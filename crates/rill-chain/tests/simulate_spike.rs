@@ -139,3 +139,79 @@ async fn simulates_an_unsigned_ptb_without_a_key() {
         }
     }
 }
+
+/// The same proof, but through the `SuiRead` trait and the real `GrpcSui` implementation rather
+/// than raw proto calls. This is what says the abstraction did not lose anything on the way: every
+/// other crate sees only the trait, so if the trait works here, it works everywhere.
+#[tokio::test]
+#[ignore = "requires network access to a Sui testnet fullnode"]
+async fn the_trait_boundary_reaches_a_real_fullnode() {
+    use rill_chain::grpc::GrpcSui;
+    use rill_chain::{SuiRead, Verification};
+
+    let chain = GrpcSui::new(TESTNET).expect("connect");
+
+    // Read — the same coin the raw test found, now through the trait.
+    let owned = chain
+        .list_owned_objects(FUNDED_SENDER)
+        .await
+        .expect("list_owned_objects through the trait");
+    let coin = owned
+        .iter()
+        .find(|o| {
+            o.object_type
+                .as_deref()
+                .is_some_and(|t| t.ends_with("::sui::SUI>") && t.contains("::coin::Coin<"))
+        })
+        .expect("a SUI coin");
+    println!("through the trait — gas coin: {}", coin.reference.id);
+
+    // A single object read, by id.
+    let fetched = chain
+        .get_object(&coin.reference.id)
+        .await
+        .expect("get_object");
+    assert_eq!(fetched.reference.id, coin.reference.id);
+
+    // Build the same unsigned PTB and simulate it through the trait.
+    let sender: Address = FUNDED_SENDER.parse().unwrap();
+    let mut tx = TransactionBuilder::new();
+    tx.set_sender(sender);
+    tx.set_gas_budget(10_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(
+        coin.reference.id.parse().unwrap(),
+        coin.reference.version,
+        coin.reference.digest.parse().unwrap(),
+    )]);
+    let amount = tx.pure(&1_000u64);
+    let gas = tx.gas();
+    let split = tx.split_coins(gas, vec![amount]);
+    let recipient = tx.pure(&sender);
+    tx.transfer_objects(split, recipient);
+
+    let built = tx.try_build().expect("build");
+    let bytes = bcs::to_bytes(&built).expect("bcs");
+    let b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+
+    let outcome = chain
+        .simulate(&b64)
+        .await
+        .expect("simulate through the trait");
+    println!(
+        "  ok={} verification={:?} gas={} balance_changes={}",
+        outcome.ok,
+        outcome.verification,
+        outcome.gas_used_mist,
+        outcome.balance_changes.len()
+    );
+    assert!(outcome.ok, "simulation should succeed: {:?}", outcome.error);
+    assert_eq!(outcome.verification, Verification::Verified);
+    assert!(
+        outcome.gas_used_mist > 0,
+        "a real simulation reports real gas"
+    );
+}

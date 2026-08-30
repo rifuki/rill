@@ -1228,13 +1228,17 @@ dependencies = [
 name = "rill-chain"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bcs",
  "prost-types",
  "rill-core",
+ "serde_json",
  "sui-rpc",
  "sui-sdk-types",
  "sui-transaction-builder",
  "thiserror 2.0.20",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1902,8 +1906,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -1912,6 +1918,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "socket2",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
