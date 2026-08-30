@@ -104,6 +104,29 @@ impl RuleKind {
         }
     }
 
+    /// Whether this rule's `prove` takes the clock as a fourth argument.
+    ///
+    /// The four on-chain rules do not share one signature. `budget::prove` and `per_tx::prove` take
+    /// `(req, wallet, version)`; `rate_limit::prove` and `time_window::prove` take
+    /// `(req, wallet, version, clock)`, because both decide against the current time.
+    ///
+    /// Emitting three arguments for all of them builds a call with the wrong arity, which the node
+    /// rejects — and a manifest carrying a rate limit or a time window is exactly the kind a
+    /// cautious owner writes. So the answer lives here, beside the module name, rather than being
+    /// re-derived by whoever emits the call.
+    pub fn prove_takes_clock(self) -> bool {
+        match self {
+            Self::RateLimit | Self::TimeWindow => true,
+            Self::Budget | Self::PerTx => false,
+            // Pre-flight rules have no `prove` at all; the question does not arise, and `false` is
+            // the answer that emits nothing extra if one ever reaches this path.
+            Self::ProtocolScope
+            | Self::SlippageFloor
+            | Self::AssetScope
+            | Self::RecipientAllowlist => false,
+        }
+    }
+
     /// Which layer actually holds this limit.
     pub fn enforcement(self) -> Enforcement {
         match self {
@@ -273,6 +296,9 @@ impl CapabilityManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnChainRuleParams {
     pub module: &'static str,
+    /// See [`RuleKind::prove_takes_clock`]. Carried with the params so the emitter never has to
+    /// know which rules are time-dependent.
+    pub prove_takes_clock: bool,
     /// Field name to value, in the order Move's constructor takes them.
     pub config: Vec<(&'static str, u64)>,
 }
@@ -284,13 +310,16 @@ pub fn to_on_chain_rule_params(
     let mut out = Vec::new();
     for rule in &manifest.rules {
         let module = rule.kind().module();
+        let prove_takes_clock = rule.kind().prove_takes_clock();
         match rule {
             CapabilityRule::Budget { total_mist } => out.push(OnChainRuleParams {
                 module,
+                prove_takes_clock,
                 config: vec![("totalMist", u64_field(total_mist, "totalMist")?)],
             }),
             CapabilityRule::PerTx { max_mist } => out.push(OnChainRuleParams {
                 module,
+                prove_takes_clock,
                 config: vec![("maxMist", u64_field(max_mist, "maxMist")?)],
             }),
             CapabilityRule::RateLimit {
@@ -298,6 +327,7 @@ pub fn to_on_chain_rule_params(
                 max_mist,
             } => out.push(OnChainRuleParams {
                 module,
+                prove_takes_clock,
                 config: vec![
                     ("windowMs", u64_field(window_ms, "windowMs")?),
                     ("maxMist", u64_field(max_mist, "maxMist")?),
@@ -308,6 +338,7 @@ pub fn to_on_chain_rule_params(
                 not_after_ms,
             } => out.push(OnChainRuleParams {
                 module,
+                prove_takes_clock,
                 config: vec![
                     ("notBeforeMs", u64_field(not_before_ms, "notBeforeMs")?),
                     ("notAfterMs", u64_field(not_after_ms, "notAfterMs")?),

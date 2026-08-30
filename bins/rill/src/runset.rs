@@ -209,20 +209,23 @@ mod tests {
         })
     }
 
+    /// A path no other test can also produce.
+    ///
+    /// This used to be named from `subsec_nanos()`, which is not unique: tests in one binary run in
+    /// parallel, two of them can read the same nanosecond, and then one test reads the file another
+    /// is still writing. It failed roughly two runs in five — often enough to be seen, rarely
+    /// enough to be dismissed as noise, which is the worst rate a flaky test can have.
+    ///
+    /// A counter cannot collide, so the question does not arise.
     fn write(value: &serde_json::Value) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
         let dir = std::env::temp_dir().join(format!("rill-runset-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.json", rill_auth_random()));
+        let path = dir.join(format!("{}.json", NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::write(&path, serde_json::to_string_pretty(value).unwrap()).unwrap();
         path
-    }
-
-    fn rill_auth_random() -> u64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
     }
 
     #[test]

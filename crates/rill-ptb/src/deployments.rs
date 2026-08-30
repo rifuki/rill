@@ -38,6 +38,10 @@ pub const TESTNET_AGENT_WALLET: &str =
 pub const TESTNET_AGENT_WALLET_SUPERSEDED: &str =
     "0xd9265581b6b930f5fd27d9ec98e67b48f876f5de7bd25155639d808e9da636da";
 
+/// The `rill_guard` package on testnet, from its own `Published.toml`.
+pub const TESTNET_RILL_GUARD: &str =
+    "0xadec99557cf7771bce94737fdd3ea0bcc989d81e0860f3e69af55433dae8c034";
+
 /// Whether an address is the superseded deployment, so a caller can say so plainly instead of
 /// letting a Move abort explain it.
 pub fn is_superseded(package_id: &str) -> bool {

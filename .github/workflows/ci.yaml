@@ -51,12 +51,39 @@ jobs:
           fi
           echo "rill-core has no floating-point arithmetic."
 
+  # The contracts, tested by the same toolchain version every time. A Move test suite that
+  # silently follows whatever `sui` the runner happens to ship is one that starts failing for
+  # reasons unrelated to the change under review.
   move:
+    runs-on: ubuntu-latest
+    env:
+      SUI_CLI_VERSION: testnet-v1.55.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Sui CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL -o sui.tgz \
+            "https://github.com/MystenLabs/sui/releases/download/${SUI_CLI_VERSION}/sui-${SUI_CLI_VERSION}-ubuntu-x86_64.tgz"
+          mkdir -p "$HOME/.sui/bin" && tar -xzf sui.tgz -C "$HOME/.sui/bin"
+          echo "$HOME/.sui/bin" >> "$GITHUB_PATH"
+      - run: sui --version
+      - name: agent_wallet
+        working-directory: move/agent_wallet
+        run: sui move test
+      - name: rill_guard
+        working-directory: move/rill_guard
+        run: sui move test
+
+  # The Rust builder emits Move calls positionally, so a signature change in the contracts that the
+  # builder does not follow is a wrong-arity call the node rejects. These read the Move source and
+  # check the emitted shape against it — the drift that killed the reference implementation.
+  signatures:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Move tests
-        run: echo "TODO(U2): sui move test for agent_wallet and rill_guard"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p rill-ptb --test move_signatures
 
   # Proves the runtime image builds and answers its own healthcheck before anything is pushed.
   # A container that compiles but cannot start is the failure this catches.

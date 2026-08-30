@@ -131,10 +131,18 @@ pub fn build_manifest_gated_spend(
             .coin_type
             .parse()
             .map_err(|_| SpendError::BadIdentifier(binding.coin_type.clone()))?;
+        // `rate_limit` and `time_window` decide against the current time and take the clock;
+        // `budget` and `per_tx` do not. Emitting three arguments for all four builds a call with
+        // the wrong arity, which the node rejects — so the shape comes from the manifest rather
+        // than from an assumption that the rules are uniform. They are not.
+        let mut args = vec![request, wallet, version];
+        if params.prove_takes_clock {
+            args.push(clock);
+        }
         tx.move_call(
             Function::new(binding.package_id, ident(module)?, ident("prove")?)
                 .with_type_args(vec![coin_type_arg]),
-            vec![request, wallet, version],
+            args,
         );
     }
 

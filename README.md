@@ -9,8 +9,8 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds and 265 tests pass, including reads against live testnet and mainnet
-fullnodes. What it does not yet have is a demonstrated end-to-end submission — see
+The workspace builds, 269 Rust tests pass — including reads against live testnet and mainnet
+fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
 [Known gaps](#known-gaps), which names exactly what is missing and why.
 
 The Bun/TypeScript implementation this replaces is the **specification**. Its behaviour is
@@ -85,6 +85,13 @@ Tests that need a fullnode are `#[ignore]` by default and named for what they pr
 ```sh
 cargo test -p rill-ptb  --test book_live     -- --ignored --nocapture
 cargo test -p rill-chain --test package_probe -- --ignored --nocapture
+```
+
+The contracts are tested by their own toolchain:
+
+```sh
+cd move/agent_wallet && sui move test   # 36
+cd move/rill_guard   && sui move test   # 2
 ```
 
 ## Known gaps
