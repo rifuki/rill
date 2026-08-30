@@ -4,3 +4,4 @@
 //! otherwise gets out of the way.
 
 pub mod keystore;
+pub mod stdio;
