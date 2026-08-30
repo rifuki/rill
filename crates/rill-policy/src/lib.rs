@@ -552,21 +552,20 @@ pub fn parse_rfc3339_ms(value: &str) -> Option<u64> {
     {
         return None;
     }
-    let days = days_from_civil(year, month, day)?;
-    Some(
-        (days as u64)
-            .checked_mul(86_400_000)?
-            .checked_add(hour * 3_600_000 + minute * 60_000 + second * 1_000 + millis)?,
-    )
+    let days = days_from_civil(year, month, day);
+    u64::try_from(days)
+        .ok()?
+        .checked_mul(86_400_000)?
+        .checked_add(hour * 3_600_000 + minute * 60_000 + second * 1_000 + millis)
 }
 
 /// Howard Hinnant's `days_from_civil` — the inverse of `rill-core`'s formatter.
-fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
     let doy = (153 * mp + 2) / 5 + d as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
+    era * 146_097 + doe - 719_468
 }
