@@ -1,0 +1,244 @@
+{
+  "$schema_note": "Cross-language conformance vectors for Rill's money path. Read by `cargo test -p rill-core` and by ts/verify-reference.ts, so the Rust implementation and the TypeScript reference are provably measured against one identical set of expectations rather than two drifting test suites.",
+  "$authority_note": "These vectors encode INTENDED behavior, taken from the reference implementation's own stated invariant \u2014 'no IEEE-754 value ever touches a token amount' \u2014 not from its observed output. A vector the reference fails is a defect in the reference, not a vector to weaken.",
+  "decimal_to_base_units": {
+    "$note": "Human decimal string to integer base units. Pure string math; the value is never routed through a float.",
+    "accepted": [
+      {
+        "value": "1",
+        "decimals": 9,
+        "expected": "1000000000",
+        "why": "whole number at SUI precision"
+      },
+      {
+        "value": "1.5",
+        "decimals": 6,
+        "expected": "1500000",
+        "why": "one fractional digit under a 6-decimal token"
+      },
+      {
+        "value": "0.000000001",
+        "decimals": 9,
+        "expected": "1",
+        "why": "exact precision boundary \u2014 one base unit"
+      },
+      {
+        "value": "0",
+        "decimals": 9,
+        "expected": "0",
+        "why": "zero is a valid amount"
+      },
+      {
+        "value": "0.5",
+        "decimals": 1,
+        "expected": "5",
+        "why": "single-decimal token"
+      },
+      {
+        "value": "42",
+        "decimals": 0,
+        "expected": "42",
+        "why": "a token with no fractional part at all"
+      },
+      {
+        "value": "007.5",
+        "decimals": 6,
+        "expected": "7500000",
+        "why": "leading zeros in the whole part are tolerated"
+      },
+      {
+        "value": "18446744073709551615",
+        "decimals": 0,
+        "expected": "18446744073709551615",
+        "why": "exactly u64::MAX is accepted"
+      },
+      {
+        "value": "0.100000000000000006",
+        "decimals": 18,
+        "expected": "100000000000000006",
+        "why": "a value a double cannot represent \u2014 0.1 + 6e-18 collapses to 0.1 in IEEE-754, so this passes only with string math"
+      },
+      {
+        "value": "9007199254740993",
+        "decimals": 0,
+        "expected": "9007199254740993",
+        "why": "2^53 + 1: the first integer a double cannot represent exactly"
+      }
+    ],
+    "rejected": [
+      {
+        "value": "1e-10",
+        "decimals": 9,
+        "why": "scientific notation"
+      },
+      {
+        "value": "1E10",
+        "decimals": 9,
+        "why": "scientific notation, uppercase"
+      },
+      {
+        "value": "abc",
+        "decimals": 9,
+        "why": "not numeric"
+      },
+      {
+        "value": "",
+        "decimals": 9,
+        "why": "empty"
+      },
+      {
+        "value": "-1",
+        "decimals": 9,
+        "why": "negative"
+      },
+      {
+        "value": "+1",
+        "decimals": 9,
+        "why": "leading sign"
+      },
+      {
+        "value": "1.2.3",
+        "decimals": 9,
+        "why": "more than one decimal point"
+      },
+      {
+        "value": "1.5",
+        "decimals": 0,
+        "why": "more fractional digits than the token supports \u2014 truncating would misreport the amount the caller asked for"
+      },
+      {
+        "value": "0.0000000001",
+        "decimals": 9,
+        "why": "one digit past the precision boundary"
+      },
+      {
+        "value": "18446744073709551616",
+        "decimals": 0,
+        "why": "one above u64::MAX"
+      },
+      {
+        "value": " 1",
+        "decimals": 9,
+        "why": "leading whitespace is not silently trimmed"
+      },
+      {
+        "value": "1_000",
+        "decimals": 9,
+        "why": "digit separators are not a decimal number"
+      }
+    ]
+  },
+  "parse_u64": {
+    "$note": "Fields already denominated in base units \u2014 spend amounts, budgets, millisecond timestamps.",
+    "accepted": [
+      {
+        "value": "0",
+        "expected": "0"
+      },
+      {
+        "value": "1000000000",
+        "expected": "1000000000"
+      },
+      {
+        "value": "18446744073709551615",
+        "expected": "18446744073709551615",
+        "why": "exactly u64::MAX"
+      }
+    ],
+    "rejected": [
+      {
+        "value": "",
+        "why": "empty"
+      },
+      {
+        "value": "1.0",
+        "why": "a decimal point is not a base-unit integer"
+      },
+      {
+        "value": "-1",
+        "why": "negative"
+      },
+      {
+        "value": "+1",
+        "why": "leading sign"
+      },
+      {
+        "value": "1e9",
+        "why": "scientific notation"
+      },
+      {
+        "value": "18446744073709551616",
+        "why": "one above u64::MAX"
+      },
+      {
+        "value": "0x10",
+        "why": "hexadecimal"
+      }
+    ]
+  },
+  "deepbook_price": {
+    "$note": "DeepBook converts an order price to base units as price * FLOAT_SCALAR * quote_scalar / base_scalar. The reference computes this with `Math.round(value * ...)` on a JS number, so precision depends on the pool's scalar ratio. Computed exactly, the answer is independent of magnitude.",
+    "$float_scalar": "1000000000",
+    "vectors": [
+      {
+        "price": "2.5",
+        "base_scalar": "1000000000",
+        "quote_scalar": "1000000",
+        "expected": "2500000",
+        "pool_shape": "SUI_DBUSDC (base 1e9 / quote 1e6, multiplier 1e6)",
+        "reference_agrees": true
+      },
+      {
+        "price": "0.123456",
+        "base_scalar": "1000000000",
+        "quote_scalar": "1000000",
+        "expected": "123456",
+        "pool_shape": "SUI_DBUSDC",
+        "reference_agrees": true
+      },
+      {
+        "price": "2362.123456",
+        "base_scalar": "1000000",
+        "quote_scalar": "1000000000",
+        "expected": "2362123456000000",
+        "pool_shape": "DEEP_SUI (base 1e6 / quote 1e9, multiplier 1e12) \u2014 listed on BOTH testnet and mainnet",
+        "reference_agrees": false,
+        "reference_returns": "2362123456000001",
+        "why": "The float product lands one base unit above the exact value. At a 1e12 multiplier the double has no bit left to round correctly, and `Math.round` cannot recover what the multiplication already lost. Reachable today on DEEP_SUI, and on NS_SUI and DRF_SUI on mainnet."
+      },
+      {
+        "price": "2366.123456",
+        "base_scalar": "1000000",
+        "quote_scalar": "1000000000",
+        "expected": "2366123456000000",
+        "pool_shape": "DEEP_SUI",
+        "reference_agrees": false,
+        "reference_returns": "2366123456000001",
+        "why": "second instance of the same divergence, to show it is systematic rather than a single unlucky value"
+      }
+    ]
+  },
+  "deepbook_quantity": {
+    "$note": "Order quantity in base units: quantity * base_scalar, exactly. Note the reference computes this as Math.round(value * scalar) on a JS number, so any product above 2^53 (9007199254740992) loses integer precision. At 9 decimals that threshold is reached at roughly 9,007,199 whole units \u2014 high for SUI, ordinary for a cheaper 9-decimal token.",
+    "vectors": [
+      {
+        "quantity": "1",
+        "base_scalar": "1000000000",
+        "expected": "1000000000"
+      },
+      {
+        "quantity": "0.123456789",
+        "base_scalar": "1000000000",
+        "expected": "123456789"
+      },
+      {
+        "quantity": "12345678.123456789",
+        "base_scalar": "1000000000",
+        "expected": "12345678123456789",
+        "why": "Scaled, this exceeds 2^53, so the double cannot represent the integer exactly and the result lands one base unit high. Found by running these vectors against the reference rather than predicted \u2014 the price divergence was known first, and this shows the same defect reaches quantity, with no unusual pool shape required.",
+        "reference_agrees": false,
+        "reference_returns": "12345678123456790"
+      }
+    ]
+  }
+}

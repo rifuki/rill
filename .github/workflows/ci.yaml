@@ -37,6 +37,20 @@ jobs:
           fi
           echo "rill-core is pure."
 
+      # The money-path invariant. The reference implementation stated this in a comment and
+      # still let a float reach a DeepBook order price — a comment cannot stop `Number(v)`.
+      # Here no float type may appear in the crate at all, so there is nothing to slip through.
+      - name: rill-core must contain no floating-point type
+        run: |
+          # Strip doc comments first — this file's own prose explains why floats are banned,
+          # and matching that text would fail the build for saying so.
+          if grep -rn --include='*.rs' -vE '^\s*(//|\*)' crates/rill-core/src \
+             | grep -E '\bf(32|64)\b'; then
+            echo "::error::A floating-point type appeared in rill-core. See KTD-4 in docs/plans/."
+            exit 1
+          fi
+          echo "rill-core has no floating-point arithmetic."
+
   move:
     runs-on: ubuntu-latest
     steps:

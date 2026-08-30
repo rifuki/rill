@@ -8,3 +8,5 @@
 //! must never show `tokio`, `axum`, `sui-rpc`, or `reqwest`. Two thirds of the reference
 //! implementation was already logic of this kind; here the dependency graph is what keeps
 //! it honest, so the majority of the system tests with no network and no mocks.
+
+pub mod amounts;
