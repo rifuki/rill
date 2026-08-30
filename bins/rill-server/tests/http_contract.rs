@@ -13,14 +13,8 @@ use http_body_util::BodyExt as _;
 use serde_json::Value;
 use tower::ServiceExt as _;
 
-#[path = "../src/envelope.rs"]
-mod envelope;
-#[path = "../src/routes.rs"]
-mod routes;
-#[path = "../src/state.rs"]
-mod state;
-
-use state::{AppState, Config, Network};
+use rill_server::routes;
+use rill_server::state::{AppState, Config, Network};
 
 fn app() -> axum::Router {
     let dir = std::env::temp_dir().join(format!("rill-server-test-{}", std::process::id()));

@@ -4,6 +4,14 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[lib]
+name = "rill_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rill-server"
+path = "src/main.rs"
+
 [dependencies]
 rill-core = { workspace = true }
 rill-chain = { workspace = true }
