@@ -4,5 +4,6 @@
 //! it through `tower`, which means what they test is what ships rather than a re-declaration of it.
 
 pub mod envelope;
+pub mod mcp;
 pub mod routes;
 pub mod state;

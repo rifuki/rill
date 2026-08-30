@@ -286,3 +286,353 @@ fn testnet_boots_with_neither_so_local_development_needs_no_setup() {
     config.network = Network::Testnet;
     assert!(config.boot_check().is_ok());
 }
+
+// ── the MCP endpoint, now that it authenticates ──
+
+use rill_auth::tokens::{sign_token, TokenClaims, TokenKind};
+
+const TEST_SECRET: &str = "test-secret";
+
+fn token(kind: TokenKind, audience: &str, scope: &str, subject: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    sign_token(
+        &TokenClaims {
+            t: kind,
+            sub: subject.into(),
+            cid: "rill_client_test".into(),
+            scope: scope.into(),
+            aud: audience.into(),
+            exp: now + 3600,
+            jti: "test-jti".into(),
+        },
+        TEST_SECRET,
+    )
+    .unwrap()
+}
+
+async fn mcp_call(auth: Option<&str>, body: Value) -> (StatusCode, Value) {
+    let mut request = Request::post("/mcp").header(header::CONTENT_TYPE, "application/json");
+    if let Some(a) = auth {
+        request = request.header(header::AUTHORIZATION, a);
+    }
+    let response = app()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn initialize() -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} })
+}
+
+#[tokio::test]
+async fn a_valid_token_completes_the_handshake() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, body) = mcp_call(Some(&bearer), initialize()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["serverInfo"]["name"], "rill-actions");
+}
+
+/// The signed `t` claim doing its job at the endpoint that matters.
+#[tokio::test]
+async fn a_refresh_token_is_refused_at_the_mcp_endpoint() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Refresh,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, _) = mcp_call(Some(&bearer), initialize()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_token_for_another_deployment_is_refused() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://other.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, _) = mcp_call(Some(&bearer), initialize()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_token_without_the_mcp_scope_is_refused_as_insufficient_not_invalid() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "offline_access",
+            "0xowner"
+        )
+    );
+    let (status, body) = mcp_call(Some(&bearer), initialize()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "insufficient_scope");
+}
+
+/// Connected but nothing published is a valid state, not a broken connector.
+#[tokio::test]
+async fn an_owner_with_no_published_actions_still_gets_an_empty_catalogue() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xnobody"
+        )
+    );
+    let (status, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "rill_list_actions", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(
+        body["result"]["structuredContent"]["actions"],
+        serde_json::json!([])
+    );
+}
+
+/// This server holds no key and must never be talked into behaving as though it does.
+#[tokio::test]
+async fn an_argument_carrying_key_material_is_refused_on_every_call() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (_, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "rill_list_actions", "arguments": { "privateKey": "suiprivkey1..." } }
+        }),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "forbidden_arguments"
+    );
+}
+
+/// Another address's action must be indistinguishable from one that does not exist, or the
+/// endpoint becomes a way to discover which ids are real.
+#[tokio::test]
+async fn someone_elses_action_answers_exactly_as_a_missing_one_does() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let describe = |id: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "rill_describe_action", "arguments": { "actionId": id } }
+        })
+    };
+    let (_, absent) = mcp_call(Some(&bearer), describe("skill_does_not_exist")).await;
+    let (_, other) = mcp_call(Some(&bearer), describe("skill_belongs_to_someone_else")).await;
+    assert_eq!(
+        absent["result"]["structuredContent"],
+        other["result"]["structuredContent"]
+    );
+}
+
+#[tokio::test]
+async fn a_notification_gets_no_body_at_all() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let response = app()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::AUTHORIZATION, &bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+/// Conflating "no id" with "notification" swallows a spec violation as a 202, and the client waits
+/// for a reply that never comes.
+#[tokio::test]
+async fn a_request_missing_its_id_is_a_reported_error_not_a_silent_202() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({ "jsonrpc": "2.0", "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn a_batch_is_answered_as_an_array() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "ping" },
+            { "jsonrpc": "2.0", "id": 2, "method": "ping" }
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(2));
+}
+
+#[tokio::test]
+async fn an_empty_batch_is_a_distinct_error() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (status, body) = mcp_call(Some(&bearer), serde_json::json!([])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_json_is_a_parse_error_once_authenticated() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let response = app()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::AUTHORIZATION, &bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{ not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Without a token, a malformed body is still just "you need a token". Answering a parse error
+/// here would tell an unauthenticated caller that this endpoint speaks JSON-RPC, and let them
+/// distinguish malformed from unauthorized.
+#[tokio::test]
+async fn an_unauthenticated_caller_learns_only_that_they_need_a_token() {
+    let response = app()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{ not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+}
+
+/// The advertised tools must be the annotated ones, so a client can tell what modifies state.
+#[tokio::test]
+async fn tools_list_advertises_annotations() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (_, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }),
+    )
+    .await;
+    let tools = body["result"]["tools"].as_array().expect("tools");
+    assert!(!tools.is_empty());
+    for tool in tools {
+        assert!(
+            tool["annotations"]["readOnlyHint"].is_boolean(),
+            "{} must say whether it modifies anything",
+            tool["name"]
+        );
+    }
+}

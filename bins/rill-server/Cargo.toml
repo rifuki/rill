@@ -27,6 +27,7 @@ rill-policy = { workspace = true }
 tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
+rill-auth = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 

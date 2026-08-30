@@ -144,20 +144,15 @@ use axum::response::IntoResponse as _;
 
 /// The owner-scoped MCP endpoint. Every 401 carries `WWW-Authenticate` so a client can discover
 /// where to authenticate rather than reporting a dead connector.
-async fn mcp_post(State(state): State<AppState>) -> Response {
-    let discovery = format!(
-        "Bearer realm=\"rill\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
-        state.config.public_base_url.trim_end_matches('/')
-    );
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, discovery)],
-        axum::Json(json!({
-            "error": "invalid_token",
-            "error_description": "An OAuth 2.1 access token is required."
-        })),
-    )
-        .into_response()
+async fn mcp_post(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    crate::mcp::post(state, authorization, body).await
 }
 
 /// What you see depends on who you are. Without a token, only skills that have no owner —
