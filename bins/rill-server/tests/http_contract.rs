@@ -636,3 +636,97 @@ async fn tools_list_advertises_annotations() {
         );
     }
 }
+
+/// Refusing beats guessing. Building against the wrong DeepBook would produce a transaction that
+/// compiles, simulates against nothing real, and fails on chain — a failure nobody can attribute.
+#[tokio::test]
+async fn building_without_a_configured_deepbook_package_is_refused_by_name() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (_, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {
+                "name": "rill_build_action",
+                "arguments": { "actionId": "skill_anything" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true);
+    // The action check comes first, so an unknown id is what surfaces here — and that is correct:
+    // a caller must not learn about deployment configuration from an action they cannot see.
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "action_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn building_an_action_you_do_not_own_is_refused_before_anything_is_compiled() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (_, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "rill_build_action",
+                "arguments": { "actionId": "skill_someone_elses", "sender": "0x1" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"], "action_unavailable",
+        "nothing should be compiled for an action the caller cannot see"
+    );
+}
+
+/// The tool now advertises that amounts are strings, which is the one thing an agent filling this
+/// call in must get right.
+#[tokio::test]
+async fn the_build_tool_tells_an_agent_that_amounts_are_strings() {
+    let bearer = format!(
+        "Bearer {}",
+        token(
+            TokenKind::Access,
+            "https://api.rill.test/mcp",
+            "mcp",
+            "0xowner"
+        )
+    );
+    let (_, body) = mcp_call(
+        Some(&bearer),
+        serde_json::json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" }),
+    )
+    .await;
+    let build = body["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "rill_build_action")
+        .expect("rill_build_action");
+    let params = build["inputSchema"]["properties"]["params"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        params.contains("STRINGS"),
+        "an agent reads this to know not to send a number: {params}"
+    );
+}

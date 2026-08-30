@@ -107,7 +107,6 @@ pub fn parse_build_request(
     action_id: &str,
     network: Network,
     deepbook_package_id: Address,
-    pool: PoolSpec,
     gas_budget: u64,
     gas_price: u64,
 ) -> Result<BuildRequest, RequestError> {
@@ -166,7 +165,16 @@ pub fn parse_build_request(
         version_id: address_at(arguments, "agentWallet.versionId")?,
         manifest,
         deepbook_package_id,
-        pool,
+        // Supplied by the caller rather than looked up. These are public identifiers, the signer
+        // pins them against its own run-set before signing, and a table kept here would be one
+        // more thing to go stale against the chain.
+        pool: PoolSpec {
+            pool_id: address_at(arguments, "params.poolId")?,
+            base_coin_type: string_at(arguments, "params.baseCoinType")?.to_owned(),
+            quote_coin_type: string_at(arguments, "params.quoteCoinType")?.to_owned(),
+            base_scalar: u64_at(arguments, "params.baseScalar")? as u128,
+            quote_scalar: u64_at(arguments, "params.quoteScalar")? as u128,
+        },
         balance_manager_id: address_at(arguments, "params.balanceManagerId")?,
         trade_cap: gas_object(
             trade_cap_id,
@@ -207,18 +215,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn pool() -> PoolSpec {
-        PoolSpec {
-            pool_id: "0x0000000000000000000000000000000000000000000000000000000000000020"
-                .parse()
-                .unwrap(),
-            base_coin_type: "0xde::deep::DEEP".into(),
-            quote_coin_type: "0x2::sui::SUI".into(),
-            base_scalar: 1_000_000,
-            quote_scalar: 1_000_000_000,
-        }
-    }
-
     fn addr(n: u8) -> String {
         format!("0x{:064x}", n)
     }
@@ -247,6 +243,11 @@ mod tests {
                 "gasObjectId": addr(0x0a),
                 "gasObjectVersion": 1,
                 "gasObjectDigest": "11111111111111111111111111111111",
+                "poolId": addr(0x20),
+                "baseCoinType": "0xde::deep::DEEP",
+                "quoteCoinType": "0x2::sui::SUI",
+                "baseScalar": 1000000,
+                "quoteScalar": 1000000000,
                 "clientOrderId": 1,
                 "price": "2.5",
                 "quantity": "1",
@@ -272,7 +273,6 @@ mod tests {
             "skill_hero",
             Network::Testnet,
             addr(0xde).parse().unwrap(),
-            pool(),
             50_000_000,
             1_000,
         )

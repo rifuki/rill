@@ -103,7 +103,7 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 /// Handle one JSON-RPC message. Returns `None` for a notification, which gets no response at all.
-fn handle_one(state: &AppState, owner: &str, message: &Value) -> Option<Value> {
+async fn handle_one(state: &AppState, owner: &str, message: &Value) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     // A message with no `id` is a notification. Not answered — not even with a null id, which is
     // what a spec-violating implementation does and what makes a client wait for a reply that
@@ -151,7 +151,7 @@ fn handle_one(state: &AppState, owner: &str, message: &Value) -> Option<Value> {
                 .collect();
             Some(rpc_result(id, json!({ "tools": tools })))
         }
-        "tools/call" => Some(handle_tool_call(state, owner, id, message)),
+        "tools/call" => Some(handle_tool_call(state, owner, id, message).await),
         other => Some(rpc_error(id, -32601, &format!("Method not found: {other}"))),
     }
 }
@@ -178,7 +178,7 @@ fn tool_ok(id: Value, data: Value) -> Value {
     )
 }
 
-fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Value) -> Value {
+async fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Value) -> Value {
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tools/call requires a tool name.");
@@ -229,12 +229,7 @@ fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Value) -
                 ),
             }
         }
-        "rill_build_action" => tool_error(
-            id,
-            "not_yet_available",
-            "Building is not wired on this deployment yet. The compiler and simulator exist and \
-             are tested; this endpoint does not call them.",
-        ),
+        "rill_build_action" => build_action(state, &catalogue, id, &arguments).await,
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
 }
@@ -285,18 +280,90 @@ pub async fn post(
             )
                 .into_response();
         }
-        let responses: Vec<Value> = messages
-            .iter()
-            .filter_map(|m| handle_one(&state, &owner, m))
-            .collect();
+        let mut responses: Vec<Value> = Vec::new();
+        for message in messages {
+            if let Some(response) = handle_one(&state, &owner, message).await {
+                responses.push(response);
+            }
+        }
         if responses.is_empty() {
             return StatusCode::ACCEPTED.into_response();
         }
         return Json(Value::Array(responses)).into_response();
     }
 
-    match handle_one(&state, &owner, &body) {
+    match handle_one(&state, &owner, &body).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
 }
+
+/// Compile and simulate one action, returning an unsigned envelope or a named refusal.
+///
+/// A refusal is surfaced as an MCP tool error rather than as content, so an agent cannot mistake
+/// `structuredContent` for something signable. That is the same reason the build path returns a
+/// distinct type rather than an envelope with a flag.
+async fn build_action(
+    state: &AppState,
+    catalogue: &[rill_store::PublishedSkill],
+    id: Value,
+    arguments: &Value,
+) -> Value {
+    let Some(action_id) = arguments.get("actionId").and_then(Value::as_str) else {
+        return tool_error(id, "invalid_arguments", "actionId is required.");
+    };
+    // Same answer as for an id that does not exist — see the module note.
+    if !catalogue.iter().any(|s| s.id == action_id) {
+        return tool_error(
+            id,
+            "action_unavailable",
+            "Action is not available from this endpoint.",
+        );
+    }
+
+    let Some(deepbook) = state.deepbook_package_id.as_deref() else {
+        return tool_error(
+            id,
+            "not_configured",
+            "DEEPBOOK_PACKAGE_ID is not set on this deployment, so there is no DeepBook to build \
+             against. Refusing rather than guessing an address.",
+        );
+    };
+    let Ok(deepbook_package_id) = deepbook.parse() else {
+        return tool_error(
+            id,
+            "not_configured",
+            "DEEPBOOK_PACKAGE_ID is set but is not a Sui address.",
+        );
+    };
+
+    let request = match crate::request::parse_build_request(
+        arguments,
+        action_id,
+        state.config.network.into(),
+        deepbook_package_id,
+        DEFAULT_GAS_BUDGET,
+        DEFAULT_GAS_PRICE,
+    ) {
+        Ok(r) => r,
+        Err(e) => return tool_error(id, "invalid_arguments", &e.to_string()),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    match crate::build::build(&request, state.chain.as_ref(), now_ms).await {
+        crate::build::BuildOutcome::Built(envelope) => match serde_json::to_value(&*envelope) {
+            Ok(value) => tool_ok(id, value),
+            Err(e) => tool_error(id, "serialize_failed", &e.to_string()),
+        },
+        crate::build::BuildOutcome::Refused { code, reason } => tool_error(id, code, &reason),
+    }
+}
+
+/// Deliberately generous; the signer enforces its own ceiling and refuses anything above it, so
+/// the binding limit is the one held by whoever owns the key rather than one chosen here.
+const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
+const DEFAULT_GAS_PRICE: u64 = 1_000;

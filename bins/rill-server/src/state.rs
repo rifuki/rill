@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use rill_chain::grpc::GrpcSui;
 use rill_store::file::{FileOAuthStore, FileSkillStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,13 @@ pub struct AppState {
     /// once the OAuth endpoints are wired.
     #[allow(dead_code)]
     pub oauth: Arc<FileOAuthStore>,
+    /// The only thing here that talks to Sui. Reads and simulates; it cannot sign, because nothing
+    /// in this process holds a key.
+    pub chain: Arc<GrpcSui>,
+    /// DeepBook's published package on this network, from the environment. There is no default:
+    /// building against the wrong DeepBook would produce a transaction that compiles, simulates
+    /// against nothing real, and fails on chain.
+    pub deepbook_package_id: Option<String>,
 }
 
 impl AppState {
@@ -147,10 +155,29 @@ impl AppState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let chain = GrpcSui::new(&config.sui_rpc_url).expect(
+            "the Sui endpoint must be a usable URL; it is checked at boot, not per request",
+        );
         Self {
             skills: Arc::new(FileSkillStore::load(&config.skills_store_path)),
             oauth: Arc::new(FileOAuthStore::load(&config.oauth_store_path, now_ms)),
+            chain: Arc::new(chain),
+            deepbook_package_id: std::env::var("DEEPBOOK_PACKAGE_ID")
+                .ok()
+                .filter(|s| !s.is_empty()),
             config: Arc::new(config),
+        }
+    }
+}
+
+/// The server's own network enum maps onto the envelope's. Two enums rather than one because the
+/// envelope's is part of a wire contract and this one is configuration — coupling them would make
+/// a config change a protocol change.
+impl From<Network> for rill_core::envelope::Network {
+    fn from(value: Network) -> Self {
+        match value {
+            Network::Testnet => Self::Testnet,
+            Network::Mainnet => Self::Mainnet,
         }
     }
 }
