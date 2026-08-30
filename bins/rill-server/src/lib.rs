@@ -6,5 +6,6 @@
 pub mod build;
 pub mod envelope;
 pub mod mcp;
+pub mod request;
 pub mod routes;
 pub mod state;

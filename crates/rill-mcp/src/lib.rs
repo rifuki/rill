@@ -104,9 +104,36 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                     "type": "object",
                     "properties": {
                         "actionId": { "type": "string" },
-                        "params": { "type": "object" }
+                        "sender": {
+                            "type": "string",
+                            "description": "The agent's Sui address. Public — never a key."
+                        },
+                        // Public object ids only. The keyless guard refuses anything key-shaped in
+                        // here, however it is spelled.
+                        "agentWallet": {
+                            "type": "object",
+                            "description": "Public ids identifying the funding wallet and its rules.",
+                            "properties": {
+                                "packageId": { "type": "string" },
+                                "walletId": { "type": "string" },
+                                "capId": { "type": "string" },
+                                "capVersion": { "type": "integer" },
+                                "capDigest": { "type": "string" },
+                                "versionId": { "type": "string" },
+                                "capabilityManifest": { "type": "object" }
+                            },
+                            "required": [
+                                "packageId", "walletId", "capId", "capVersion", "capDigest",
+                                "versionId", "capabilityManifest"
+                            ],
+                            "additionalProperties": false
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Runtime values. Amounts are decimal STRINGS, never numbers — a JSON number would put a float on the money path."
+                        }
                     },
-                    "required": ["actionId"],
+                    "required": ["actionId", "sender", "agentWallet", "params"],
                     "additionalProperties": false
                 })),
             ),
