@@ -57,3 +57,29 @@ jobs:
       - uses: actions/checkout@v4
       - name: Move tests
         run: echo "TODO(U2): sui move test for agent_wallet and rill_guard"
+
+  # Proves the runtime image builds and answers its own healthcheck before anything is pushed.
+  # A container that compiles but cannot start is the failure this catches.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: rill-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: The container must start and answer /health
+        run: |
+          docker run -d --name rill -p 3939:3939 rill-server:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3939/health > /dev/null; then
+              echo "healthy after ${i}s"; docker logs rill; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the container never became healthy"; docker logs rill; exit 1
