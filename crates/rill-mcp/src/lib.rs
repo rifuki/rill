@@ -99,7 +99,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
             read_only(
                 "rill_build_action",
                 "Compile and strictly simulate an action, returning an unsigned ExecutionEnvelope. \
-                 No key is involved and nothing is submitted; signing happens locally in rill-wallet.",
+                 No key is involved and nothing is submitted; signing happens locally in rill.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -140,13 +140,13 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
         ],
         Surface::Wallet => vec![
             read_only(
-                "rill_wallet_status",
+                "rill_status",
                 "Report the local signer's readiness and the agent wallet's live budget and \
                  revocation state.",
                 no_arguments(),
             ),
             read_only(
-                "rill_list_capabilities",
+                "rill_capabilities",
                 "Return this run's public ids, limits, allowed targets, and which layer enforces each.",
                 no_arguments(),
             ),
@@ -156,7 +156,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 no_arguments(),
             ),
             destructive(
-                "rill_execute_rill_action",
+                "rill_execute",
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope. \
                  THIS SUBMITS A REAL TRANSACTION and cannot be undone.",
                 object_schema(json!({
@@ -203,7 +203,7 @@ pub fn assert_keyless_arguments(args: &Value) -> Result<(), String> {
                 if FORBIDDEN_KEYLESS_ARGUMENTS.contains(&normalized.as_str()) {
                     return Err(format!(
                         "\"{key}\" is not accepted here. Rill Cloud holds no key and never signs \
-                         or submits; pass public identifiers only, and sign locally with rill-wallet."
+                         or submits; pass public identifiers only, and sign locally with rill."
                     ));
                 }
                 assert_keyless_arguments(value)?;
@@ -245,7 +245,7 @@ mod tests {
             .filter(|t| t.annotations.as_ref().unwrap().destructive_hint == Some(true))
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(destructive, vec!["rill_execute_rill_action".to_string()]);
+        assert_eq!(destructive, vec!["rill_execute".to_string()]);
     }
 
     /// The keyless surface must offer nothing that can spend.

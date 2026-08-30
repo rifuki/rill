@@ -1,52 +1,76 @@
 # Rill
 
-**The transaction layer for AI agents on Sui** — rebuilt in Rust.
+**The transaction layer for AI agents on Sui** — in Rust.
 
-Any agent can safely transact with any Sui protocol without hallucinating parameters or
-risking the whole wallet. The server builds and simulates transactions **without ever
-holding a key**; a local signer holds the key and trusts nothing the server sends without
-independently re-deriving it; two on-chain Move contracts bound every action.
+An agent can transact with any Sui protocol without inventing parameters or risking the whole
+wallet. The server builds and simulates transactions **without ever holding a key**; a local
+binary holds the key and trusts nothing the server sends without re-deriving it independently;
+two on-chain Move contracts bound every action.
 
-## Status
+## Where things stand
 
-Scaffold. The implementation plan is
-[`docs/plans/2026-08-30-001-feat-rill-rust-greenfield-plan.md`](docs/plans/2026-08-30-001-feat-rill-rust-greenfield-plan.md).
+The workspace builds and 265 tests pass, including reads against live testnet and mainnet
+fullnodes. What it does not yet have is a demonstrated end-to-end submission — see
+[Known gaps](#known-gaps), which names exactly what is missing and why.
 
-The Bun/TypeScript implementation this replaces remains the **specification** — its 746
-passing tests define the behavior being re-expressed here, and it keeps running until each
-component is cut over.
+The Bun/TypeScript implementation this replaces is the **specification**. Its behaviour is
+re-expressed here, with conformance fixtures in `fixtures/` checked against it by
+`ts/verify-reference.ts`.
 
 ## Why a rebuild rather than a port
 
-Three problems in the TypeScript version are the same problem: invariants the code
-documents but the language does not enforce.
+Three problems in the TypeScript version are one problem: invariants the code documents but the
+language does not enforce.
 
-- A float reached the money path, in a codebase whose own stated rule is that no IEEE-754
-  value may touch a token amount. Every test passed.
-- The signer drifted off the deployed contract — it still required a `spend()` entry point
-  the contract no longer has, so the only run-set the product could create could never
-  validate.
-- One capability-declaration contract had three implementations, two of which had to agree
-  exactly with nothing enforcing that they did.
+- **A float reached the money path**, in a codebase whose own stated rule is that no IEEE-754
+  value may touch a token amount. `@mysten/deepbook-v3` converts a price with
+  `BigInt(Math.round(value * floatScalar * quoteScalar / baseScalar))`, and the order price and
+  quantity arrive as `z.number()`. Divergence is reproducible at `2362.123456` on a 1e12-multiplier
+  pool. Every one of its 746 tests passed.
+- **The reading side has the same defect.** `midPrice` ends
+  `Number(bcs.U64.parse(bytes)) * baseScalar / quoteScalar / FLOAT_SCALAR`, so a price read off the
+  order book has been through a double before it is used — and the usual next step feeds it back
+  in as an order price, through a second one.
+- **The signer and the contract disagree about which deployment they mean.** Not stale prose: two
+  packages are deployed, one generation apart, and the repo's documents point at different ones.
+  See [Known gaps](#known-gaps).
 
-Here, each is structurally impossible: integer-only money types with no `f64` constructor,
-validation state carried in the type so an unchecked envelope cannot reach `sign()`, and a
-single declaration producer.
+Here each is structurally impossible: integer-only money types with no `f64` constructor,
+validation state carried in the type so an unchecked envelope cannot reach `sign()`, and a single
+declaration producer. CI fails the build on an `f32`/`f64` anywhere outside a comment, and on any
+I/O dependency reaching `rill-core`.
 
 ## Layout
 
 | Path | Role |
 |---|---|
 | `crates/rill-core` | Pure domain logic — **no I/O, enforced in CI** |
-| `crates/rill-chain` | The only crate that talks to Sui (nine methods behind a trait) |
+| `crates/rill-chain` | The only crate that talks to Sui, behind a trait |
 | `crates/rill-ptb` | Transaction building; direct Move calls, no protocol SDK |
 | `crates/rill-policy` | Type-state envelope verification |
 | `crates/rill-mcp` | Shared MCP wiring and tool definitions |
 | `crates/rill-auth` | OAuth 2.1 authorization server + Sign-In With Sui |
 | `crates/rill-store` | Persistence behind a trait |
 | `bins/rill-server` | axum — REST, MCP, OAuth |
-| `bins/rill-wallet` | The local signer that holds the key |
+| `bins/rill` | The local binary that holds the key |
 | `move/` | On-chain contracts, carried over unchanged |
+
+## `rill`, the local binary
+
+One binary, every local job. Run it with no arguments and it reports readiness and lists what it
+can do — it never falls through to the protocol loop, because one human-readable line on stdout
+corrupts the MCP wire with nothing to say where the corruption came from.
+
+```sh
+rill              # status, then the command list
+rill mcp          # speak MCP over stdio — this is what an agent runs
+rill status       # readiness; exits non-zero when it cannot sign
+rill address      # just the address, so it composes
+rill capabilities # what the loaded run-set permits, in order
+```
+
+The key comes from `RILL_SUI_PRIVATE_KEY`, read from the environment of whatever launches the
+process — never from an MCP config file, a command-line argument, or anything the agent can read.
 
 ## Build
 
@@ -55,3 +79,32 @@ cargo build --workspace
 cargo test --workspace
 cargo tree -p rill-core --edges normal   # must show no tokio / axum / sui-rpc
 ```
+
+Tests that need a fullnode are `#[ignore]` by default and named for what they prove:
+
+```sh
+cargo test -p rill-ptb  --test book_live     -- --ignored --nocapture
+cargo test -p rill-chain --test package_probe -- --ignored --nocapture
+```
+
+## Known gaps
+
+Recorded here rather than discovered during a demo.
+
+**The demo wallet's capabilities belong to the superseded contract.** Two `agent_wallet` packages
+are deployed on testnet, and the reference repo's own documents disagree about which is current.
+Asked directly (`rill-chain/tests/package_probe.rs`, reproducible):
+
+| package | named by | `request_spend` | `confirm_spend` | `spend` |
+|---|---|---|---|---|
+| `0xb02f39d6…563740` | `Published.toml`, `.env.example` | present | present | absent |
+| `0xd9265581…a636da` | README, `pitch.tsx` | absent | absent | present |
+
+The first is current. The funded testnet sender's three `AgentCap` objects are all typed
+`0xd9265581…::agent_wallet::AgentCap` — the superseded one. A capability minted by one package
+cannot authorise a call in another, so **an end-to-end submission needs a fresh `AgentCap` minted
+from `0xb02f39d6…` first.** `rill status` warns when a run-set names the old package rather than
+letting it surface as a Move abort at signing time.
+
+**Submission is unproven.** Everything up to signing is verified against live nodes; the final
+`execute` has not been run against a funded wallet on the current contract, for the reason above.

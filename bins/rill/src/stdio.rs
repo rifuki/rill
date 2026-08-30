@@ -116,7 +116,7 @@ pub fn handle(context: &mut WalletContext, message: &Value) -> Option<Value> {
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": {
-                        "name": "rill-wallet",
+                        "name": "rill",
                         "version": env!("CARGO_PKG_VERSION"),
                         "description": "Local signer. Holds the key, validates independently, and is the only thing here that can submit."
                     }
@@ -143,7 +143,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     };
 
     match name {
-        "rill_wallet_status" => match &context.keystore {
+        "rill_status" => match &context.keystore {
             Some(keystore) => tool_ok(
                 id,
                 json!({
@@ -165,7 +165,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
                 }),
             ),
         },
-        "rill_list_capabilities" => match &context.run_set {
+        "rill_capabilities" => match &context.run_set {
             Some(run_set) => {
                 let declaration = rill_core::manifest::to_declaration(&run_set.capability_manifest)
                     .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
@@ -203,7 +203,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
                 json!({ "lastRejection": null, "note": "Nothing has been refused yet." }),
             ),
         },
-        "rill_execute_rill_action" => execute(context, id, &params),
+        "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
 }
@@ -343,7 +343,7 @@ mod tests {
     fn the_handshake_completes() {
         let out = drive(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["result"]["serverInfo"]["name"], "rill-wallet");
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], "rill");
     }
 
     #[test]
@@ -380,7 +380,7 @@ mod tests {
         let tools = out[0]["result"]["tools"].as_array().unwrap();
         let execute = tools
             .iter()
-            .find(|t| t["name"] == "rill_execute_rill_action")
+            .find(|t| t["name"] == "rill_execute")
             .expect("the wallet must offer execution");
         assert_eq!(
             execute["annotations"]["destructiveHint"], true,
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn status_without_a_key_says_so_plainly() {
         let out = drive(
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rill_wallet_status","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rill_status","arguments":{}}}"#,
         );
         assert_eq!(out[0]["result"]["structuredContent"]["ready"], false);
         assert!(out[0]["result"]["structuredContent"]["reason"]
@@ -411,7 +411,7 @@ mod tests {
         let mut out = Vec::new();
         serve(
             &mut ctx,
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rill_wallet_status","arguments":{}}}"#.as_bytes(),
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rill_status","arguments":{}}}"#.as_bytes(),
             &mut out,
         )
         .unwrap();
@@ -429,7 +429,7 @@ mod tests {
         let mut ctx = context();
         let mut out = Vec::new();
         let input = concat!(
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rill_execute_rill_action","arguments":{"envelope":{}}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rill_execute","arguments":{"envelope":{}}}}"#,
             "\n",
             r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rill_explain_rejection","arguments":{}}}"#
         );
@@ -572,7 +572,7 @@ mod execution_tests {
     fn execute_with(ctx: &mut WalletContext, envelope: Value) -> Value {
         let message = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "rill_execute_rill_action", "arguments": { "envelope": envelope } }
+            "params": { "name": "rill_execute", "arguments": { "envelope": envelope } }
         });
         handle(ctx, &message).expect("a request gets a reply")
     }
@@ -656,7 +656,7 @@ mod execution_tests {
             &mut ctx,
             &json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": { "name": "rill_list_capabilities", "arguments": {} }
+                "params": { "name": "rill_capabilities", "arguments": {} }
             }),
         )
         .unwrap();

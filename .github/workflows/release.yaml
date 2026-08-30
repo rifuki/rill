@@ -24,13 +24,13 @@ jobs:
           # machine is the worst of both.
           - runner: macos-14
             target: aarch64-apple-darwin
-            asset: rill-wallet-darwin-arm64
+            asset: rill-darwin-arm64
           - runner: macos-13
             target: x86_64-apple-darwin
-            asset: rill-wallet-darwin-x64
+            asset: rill-darwin-x64
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: rill-wallet-linux-x64
+            asset: rill-linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -83,10 +83,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            rill-wallet-darwin-arm64
-            rill-wallet-darwin-arm64.sha256
-            rill-wallet-darwin-x64
-            rill-wallet-darwin-x64.sha256
-            rill-wallet-linux-x64
-            rill-wallet-linux-x64.sha256
+            rill-darwin-arm64
+            rill-darwin-arm64.sha256
+            rill-darwin-x64
+            rill-darwin-x64.sha256
+            rill-linux-x64
+            rill-linux-x64.sha256
           fail_on_unmatched_files: true

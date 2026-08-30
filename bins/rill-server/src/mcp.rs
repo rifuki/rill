@@ -217,8 +217,8 @@ async fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Va
                         "name": skill.name,
                         "description": skill.description,
                         "network": state.config.network.as_str(),
-                        "simulationRule": "Rill Cloud and rill-wallet both require a verified, successful simulation.",
-                        "signingRule": "Only the local rill-wallet may validate, re-simulate, sign, and submit."
+                        "simulationRule": "Rill Cloud and rill both require a verified, successful simulation.",
+                        "signingRule": "Only the local rill may validate, re-simulate, sign, and submit."
                     }),
                 ),
                 // Deliberately the same answer as for an id that does not exist.

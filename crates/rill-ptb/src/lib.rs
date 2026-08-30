@@ -11,6 +11,7 @@
 pub mod book;
 pub mod cetus;
 pub mod deepbook;
+pub mod deployments;
 pub mod guard;
 pub mod haedal;
 pub mod registry;
