@@ -1270,8 +1270,10 @@ dependencies = [
  "rill-chain",
  "rill-core",
  "rill-ptb",
+ "serde_json",
  "sui-sdk-types",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
