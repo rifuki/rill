@@ -19,6 +19,7 @@ use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
 use crate::keystore::Keystore;
+use crate::runset::RunSet;
 
 /// Protocol versions this signer speaks.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -27,6 +28,9 @@ const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 /// What the signer knows about itself. Everything here is public.
 pub struct WalletContext {
     pub keystore: Option<Keystore>,
+    /// Loaded at startup and never written by any tool. An agent that could widen its own limits
+    /// has no limits — the Move contract makes the same choice by reserving `add_rule` to the owner.
+    pub run_set: Option<RunSet>,
     pub network: String,
     /// Whether signing on mainnet has been explicitly opted into.
     pub mainnet_allowed: bool,
@@ -38,10 +42,16 @@ impl WalletContext {
     pub fn new(keystore: Option<Keystore>, network: String, mainnet_allowed: bool) -> Self {
         Self {
             keystore,
+            run_set: None,
             network,
             mainnet_allowed,
             last_rejection: None,
         }
+    }
+
+    pub fn with_run_set(mut self, run_set: Option<RunSet>) -> Self {
+        self.run_set = run_set;
+        self
     }
 }
 
@@ -155,15 +165,37 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
                 }),
             ),
         },
-        "rill_list_capabilities" => tool_ok(
-            id,
-            json!({
-                "runSet": null,
-                "note": "No run-set is loaded on this build, so there are no capabilities to \
-                         report. This is stated rather than answered with an empty object, which \
-                         would read as \"no limits\"."
-            }),
-        ),
+        "rill_list_capabilities" => match &context.run_set {
+            Some(run_set) => {
+                let declaration = rill_core::manifest::to_declaration(&run_set.capability_manifest)
+                    .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null);
+                tool_ok(
+                    id,
+                    json!({
+                        "label": run_set.label,
+                        "network": run_set.network,
+                        "actionId": run_set.action_id,
+                        "walletId": run_set.wallet_id,
+                        "allowedTargets": run_set.allowed_targets,
+                        "maxAmountBaseUnits": run_set.max_amount_base_units,
+                        "minimumRemainingBaseUnits": run_set.minimum_remaining_base_units,
+                        // Which layer holds each limit, so a reader is not left assuming the chain
+                        // enforces all of them.
+                        "declaration": declaration,
+                    }),
+                )
+            }
+            None => tool_ok(
+                id,
+                json!({
+                    "runSet": null,
+                    "note": "No run-set is loaded, so there are no capabilities to report. Stated \
+                             rather than answered with an empty object, which would read as \
+                             \"no limits\"."
+                }),
+            ),
+        },
         "rill_explain_rejection" => match &context.last_rejection {
             Some(reason) => tool_ok(id, json!({ "lastRejection": reason })),
             None => tool_ok(
@@ -171,19 +203,91 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
                 json!({ "lastRejection": null, "note": "Nothing has been refused yet." }),
             ),
         },
-        "rill_execute_rill_action" => {
-            // Honest refusal. The validation chain and the signing key both exist and are tested;
-            // what is missing is the run-set that pins what this run may do, and signing without
-            // one would mean signing against limits nobody set.
-            let reason =
-                "Execution is not available on this build: no run-set is loaded, so there \
-                          are no pinned limits to validate against. Refusing to sign rather than \
-                          signing against limits nobody set.";
-            context.last_rejection = Some(reason.to_string());
-            tool_error(id, "no_run_set", reason)
-        }
+        "rill_execute_rill_action" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
+}
+
+/// Validate an envelope against the pinned run-set.
+///
+/// Every refusal is remembered so `rill_explain_rejection` can answer without re-running anything,
+/// and every refusal names which check failed rather than saying "policy violation" — an operator
+/// reading the latter learns nothing about what to fix.
+///
+/// Submission is not wired: the validation chain ends at [`rill_policy::Simulated`], which is the
+/// only type that can be signed, and going further needs a live fullnode this function does not
+/// have. What is proven here is that a bad envelope never reaches that type.
+fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(run_set) = context.run_set.as_ref() else {
+        let reason = "No run-set is loaded, so there are no pinned limits to validate against. \
+                      Refusing to sign rather than signing against limits nobody set.";
+        context.last_rejection = Some(reason.to_string());
+        return tool_error(id, "no_run_set", reason);
+    };
+    if context.keystore.is_none() {
+        let reason = "No signing key is configured.";
+        context.last_rejection = Some(reason.to_string());
+        return tool_error(id, "no_key", reason);
+    }
+    // Mainnet needs an explicit opt-in, and it is checked before anything is parsed — the cheapest
+    // possible place to stop.
+    if run_set.network == rill_core::envelope::Network::Mainnet && !context.mainnet_allowed {
+        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.";
+        context.last_rejection = Some(reason.to_string());
+        return tool_error(id, "mainnet_not_opted_in", reason);
+    }
+
+    let Some(envelope_value) = params.get("arguments").and_then(|a| a.get("envelope")) else {
+        return tool_error(id, "invalid_arguments", "envelope is required.");
+    };
+    let envelope: rill_core::envelope::ExecutionEnvelope =
+        match serde_json::from_value(envelope_value.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                let reason = format!("the envelope did not parse: {e}");
+                context.last_rejection = Some(reason.clone());
+                return tool_error(id, "malformed_envelope", &reason);
+            }
+        };
+
+    let policy = match run_set.to_policy() {
+        Ok(p) => p,
+        Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let validated = match rill_policy::RawEnvelope::new(envelope).validate(&policy, now_ms) {
+        Ok(v) => v,
+        Err(rejection) => {
+            let reason = rejection.to_string();
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, "policy_rejection", &reason);
+        }
+    };
+    let pinned = match validated.pin_bytes() {
+        Ok(p) => p,
+        Err(rejection) => {
+            let reason = rejection.to_string();
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, "policy_rejection", &reason);
+        }
+    };
+
+    tool_ok(
+        id,
+        json!({
+            "validated": true,
+            "digest": pinned.pinned_digest(),
+            "spendBaseUnits": pinned.envelope().resolved_params.as_ref()
+                .map(|p| p.spend_amount_mist.clone()),
+            "note": "The envelope passed every local check and is byte-pinned. Submission is not \
+                     wired on this build: the next step re-simulates against a live fullnode, and \
+                     only the type produced by that step can be signed."
+        }),
+    )
 }
 
 /// Read messages from `input`, write replies to `output`.
@@ -340,10 +444,14 @@ mod tests {
             lines[0]["result"]["structuredContent"]["code"],
             "no_run_set"
         );
-        assert!(lines[1]["result"]["structuredContent"]["lastRejection"]
-            .as_str()
-            .unwrap()
-            .contains("no run-set"));
+        assert!(
+            lines[1]["result"]["structuredContent"]["lastRejection"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("run-set"),
+            "the refusal must survive into explain_rejection"
+        );
     }
 
     #[test]
@@ -352,5 +460,207 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"rill_do_anything","arguments":{}}}"#,
         );
         assert_eq!(out[0]["error"]["code"], -32602);
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use crate::runset::RunSet;
+
+    fn run_set() -> RunSet {
+        serde_json::from_value(serde_json::json!({
+            "label": "hero-testnet",
+            "network": "testnet",
+            "sender": "0xagent",
+            "actionId": "skill_hero",
+            "walletPackageId": "0xpkg",
+            "walletId": "0xwallet",
+            "agentCapId": "0xcap",
+            "versionId": "0xversion",
+            "capabilityManifest": {
+                "walletCoinType": "0x2::sui::SUI",
+                "rules": [{ "kind": "budget", "totalMist": "5000000000" }]
+            },
+            "allowedTargets": ["0xpkg::agent_wallet::request_spend"],
+            "allowedObjectIds": ["0xwallet"],
+            "maxAmountBaseUnits": "2000000000",
+            "declaredSpendBaseUnits": "2000000000",
+            "minimumRemainingBaseUnits": "0",
+            "gasCeilingBaseUnits": "50000000"
+        }))
+        .unwrap()
+    }
+
+    fn context_with_run_set() -> WalletContext {
+        use sui_crypto::ed25519::Ed25519PrivateKey;
+        let encoded = Ed25519PrivateKey::new([11u8; 32]).to_suiprivkey().unwrap();
+        WalletContext::new(
+            Some(Keystore::from_suiprivkey(&encoded).unwrap()),
+            "testnet".into(),
+            false,
+        )
+        .with_run_set(Some(run_set()))
+    }
+
+    const PTB: &str = "AAA=";
+
+    fn envelope(overrides: serde_json::Value) -> Value {
+        let mut base = json!({
+            "version": "1",
+            "actionId": "skill_hero",
+            "actionDigest": rill_core::envelope::digest_unsigned_ptb(PTB),
+            "network": "testnet",
+            "sender": "0xagent",
+            "walletPackageId": "0xpkg",
+            "walletId": "0xwallet",
+            "agentCapId": "0xcap",
+            "balanceManagerId": "0xbm",
+            "tradeCapId": "0xtc",
+            "resolvedParams": {
+                "poolKey": "DEEP_SUI", "poolId": "0xpool", "clientOrderId": "1",
+                "spendAmountMist": "1000000000", "price": "2.5", "quantity": "1",
+                "depositSui": "1", "isBid": true, "payWithDeep": false
+            },
+            "allowedTargets": ["0xpkg::agent_wallet::request_spend"],
+            "requiredObjectIds": ["0xwallet"],
+            "requiredGuards": [],
+            "unsignedPtb": PTB,
+            "preview": "place a limit order",
+            "simulation": {
+                "ok": true, "verification": "verified", "gasEstimate": "2000000",
+                "balanceChanges": [], "objectChanges": []
+            },
+            "expiresAt": far_future()
+        });
+        if let Some(map) = overrides.as_object() {
+            for (k, v) in map {
+                base[k] = v.clone();
+            }
+        }
+        base
+    }
+
+    fn far_future() -> String {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        let secs = ms / 1000;
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+            rem / 3600,
+            (rem / 60) % 60,
+            rem % 60,
+            ms % 1000
+        )
+    }
+
+    fn execute_with(ctx: &mut WalletContext, envelope: Value) -> Value {
+        let message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "rill_execute_rill_action", "arguments": { "envelope": envelope } }
+        });
+        handle(ctx, &message).expect("a request gets a reply")
+    }
+
+    #[test]
+    fn a_good_envelope_passes_every_local_check_and_is_byte_pinned() {
+        let mut ctx = context_with_run_set();
+        let out = execute_with(&mut ctx, envelope(json!({})));
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        assert_eq!(out["result"]["structuredContent"]["validated"], true);
+        assert!(out["result"]["structuredContent"]["digest"].is_string());
+    }
+
+    #[test]
+    fn an_envelope_for_another_action_is_refused_by_name() {
+        let mut ctx = context_with_run_set();
+        let out = execute_with(&mut ctx, envelope(json!({ "actionId": "skill_other" })));
+        assert_eq!(out["result"]["isError"], true);
+        let message = out["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(message.contains("skill_other"), "{message}");
+    }
+
+    /// The gate with no override anywhere in this workspace.
+    #[test]
+    fn an_unverified_simulation_is_refused_even_with_a_run_set_loaded() {
+        let mut ctx = context_with_run_set();
+        let mut env = envelope(json!({}));
+        env["simulation"]["verification"] = json!("unverified");
+        let out = execute_with(&mut ctx, env);
+        assert_eq!(out["result"]["isError"], true);
+        assert!(out["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("inconclusive"));
+    }
+
+    #[test]
+    fn a_spend_above_the_run_sets_ceiling_is_refused() {
+        let mut ctx = context_with_run_set();
+        let mut env = envelope(json!({}));
+        env["resolvedParams"]["spendAmountMist"] = json!("9000000000");
+        let out = execute_with(&mut ctx, env);
+        assert_eq!(out["result"]["isError"], true);
+    }
+
+    #[test]
+    fn a_digest_that_does_not_describe_the_bytes_is_refused() {
+        let mut ctx = context_with_run_set();
+        let out = execute_with(
+            &mut ctx,
+            envelope(json!({ "actionDigest": "00".repeat(32) })),
+        );
+        assert_eq!(out["result"]["isError"], true);
+    }
+
+    /// Every refusal is remembered, so an operator can ask what happened without re-running it.
+    #[test]
+    fn a_refusal_is_recoverable_through_explain_rejection() {
+        let mut ctx = context_with_run_set();
+        execute_with(&mut ctx, envelope(json!({ "actionId": "skill_other" })));
+        let out = handle(
+            &mut ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "rill_explain_rejection", "arguments": {} }
+            }),
+        )
+        .unwrap();
+        assert!(out["result"]["structuredContent"]["lastRejection"]
+            .as_str()
+            .unwrap()
+            .contains("skill_other"));
+    }
+
+    #[test]
+    fn capabilities_report_which_layer_holds_each_limit() {
+        let mut ctx = context_with_run_set();
+        let out = handle(
+            &mut ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "rill_list_capabilities", "arguments": {} }
+            }),
+        )
+        .unwrap();
+        let caps = &out["result"]["structuredContent"]["declaration"]["caps"];
+        assert_eq!(caps[0]["enforcement"], "on-chain");
     }
 }

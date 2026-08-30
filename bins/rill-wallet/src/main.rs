@@ -9,6 +9,7 @@
 use std::io::{stdin, stdout, BufReader};
 
 use rill_wallet::keystore::Keystore;
+use rill_wallet::runset::RunSet;
 use rill_wallet::stdio::{serve, WalletContext};
 
 fn main() {
@@ -21,6 +22,32 @@ fn main() {
             None
         }
     };
+    // Loaded at startup. A run-set paired with the wrong key must fail here, where the operator
+    // is looking, rather than at signing time, where it costs a user an unexplained refusal.
+    let run_set = match RunSet::path_from_env() {
+        Some(path) => match RunSet::from_path(&path) {
+            Ok(run_set) => {
+                if let Some(store) = &keystore {
+                    if let Err(e) = run_set.check_key(&store.address().to_string()) {
+                        eprintln!("rill-wallet: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Some(run_set)
+            }
+            Err(e) => {
+                eprintln!("rill-wallet: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!(
+                "rill-wallet: no run-set configured; execution will refuse. Set RILL_RUN_SET_PATH."
+            );
+            None
+        }
+    };
+
     let network = std::env::var("SUI_NETWORK").unwrap_or_else(|_| "testnet".into());
     let mainnet_allowed = std::env::var("RILL_ALLOW_MAINNET").as_deref() == Ok("true");
 
@@ -50,7 +77,7 @@ fn main() {
         None => eprintln!("rill-wallet started with no key; only read-only tools will answer"),
     }
 
-    let mut context = WalletContext::new(keystore, network, mainnet_allowed);
+    let mut context = WalletContext::new(keystore, network, mainnet_allowed).with_run_set(run_set);
     if let Err(e) = serve(&mut context, BufReader::new(stdin()), stdout()) {
         eprintln!("rill-wallet: transport stopped: {e}");
         std::process::exit(1);
