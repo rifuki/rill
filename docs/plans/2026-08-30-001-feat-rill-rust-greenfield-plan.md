@@ -565,6 +565,33 @@ Dockerfile becomes a multi-stage Rust build producing a static-ish binary; `curl
 
 `rill-server` serves the existing frontend and existing MCP clients with no client-side changes; `rill-wallet` ships under its existing release asset names and can complete a run-set creation followed by a validated, signed, submitted DeepBook order against the v3 contract; both are deployed through the existing GHCR + Dokploy path; and `rill-core` has no I/O in its dependency graph.
 
+### Status at 2026-08-31
+
+Verified on this machine, not asserted:
+
+- **`rill-server`** — 2.8 MB binary; `/health`, the two `/.well-known` discovery documents, and
+  `POST /mcp` (401 with `WWW-Authenticate`, exposed to the browser) answered by the running
+  process. `rill_build_action` compiles, simulates, and returns an envelope that `rill-policy`
+  accepts — checked by building one and validating it with the signer's own code.
+- **`rill-wallet`** — 854 KB binary, drives a real MCP handshake over a pipe; four tools with
+  annotations, exactly one marked destructive.
+- **Runtime image** — 121 MB, builds from this Dockerfile, runs as uid 10001, and Docker's own
+  `HEALTHCHECK` reports `healthy`.
+- **Gates** — 222 tests, clippy clean at `-D warnings`, `rill-core` free of I/O and of any
+  floating-point type.
+
+Not done, and not hidden:
+
+- **Pushing to GHCR and triggering Dokploy** needs credentials and a registry that are not this
+  agent's to use. The CI job that builds the image, runs it, and fails unless the container
+  answers its own healthcheck is written and will run on the first push.
+- **`rill_execute_rill_action` refuses.** The validation chain and the key both exist and are
+  tested; the run-set that pins what a given run may do does not. Signing without one would mean
+  signing against limits nobody set.
+- **Cetus and Haedal adapters** are not written. Only the DeepBook path builds.
+- **U2 is still open** — which deployed `agent_wallet` package carries `request_spend`. Every test
+  here stays green under the wrong answer, and the transaction still aborts on chain.
+
 ---
 
 ## Sources & Research
