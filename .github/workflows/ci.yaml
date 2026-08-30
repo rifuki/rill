@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # The architecture's load-bearing invariant (KTD-1). rill-core holds two thirds of the
+  # system's logic and must stay unable to perform I/O — not by convention, but because it
+  # cannot name anything that does. A dependency added three crates away that drags tokio
+  # into rill-core would be invisible in review; it is not invisible here.
+  purity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: rill-core must have no I/O in its dependency graph
+        run: |
+          if cargo tree -p rill-core --edges normal \
+             | grep -E '\b(tokio|axum|sui-rpc|reqwest|hyper|tonic)\b'; then
+            echo "::error::rill-core gained an I/O dependency. See KTD-1 in docs/plans/."
+            exit 1
+          fi
+          echo "rill-core is pure."
+
+  move:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move tests
+        run: echo "TODO(U2): sui move test for agent_wallet and rill_guard"

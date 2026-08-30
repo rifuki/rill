@@ -1,0 +1,17 @@
+[package]
+name = "rill-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rill-core = { workspace = true }
+rill-chain = { workspace = true }
+rill-ptb = { workspace = true }
+rill-mcp = { workspace = true }
+rill-auth = { workspace = true }
+rill-store = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

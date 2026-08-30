@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rill-core",
+    "crates/rill-chain",
+    "crates/rill-ptb",
+    "crates/rill-policy",
+    "crates/rill-mcp",
+    "crates/rill-auth",
+    "crates/rill-store",
+    "bins/rill-server",
+    "bins/rill-wallet",
+]
+
+# Every external dependency is pinned with `=`. All Sui crates are 0.x, where a
+# minor bump may break; axum has no 1.0 and is accumulating 0.9 changes on main.
+# Upgrades are deliberate units of work, never incidental. (KTD-9)
+[workspace.dependencies]
+rill-core   = { path = "crates/rill-core" }
+rill-chain  = { path = "crates/rill-chain" }
+rill-ptb    = { path = "crates/rill-ptb" }
+rill-policy = { path = "crates/rill-policy" }
+rill-mcp    = { path = "crates/rill-mcp" }
+rill-auth   = { path = "crates/rill-auth" }
+rill-store  = { path = "crates/rill-store" }
+
+sui-sdk-types           = "=0.3.2"
+sui-transaction-builder = "=0.3.2"
+sui-crypto              = { version = "=0.3.1", features = ["ed25519", "secp256k1", "secp256r1"] }
+sui-rpc                 = "=0.3.2"
+
+rmcp = "=3.1.4"
+axum = "=0.8.9"
+
+tokio      = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+hmac       = "0.12"
+base64     = "0.22"
+rand       = "0.9"
+thiserror  = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"

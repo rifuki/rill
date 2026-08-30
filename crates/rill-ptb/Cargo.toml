@@ -1,0 +1,12 @@
+[package]
+name = "rill-ptb"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rill-core = { workspace = true }
+rill-chain = { workspace = true }
+sui-transaction-builder = { workspace = true }
+sui-sdk-types = { workspace = true }
+thiserror = { workspace = true }

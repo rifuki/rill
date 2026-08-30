@@ -1,0 +1,17 @@
+[package]
+name = "rill-wallet"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rill-core = { workspace = true }
+rill-chain = { workspace = true }
+rill-ptb = { workspace = true }
+rill-policy = { workspace = true }
+rill-mcp = { workspace = true }
+sui-crypto = { workspace = true }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
