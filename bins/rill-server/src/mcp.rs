@@ -52,12 +52,16 @@ fn unauthorized(state: &AppState, description: &str) -> Response {
 }
 
 /// Who is calling, established from the bearer token alone.
-fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String, Response> {
+///
+/// The error side is a fully-formed `Response` rather than an error code, because a 401 here has
+/// to carry the `WWW-Authenticate` discovery header and only this function knows the base URL to
+/// build it from. Boxed to keep the `Result` small.
+fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String, Box<Response>> {
     let Some(token) = bearer_from_header(authorization) else {
-        return Err(unauthorized(
+        return Err(Box::new(unauthorized(
             state,
             "An OAuth 2.1 access token is required.",
-        ));
+        )));
     };
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -73,17 +77,19 @@ fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String,
             now_secs,
         },
     )
-    .map_err(|e| unauthorized(state, &e.to_string()))?;
+    .map_err(|e| Box::new(unauthorized(state, &e.to_string())))?;
 
     if !claims.scope.split_whitespace().any(|s| s == "mcp") {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "insufficient_scope",
-                "error_description": "The \"mcp\" scope is required."
-            })),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "insufficient_scope",
+                    "error_description": "The \"mcp\" scope is required."
+                })),
+            )
+                .into_response(),
+        ));
     }
     Ok(claims.sub)
 }
@@ -246,7 +252,7 @@ pub async fn post(
 ) -> Response {
     let owner = match authenticate(&state, authorization) {
         Ok(o) => o,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     // Only now is the body worth looking at. A parse failure is JSON-RPC 2.0 §5.1's parse error.
