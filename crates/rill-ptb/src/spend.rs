@@ -19,6 +19,8 @@ use rill_core::manifest::{to_on_chain_rule_params, CapabilityManifest, ManifestE
 use sui_sdk_types::{Address, Identifier};
 use sui_transaction_builder::{Argument, Function, ObjectInput, TransactionBuilder};
 
+use crate::shared::{SharedObjects, UnknownSharedVersion};
+
 /// Sui's shared `Clock`. Always at this address, on every network.
 pub const CLOCK_ID: &str = "0x6";
 
@@ -41,6 +43,8 @@ pub struct WalletBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendError {
+    /// A shared object was referenced before its initial version was known.
+    UnknownShared(UnknownSharedVersion),
     ZeroAmount,
     Manifest(ManifestError),
     /// A rule is attached on-chain but this builder does not know how to prove it. Refusing is the
@@ -53,6 +57,7 @@ pub enum SpendError {
 impl std::fmt::Display for SpendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownShared(e) => write!(f, "{e}"),
             Self::ZeroAmount => write!(f, "refusing to build a spend of zero"),
             Self::Manifest(e) => write!(f, "capability manifest is invalid: {e}"),
             Self::UnprovableRule(module) => write!(
@@ -66,6 +71,12 @@ impl std::fmt::Display for SpendError {
 }
 
 impl std::error::Error for SpendError {}
+
+impl From<UnknownSharedVersion> for SpendError {
+    fn from(e: UnknownSharedVersion) -> Self {
+        Self::UnknownShared(e)
+    }
+}
 
 fn ident(s: &str) -> Result<Identifier, SpendError> {
     Identifier::new(s).map_err(|_| SpendError::BadIdentifier(s.to_owned()))
@@ -81,6 +92,8 @@ pub fn build_manifest_gated_spend(
     tx: &mut TransactionBuilder,
     binding: &WalletBinding,
     amount_base_units: u64,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
 ) -> Result<Argument, SpendError> {
     if amount_base_units == 0 {
         return Err(SpendError::ZeroAmount);
@@ -93,13 +106,10 @@ pub fn build_manifest_gated_spend(
         .map_err(|_| SpendError::BadIdentifier(binding.coin_type.clone()))?;
 
     // Shared objects. The wallet and version are mutated by the sequence; the clock is read.
-    let wallet = tx.object(ObjectInput::shared(binding.wallet_id, 0, true));
-    let version = tx.object(ObjectInput::shared(binding.version_id, 0, false));
-    let clock = tx.object(ObjectInput::shared(
-        CLOCK_ID.parse().expect("0x6 is a valid address"),
-        0,
-        false,
-    ));
+    // Each carries the version it was first shared at, read from the chain — see `shared`.
+    let wallet = tx.object(shared.input(binding.wallet_id, true)?);
+    let version = tx.object(shared.input(binding.version_id, false)?);
+    let clock = tx.object(shared.input(CLOCK_ID.parse().expect("0x6 is a valid address"), false)?);
     let cap = tx.object(binding.cap.clone());
     let amount = tx.pure(&amount_base_units);
 

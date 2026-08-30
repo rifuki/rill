@@ -36,6 +36,10 @@ pub mod rill_chain_types {
         pub object_type: Option<String>,
         /// Raw JSON of the object's fields, when requested. `None` when only the reference was read.
         pub fields: Option<serde_json::Value>,
+        /// The version this object was first shared at, for a shared object; `None` when it is
+        /// owned. This is what a transaction must reference a shared object by — not its current
+        /// version, and never zero.
+        pub shared_initial_version: Option<u64>,
     }
 
     /// A coin balance delta observed during simulation or execution.
@@ -72,6 +76,12 @@ pub mod rill_chain_types {
         pub balance_changes: Vec<BalanceDelta>,
         /// One entry per PTB command, in order — the devInspect-style return values.
         pub command_output_count: usize,
+        /// The BCS bytes each command returned, command by command.
+        ///
+        /// Carried rather than merely counted because a Move function with a return value — a
+        /// pool's mid price, a quote, a balance — is read by simulating a call to it and taking
+        /// the bytes back out. Counting them would say a value arrived without saying what it was.
+        pub command_returns: Vec<Vec<Vec<u8>>>,
     }
 
     /// The result of actually submitting a transaction.
@@ -123,6 +133,23 @@ pub trait SuiRead {
     /// Evaluate an unsigned transaction. Takes base64 BCS so this trait stays independent of the
     /// transaction-builder crate.
     async fn simulate(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome>;
+
+    /// Evaluate a transaction purely to read a Move function's return value.
+    ///
+    /// # This is not the gate, and must never be used as one
+    ///
+    /// Input checks are turned off, which is what makes a read possible at all: a call to
+    /// `pool::mid_price` has no sender who owns anything and no gas coin to pay with, and with
+    /// checks on the node refuses it before reaching the function. Off, it runs the code and hands
+    /// back what it returned.
+    ///
+    /// That is also exactly why it cannot stand in for [`simulate`]: a transaction that passes here
+    /// has not been shown to be payable, authorised, or executable — only that its Move code does
+    /// not abort. The strict gate before signing asks the other question, and asks it with checks
+    /// on.
+    ///
+    /// [`simulate`]: SuiRead::simulate
+    async fn simulate_read(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome>;
 }
 
 /// Writes. Separated from [`SuiRead`] so that a component which only needs to read cannot be

@@ -1,6 +1,7 @@
 //! The funding sequence: shape, ordering, and which rules produce a proof.
 
 use rill_core::manifest::{CapabilityManifest, CapabilityRule};
+use rill_ptb::shared::SharedObjects;
 use rill_ptb::spend::{
     build_manifest_gated_spend, expected_spend_targets, SpendError, WalletBinding,
 };
@@ -11,6 +12,18 @@ const PKG: &str = "0x00000000000000000000000000000000000000000000000000000000000
 
 fn addr(hex: &str) -> Address {
     hex.parse().expect("address")
+}
+
+/// Every shared object these fixtures reference, at a plausible non-zero initial version.
+///
+/// Never 0: a test that entered zero would pass while re-encoding the defect `SharedObjects`
+/// exists to stop.
+fn resolved() -> SharedObjects {
+    let mut shared = SharedObjects::new();
+    for n in 0x01u32..=0xffff {
+        shared.insert(addr(&format!("0x{n:064x}")), 400_000 + n as u64);
+    }
+    shared
 }
 
 fn binding(rules: Vec<CapabilityRule>) -> WalletBinding {
@@ -118,7 +131,8 @@ fn the_sequence_builds_into_a_real_transaction() {
         Digest::ZERO,
     )]);
 
-    let coin = build_manifest_gated_spend(&mut tx, &b, 1_000_000).expect("spend should build");
+    let coin = build_manifest_gated_spend(&mut tx, &b, 1_000_000, &resolved())
+        .expect("spend should build");
     // The released coin must be fully consumed, or execution aborts with UnusedValueWithoutDrop.
     let recipient = tx.pure(&b.wallet_id);
     tx.transfer_objects(vec![coin], recipient);
@@ -134,7 +148,7 @@ fn a_zero_spend_is_refused() {
     }]);
     let mut tx = TransactionBuilder::new();
     assert!(matches!(
-        build_manifest_gated_spend(&mut tx, &b, 0),
+        build_manifest_gated_spend(&mut tx, &b, 0, &resolved()),
         Err(SpendError::ZeroAmount)
     ));
 }
@@ -146,7 +160,7 @@ fn a_manifest_with_no_rules_cannot_produce_a_spend() {
     let b = binding(vec![]);
     let mut tx = TransactionBuilder::new();
     assert!(matches!(
-        build_manifest_gated_spend(&mut tx, &b, 1),
+        build_manifest_gated_spend(&mut tx, &b, 1, &resolved()),
         Err(SpendError::Manifest(_))
     ));
     assert!(expected_spend_targets(&b).is_err());

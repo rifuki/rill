@@ -1,15 +1,15 @@
 [package]
-name = "rill-wallet"
+name = "rill"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [lib]
-name = "rill_wallet"
+name = "rill_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rill-wallet"
+name = "rill"
 path = "src/main.rs"
 
 [dependencies]

@@ -19,6 +19,7 @@ use rill_core::envelope::{
 };
 use rill_core::manifest::CapabilityManifest;
 use rill_ptb::deepbook::{expected_order_targets, place_limit_order, LimitOrder, PoolSpec};
+use rill_ptb::shared::SharedObjects;
 use rill_ptb::spend::{build_manifest_gated_spend, expected_spend_targets, WalletBinding};
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -75,9 +76,58 @@ impl BuildOutcome {
     }
 }
 
+/// Read the version each shared object was first shared at.
+///
+/// A shared object is referenced by the version it was *shared* at, not its current version and not
+/// zero — a wrong one is rejected by the node before execution, with a message about the object
+/// being missing that points at the address rather than the version. So it is read here, and an
+/// object that turns out not to be shared is refused rather than entered anyway.
+async fn resolve_shared(
+    request: &BuildRequest,
+    chain: &impl SuiRead,
+) -> Result<SharedObjects, BuildOutcome> {
+    let mut shared = SharedObjects::new();
+    for id in [
+        request.wallet_id,
+        request.version_id,
+        request.pool.pool_id,
+        request.balance_manager_id,
+    ] {
+        if shared.get(id).is_ok() {
+            continue;
+        }
+        let summary = chain
+            .get_object(&id.to_string())
+            .await
+            .map_err(|e| match e {
+                ChainError::NotFound(_) => BuildOutcome::refuse(
+                    "shared_object_missing",
+                    format!("{id} does not exist on this network"),
+                ),
+                other => BuildOutcome::refuse("chain_unavailable", other.to_string()),
+            })?;
+        let version = summary.shared_initial_version.ok_or_else(|| {
+            BuildOutcome::refuse(
+                "not_a_shared_object",
+                format!(
+                    "{id} is not a shared object, so it cannot be referenced as one; check the \
+                     address before anything is signed"
+                ),
+            )
+        })?;
+        shared.insert(id, version);
+    }
+    Ok(shared)
+}
+
 /// Assemble, serialize, simulate, and — only if the simulation succeeded and was conclusive —
 /// return an envelope.
 pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) -> BuildOutcome {
+    let shared = match resolve_shared(request, chain).await {
+        Ok(s) => s,
+        Err(refusal) => return refusal,
+    };
+
     let binding = WalletBinding {
         package_id: request.wallet_package_id,
         wallet_id: request.wallet_id,
@@ -95,10 +145,11 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
 
     // Funding first: request_spend, one prove per attached rule, confirm_spend. The released coin
     // must be fully consumed, and the order below consumes it.
-    let coin = match build_manifest_gated_spend(&mut tx, &binding, request.spend_base_units) {
-        Ok(coin) => coin,
-        Err(e) => return BuildOutcome::refuse("spend_rejected", e.to_string()),
-    };
+    let coin =
+        match build_manifest_gated_spend(&mut tx, &binding, request.spend_base_units, &shared) {
+            Ok(coin) => coin,
+            Err(e) => return BuildOutcome::refuse("spend_rejected", e.to_string()),
+        };
 
     let order = LimitOrder {
         pool: request.pool.clone(),
@@ -110,7 +161,7 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
         is_bid: request.is_bid,
         pay_with_deep: request.pay_with_deep,
     };
-    if let Err(e) = place_limit_order(&mut tx, request.deepbook_package_id, &order, coin) {
+    if let Err(e) = place_limit_order(&mut tx, request.deepbook_package_id, &order, coin, &shared) {
         return BuildOutcome::refuse("order_rejected", e.to_string());
     }
 

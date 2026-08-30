@@ -7,7 +7,9 @@
 //! looking, so the amount is refused before a single command is emitted.
 
 use sui_sdk_types::{Address, Identifier};
-use sui_transaction_builder::{Argument, Function, ObjectInput, TransactionBuilder};
+use sui_transaction_builder::{Argument, Function, TransactionBuilder};
+
+use crate::shared::{SharedObjects, UnknownSharedVersion};
 
 /// Haedal's floor: one SUI, in mist. Below this, `request_stake` aborts with code 4.
 pub const MIN_STAKE_MIST: u64 = 1_000_000_000;
@@ -29,6 +31,8 @@ pub struct Stake {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HaedalError {
+    /// A shared object was referenced before its initial version was known.
+    UnknownShared(UnknownSharedVersion),
     /// Below Haedal's own minimum, refused before anything is built.
     BelowMinimum {
         amount: u64,
@@ -39,6 +43,7 @@ pub enum HaedalError {
 impl std::fmt::Display for HaedalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownShared(e) => write!(f, "{e}"),
             Self::BelowMinimum { amount } => write!(
                 f,
                 "staking {amount} mist is below Haedal's minimum of {MIN_STAKE_MIST} (1 SUI); this \
@@ -50,6 +55,12 @@ impl std::fmt::Display for HaedalError {
 }
 
 impl std::error::Error for HaedalError {}
+
+impl From<UnknownSharedVersion> for HaedalError {
+    fn from(e: UnknownSharedVersion) -> Self {
+        Self::UnknownShared(e)
+    }
+}
 
 fn ident(s: &str) -> Result<Identifier, HaedalError> {
     Identifier::new(s).map_err(|_| HaedalError::BadIdentifier(s.to_owned()))
@@ -63,6 +74,8 @@ pub fn request_stake(
     tx: &mut TransactionBuilder,
     stake: &Stake,
     sui_coin: Argument,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
 ) -> Result<(), HaedalError> {
     if stake.amount_mist < MIN_STAKE_MIST {
         return Err(HaedalError::BelowMinimum {
@@ -70,12 +83,11 @@ pub fn request_stake(
         });
     }
 
-    let system_state = tx.object(ObjectInput::shared(
+    let system_state = tx.object(shared.input(
         SUI_SYSTEM_STATE_ID.parse().expect("0x5 is a valid address"),
-        0,
         true,
-    ));
-    let staking = tx.object(ObjectInput::shared(stake.staking_object_id, 0, true));
+    )?);
+    let staking = tx.object(shared.input(stake.staking_object_id, true)?);
     let validator = tx.pure(&stake.validator);
 
     tx.move_call(

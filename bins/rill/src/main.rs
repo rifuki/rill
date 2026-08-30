@@ -8,9 +8,9 @@
 
 use std::io::{stdin, stdout, BufReader};
 
-use rill_wallet::keystore::Keystore;
-use rill_wallet::runset::RunSet;
-use rill_wallet::stdio::{serve, WalletContext};
+use rill_cli::keystore::Keystore;
+use rill_cli::runset::RunSet;
+use rill_cli::stdio::{serve, WalletContext};
 
 fn main() {
     let keystore = match Keystore::from_env() {

@@ -2,11 +2,24 @@
 
 use rill_ptb::cetus::{expected_swap_targets, swap, CetusError, Swap};
 use rill_ptb::haedal::{expected_stake_targets, request_stake, HaedalError, Stake, MIN_STAKE_MIST};
+use rill_ptb::shared::SharedObjects;
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 fn addr(n: u8) -> Address {
     format!("0x{:064x}", n).parse().unwrap()
+}
+
+/// Every shared object these fixtures reference, at a plausible non-zero initial version.
+///
+/// Deliberately never 0: a test that entered zero would pass while re-encoding the exact defect
+/// `SharedObjects` exists to stop.
+fn resolved() -> SharedObjects {
+    let mut shared = SharedObjects::new();
+    for n in 0x20u8..=0x80 {
+        shared.insert(addr(n), 400_000 + n as u64);
+    }
+    shared
 }
 
 fn funded() -> TransactionBuilder {
@@ -43,7 +56,7 @@ fn a_swap(a2b: bool, amount: u64) -> Swap {
 fn a_swap_builds_into_a_real_transaction() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 1_000_000);
-    let out = swap(&mut tx, &a_swap(true, 1_000_000), coin).expect("should build");
+    let out = swap(&mut tx, &a_swap(true, 1_000_000), coin, &resolved()).expect("should build");
     let recipient = tx.pure(&addr(9));
     tx.transfer_objects(vec![out], recipient);
     tx.try_build().expect("valid transaction");
@@ -55,7 +68,7 @@ fn both_swap_directions_build() {
     for a2b in [true, false] {
         let mut tx = funded();
         let coin = a_coin(&mut tx, 1_000_000);
-        let out = swap(&mut tx, &a_swap(a2b, 1_000_000), coin)
+        let out = swap(&mut tx, &a_swap(a2b, 1_000_000), coin, &resolved())
             .unwrap_or_else(|e| panic!("a2b={a2b}: {e}"));
         let recipient = tx.pure(&addr(9));
         tx.transfer_objects(vec![out], recipient);
@@ -68,7 +81,7 @@ fn a_swap_of_zero_is_refused() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 1);
     assert!(matches!(
-        swap(&mut tx, &a_swap(true, 0), coin),
+        swap(&mut tx, &a_swap(true, 0), coin, &resolved()),
         Err(CetusError::ZeroAmount)
     ));
 }
@@ -80,7 +93,7 @@ fn a_swap_with_an_unparseable_coin_type_is_refused() {
     let mut bad = a_swap(true, 1_000);
     bad.coin_type_b = "not a type".into();
     assert!(matches!(
-        swap(&mut tx, &bad, coin),
+        swap(&mut tx, &bad, coin, &resolved()),
         Err(CetusError::BadIdentifier(_))
     ));
 }
@@ -107,7 +120,8 @@ fn a_stake(amount: u64) -> Stake {
 fn a_stake_at_the_minimum_builds() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, MIN_STAKE_MIST);
-    request_stake(&mut tx, &a_stake(MIN_STAKE_MIST), coin).expect("exactly one SUI is allowed");
+    request_stake(&mut tx, &a_stake(MIN_STAKE_MIST), coin, &resolved())
+        .expect("exactly one SUI is allowed");
     tx.try_build().expect("valid transaction");
 }
 
@@ -118,7 +132,7 @@ fn a_stake_below_the_minimum_is_refused_before_any_command_is_emitted() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 1);
     assert!(matches!(
-        request_stake(&mut tx, &a_stake(MIN_STAKE_MIST - 1), coin),
+        request_stake(&mut tx, &a_stake(MIN_STAKE_MIST - 1), coin, &resolved()),
         Err(HaedalError::BelowMinimum { .. })
     ));
 }
@@ -127,7 +141,7 @@ fn a_stake_below_the_minimum_is_refused_before_any_command_is_emitted() {
 fn the_refusal_names_both_the_amount_and_the_floor() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 1);
-    let message = request_stake(&mut tx, &a_stake(500_000_000), coin)
+    let message = request_stake(&mut tx, &a_stake(500_000_000), coin, &resolved())
         .unwrap_err()
         .to_string();
     assert!(message.contains("500000000"));
@@ -144,7 +158,7 @@ fn the_stake_sequence_is_one_call() {
 fn a_swap_can_fund_a_stake_in_one_transaction() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 2_000_000_000);
-    let swapped = swap(&mut tx, &a_swap(false, 2_000_000_000), coin).expect("swap");
-    request_stake(&mut tx, &a_stake(MIN_STAKE_MIST), swapped).expect("stake");
+    let swapped = swap(&mut tx, &a_swap(false, 2_000_000_000), coin, &resolved()).expect("swap");
+    request_stake(&mut tx, &a_stake(MIN_STAKE_MIST), swapped, &resolved()).expect("stake");
     tx.try_build().expect("the composed flow must build");
 }

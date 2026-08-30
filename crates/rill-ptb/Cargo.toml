@@ -10,3 +10,9 @@ rill-chain = { workspace = true }
 sui-transaction-builder = { workspace = true }
 sui-sdk-types = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+bcs = "0.1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+rill-chain = { workspace = true }

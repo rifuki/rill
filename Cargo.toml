@@ -9,7 +9,7 @@ members = [
     "crates/rill-auth",
     "crates/rill-store",
     "bins/rill-server",
-    "bins/rill-wallet",
+    "bins/rill",
 ]
 
 # Every external dependency is pinned with `=`. All Sui crates are 0.x, where a

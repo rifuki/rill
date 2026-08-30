@@ -1222,6 +1222,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rill"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rill-chain",
+ "rill-core",
+ "rill-mcp",
+ "rill-policy",
+ "rill-ptb",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sui-crypto",
+ "sui-sdk-types",
+ "sui-transaction-builder",
+ "tokio",
+]
+
+[[package]]
 name = "rill-auth"
 version = "0.1.0"
 dependencies = [
@@ -1292,11 +1311,14 @@ dependencies = [
 name = "rill-ptb"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bcs",
  "rill-chain",
  "rill-core",
  "sui-sdk-types",
  "sui-transaction-builder",
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -1331,25 +1353,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "rill-wallet"
-version = "0.1.0"
-dependencies = [
- "rand",
- "rill-chain",
- "rill-core",
- "rill-mcp",
- "rill-policy",
- "rill-ptb",
- "rmcp",
- "serde",
- "serde_json",
- "sui-crypto",
- "sui-sdk-types",
- "sui-transaction-builder",
- "tokio",
 ]
 
 [[package]]

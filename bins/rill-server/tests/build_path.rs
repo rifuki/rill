@@ -7,6 +7,7 @@
 //! contract.
 
 use rill_chain::fake::{FakeSui, SimulationBehavior};
+use rill_chain::{ObjectRef, ObjectSummary};
 use rill_core::envelope::{digest_unsigned_ptb, Network};
 use rill_core::manifest::{CapabilityManifest, CapabilityRule};
 use rill_ptb::deepbook::PoolSpec;
@@ -18,6 +19,28 @@ const SUI: &str = "0x2::sui::SUI";
 
 fn addr(n: u8) -> Address {
     format!("0x{:064x}", n).parse().unwrap()
+}
+
+/// A fake chain carrying the four shared objects a build references, each at a non-zero initial
+/// shared version — the number the build must read rather than assume.
+fn chain_with_shared_objects() -> FakeSui {
+    let mut chain = FakeSui::new();
+    for n in [1u8, 3, 0x20, 0x21] {
+        chain = chain.with_object(
+            None,
+            ObjectSummary {
+                reference: ObjectRef {
+                    id: addr(n).to_string(),
+                    version: 500_000 + n as u64,
+                    digest: Digest::ZERO.to_string(),
+                },
+                object_type: None,
+                fields: None,
+                shared_initial_version: Some(400_000 + n as u64),
+            },
+        );
+    }
+    chain
 }
 
 fn request() -> rill_server::build::BuildRequest {
@@ -66,7 +89,7 @@ fn request() -> rill_server::build::BuildRequest {
 
 #[tokio::test]
 async fn a_good_build_produces_an_envelope_whose_digest_describes_its_own_bytes() {
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     let BuildOutcome::Built(envelope) = build(&request(), &chain, NOW).await else {
         panic!("this build should succeed");
     };
@@ -83,7 +106,7 @@ async fn a_good_build_produces_an_envelope_whose_digest_describes_its_own_bytes(
 /// against, so a build that emitted a different one would be refused downstream.
 #[tokio::test]
 async fn the_envelope_carries_the_whole_call_sequence_in_order() {
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     let BuildOutcome::Built(envelope) = build(&request(), &chain, NOW).await else {
         panic!("should build");
     };
@@ -100,7 +123,7 @@ async fn the_envelope_carries_the_whole_call_sequence_in_order() {
 /// second is how an unchecked transaction gets built.
 #[tokio::test]
 async fn an_unreachable_node_is_its_own_refusal_not_a_verdict() {
-    let chain = FakeSui::new().with_simulation(SimulationBehavior::Unreachable);
+    let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Unreachable);
     let BuildOutcome::Refused { code, .. } = build(&request(), &chain, NOW).await else {
         panic!("an unreachable node must not produce an envelope");
     };
@@ -109,7 +132,7 @@ async fn an_unreachable_node_is_its_own_refusal_not_a_verdict() {
 
 #[tokio::test]
 async fn a_failing_simulation_refuses_and_says_why() {
-    let chain = FakeSui::new().with_simulation(SimulationBehavior::Fails {
+    let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Fails {
         error: "MoveAbort(.., 5)".into(),
     });
     let BuildOutcome::Refused { code, reason } = build(&request(), &chain, NOW).await else {
@@ -126,7 +149,7 @@ async fn an_inconclusive_simulation_refuses() {
         "MoveAbort in {}::config: checked_package_version",
         rill_chain::CETUS_PACKAGE_IDS[0]
     );
-    let chain = FakeSui::new().with_simulation(SimulationBehavior::Fails { error });
+    let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Fails { error });
     let BuildOutcome::Refused { code, .. } = build(&request(), &chain, NOW).await else {
         panic!("should refuse");
     };
@@ -137,7 +160,7 @@ async fn an_inconclusive_simulation_refuses() {
 async fn a_manifest_with_no_rules_cannot_produce_a_build() {
     let mut r = request();
     r.manifest.rules.clear();
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     assert!(
         matches!(build(&r, &chain, NOW).await, BuildOutcome::Refused { .. }),
         "an ungated spend must not be buildable"
@@ -148,7 +171,7 @@ async fn a_manifest_with_no_rules_cannot_produce_a_build() {
 async fn a_price_that_cannot_be_represented_exactly_refuses_rather_than_rounding() {
     let mut r = request();
     r.price = "1.0000000000000001".into();
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     let BuildOutcome::Refused { code, .. } = build(&r, &chain, NOW).await else {
         panic!("should refuse");
     };
@@ -162,7 +185,7 @@ async fn what_the_server_builds_is_what_the_signer_accepts() {
     use rill_policy::{LocalPolicy, RawEnvelope};
 
     let r = request();
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     let BuildOutcome::Built(envelope) = build(&r, &chain, NOW).await else {
         panic!("should build");
     };
@@ -196,11 +219,55 @@ async fn what_the_server_builds_is_what_the_signer_accepts() {
 /// routines that disagree would make every envelope unsignable.
 #[tokio::test]
 async fn the_expiry_the_server_writes_is_the_one_the_signer_parses() {
-    let chain = FakeSui::new();
+    let chain = chain_with_shared_objects();
     let BuildOutcome::Built(envelope) = build(&request(), &chain, NOW).await else {
         panic!("should build");
     };
     let parsed = rill_policy::parse_rfc3339_ms(&envelope.expires_at)
         .expect("the signer must be able to read this timestamp");
     assert_eq!(parsed, NOW + ENVELOPE_TTL_MS);
+}
+
+/// A shared object entered at the wrong version is rejected by the node with a message about the
+/// object being *missing*, which sends whoever reads it to check the address — the one thing that
+/// was correct. So the build refuses first, and says which object it could not resolve.
+#[tokio::test]
+async fn an_unresolvable_shared_object_refuses_before_anything_is_built() {
+    // A chain that knows nothing: no pool, no wallet, no balance manager.
+    let chain = FakeSui::new();
+    let BuildOutcome::Refused { code, reason } = build(&request(), &chain, NOW).await else {
+        panic!("a build that cannot resolve its shared objects must not produce an envelope");
+    };
+    assert_eq!(code, "shared_object_missing");
+    assert!(
+        reason.contains(&addr(1).to_string()),
+        "the refusal must name the object it could not resolve: {reason}"
+    );
+}
+
+/// An owned object handed in where a shared one belongs is a different mistake with the same
+/// symptom, and it is worth naming separately.
+#[tokio::test]
+async fn an_owned_object_used_as_a_shared_one_is_refused_by_name() {
+    let mut chain = FakeSui::new();
+    for n in [1u8, 3, 0x20, 0x21] {
+        chain = chain.with_object(
+            None,
+            ObjectSummary {
+                reference: ObjectRef {
+                    id: addr(n).to_string(),
+                    version: 7,
+                    digest: Digest::ZERO.to_string(),
+                },
+                object_type: None,
+                fields: None,
+                // Owned, not shared.
+                shared_initial_version: None,
+            },
+        );
+    }
+    let BuildOutcome::Refused { code, .. } = build(&request(), &chain, NOW).await else {
+        panic!("an owned object cannot be referenced as a shared one");
+    };
+    assert_eq!(code, "not_a_shared_object");
 }

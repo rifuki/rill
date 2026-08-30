@@ -17,7 +17,7 @@ use crate::{
 
 /// Fields worth asking for on an object read. Requesting a mask rather than everything keeps the
 /// response small, and makes it obvious at the call site what the caller actually depends on.
-const OBJECT_MASK: &[&str] = &["object_id", "version", "digest", "object_type"];
+const OBJECT_MASK: &[&str] = &["object_id", "version", "digest", "object_type", "owner"];
 
 pub struct GrpcSui {
     client: Client,
@@ -47,6 +47,16 @@ fn to_summary(o: &sui_rpc::proto::sui::rpc::v2::Object) -> ObjectSummary {
         },
         object_type: o.object_type.clone(),
         fields: None,
+        // `Owner.version` carries the initial shared version when the object is shared, so it is
+        // read only for the SHARED kind — for an owned object the same field means nothing.
+        shared_initial_version: o.owner.as_ref().and_then(|owner| {
+            matches!(
+                owner.kind(),
+                sui_rpc::proto::sui::rpc::v2::owner::OwnerKind::Shared
+            )
+            .then(|| owner.version)
+            .flatten()
+        }),
     }
 }
 
@@ -183,6 +193,78 @@ impl SuiRead for GrpcSui {
                 .map(|t| balance_deltas(&t.balance_changes))
                 .unwrap_or_default(),
             command_output_count: response.command_outputs.len(),
+            command_returns: response
+                .command_outputs
+                .iter()
+                .map(|c| {
+                    c.return_values
+                        .iter()
+                        .filter_map(|v| v.value.as_ref())
+                        .map(|b| b.value.clone().unwrap_or_default().to_vec())
+                        .collect()
+                })
+                .collect(),
+        })
+    }
+
+    async fn simulate_read(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
+        let transaction = decode_transaction(unsigned_tx_b64)?;
+
+        let mut request = SimulateTransactionRequest::default();
+        request.transaction = Some(transaction);
+        // Checks stay ON — a public fullnode applies them regardless of what this field asks for,
+        // so turning them off buys nothing and would only misdescribe what ran. What makes a
+        // keyless read work is the empty gas payment: the node selects and charges nothing against
+        // a transaction it is only evaluating.
+        request.checks = Some(TransactionChecks::Enabled as i32);
+        request.do_gas_selection = Some(true);
+
+        // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
+        // simulation, so a dropped connection can never read as "the transaction would fail" —
+        // or, worse, be smoothed into something a caller treats as a checked result.
+        let response = self
+            .client
+            .clone()
+            .execution_client()
+            .simulate_transaction(request)
+            .await
+            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .into_inner();
+
+        let executed = response.transaction.as_ref();
+        let effects = executed.and_then(|t| t.effects.as_ref());
+        let status = effects.and_then(|e| e.status.as_ref());
+        let ok = status.and_then(|s| s.success).unwrap_or(false);
+        let error = status
+            .and_then(|s| s.error.as_ref())
+            .and_then(|e| e.description.clone());
+
+        let verification = if ok {
+            Verification::Verified
+        } else {
+            classify_failure(error.as_deref().unwrap_or(""))
+        };
+
+        Ok(SimulationOutcome {
+            ok,
+            verification,
+            error,
+            gas_used_mist: net_gas(effects),
+            balance_changes: executed
+                .map(|t| balance_deltas(&t.balance_changes))
+                .unwrap_or_default(),
+            command_output_count: response.command_outputs.len(),
+            command_returns: response
+                .command_outputs
+                .iter()
+                .map(|c| {
+                    c.return_values
+                        .iter()
+                        .filter_map(|v| v.value.as_ref())
+                        .map(|b| b.value.clone().unwrap_or_default().to_vec())
+                        .collect()
+                })
+                .collect(),
         })
     }
 }

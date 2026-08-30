@@ -18,6 +18,8 @@ use rill_core::amounts::{
 use sui_sdk_types::{Address, Identifier};
 use sui_transaction_builder::{Argument, Function, ObjectInput, TransactionBuilder};
 
+use crate::shared::{SharedObjects, UnknownSharedVersion};
+
 use crate::spend::CLOCK_ID;
 
 /// DeepBook's default order type: no time-in-force restriction.
@@ -58,6 +60,8 @@ pub const FLOAT_SCALAR: u128 = 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepBookError {
+    /// A shared object was referenced before its initial version was known.
+    UnknownShared(UnknownSharedVersion),
     Amount {
         field: &'static str,
         source: AmountError,
@@ -68,6 +72,7 @@ pub enum DeepBookError {
 impl std::fmt::Display for DeepBookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownShared(e) => write!(f, "{e}"),
             Self::Amount { field, source } => write!(f, "{field}: {source}"),
             Self::BadIdentifier(s) => write!(f, "\"{s}\" is not a valid Move identifier"),
         }
@@ -75,6 +80,12 @@ impl std::fmt::Display for DeepBookError {
 }
 
 impl std::error::Error for DeepBookError {}
+
+impl From<UnknownSharedVersion> for DeepBookError {
+    fn from(e: UnknownSharedVersion) -> Self {
+        Self::UnknownShared(e)
+    }
+}
 
 fn ident(s: &str) -> Result<Identifier, DeepBookError> {
     Identifier::new(s).map_err(|_| DeepBookError::BadIdentifier(s.to_owned()))
@@ -95,6 +106,8 @@ pub fn place_limit_order(
     deepbook_package: Address,
     order: &LimitOrder,
     funding_coin: Argument,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
 ) -> Result<(), DeepBookError> {
     let price_base = deepbook_price_to_base_units(
         &order.price,
@@ -113,7 +126,7 @@ pub fn place_limit_order(
             source,
         })?;
 
-    let manager = tx.object(ObjectInput::shared(order.balance_manager_id, 0, true));
+    let manager = tx.object(shared.input(order.balance_manager_id, true)?);
 
     // 1. Deposit the funding coin. Type argument is the coin being deposited.
     tx.move_call(
@@ -139,12 +152,8 @@ pub fn place_limit_order(
     );
 
     // 3. Place the order. Twelve arguments, two type arguments, in DeepBook's declared order.
-    let pool = tx.object(ObjectInput::shared(order.pool.pool_id, 0, true));
-    let clock = tx.object(ObjectInput::shared(
-        CLOCK_ID.parse().expect("0x6 is a valid address"),
-        0,
-        false,
-    ));
+    let pool = tx.object(shared.input(order.pool.pool_id, true)?);
+    let clock = tx.object(shared.input(CLOCK_ID.parse().expect("0x6 is a valid address"), false)?);
     let args = vec![
         pool,
         manager,

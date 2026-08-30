@@ -44,6 +44,8 @@ struct State {
     simulation: SimulationBehavior,
     executions: Vec<String>,
     next_digest: usize,
+    /// What `simulate_read` hands back, command by command.
+    read_returns: Vec<Vec<Vec<u8>>>,
 }
 
 /// A configurable in-memory chain.
@@ -75,6 +77,12 @@ impl FakeSui {
             .borrow_mut()
             .balances
             .insert((owner.to_owned(), coin_type.to_owned()), amount);
+        self
+    }
+
+    /// Stage the BCS bytes a read should return — a mid price, a quote, a balance.
+    pub fn with_read_return(self, bytes: Vec<u8>) -> Self {
+        self.state.borrow_mut().read_returns.push(vec![bytes]);
         self
     }
 
@@ -131,6 +139,7 @@ impl SuiRead for FakeSui {
                 gas_used_mist,
                 balance_changes: Vec::new(),
                 command_output_count: 0,
+                command_returns: Vec::new(),
             }),
             SimulationBehavior::Fails { error } => Ok(SimulationOutcome {
                 ok: false,
@@ -139,11 +148,27 @@ impl SuiRead for FakeSui {
                 gas_used_mist: 0,
                 balance_changes: Vec::new(),
                 command_output_count: 0,
+                command_returns: Vec::new(),
             }),
             SimulationBehavior::Unreachable => {
                 Err(ChainError::Transport("fake node is unreachable".into()))
             }
         }
+    }
+
+    /// A read returns whatever `command_returns` was staged with, so a caller reading a price can
+    /// be tested without a node.
+    async fn simulate_read(&self, _unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
+        let returns = self.state.borrow().read_returns.clone();
+        Ok(SimulationOutcome {
+            ok: true,
+            verification: Verification::Verified,
+            error: None,
+            gas_used_mist: 0,
+            balance_changes: Vec::new(),
+            command_output_count: returns.len(),
+            command_returns: returns,
+        })
     }
 }
 

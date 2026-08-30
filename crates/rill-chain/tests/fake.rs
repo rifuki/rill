@@ -16,6 +16,7 @@ fn object(id: &str, ty: &str) -> ObjectSummary {
         },
         object_type: Some(ty.into()),
         fields: None,
+        shared_initial_version: None,
     }
 }
 

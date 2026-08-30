@@ -5,6 +5,7 @@ use rill_ptb::deepbook::{
     expected_order_targets, place_limit_order, DeepBookError, LimitOrder, PoolSpec,
 };
 use rill_ptb::guard::{assert_min_value, GuardError, GuardOutcome};
+use rill_ptb::shared::SharedObjects;
 use rill_ptb::spend::{build_manifest_gated_spend, expected_spend_targets, WalletBinding};
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -16,6 +17,18 @@ const SUI: &str = "0x2::sui::SUI";
 
 fn addr(hex: &str) -> Address {
     hex.parse().expect("address")
+}
+
+/// Every shared object these fixtures reference, at a plausible non-zero initial version.
+///
+/// Deliberately never 0: a test that entered zero would pass while re-encoding the exact defect
+/// `SharedObjects` exists to stop.
+fn resolved() -> SharedObjects {
+    let mut shared = SharedObjects::new();
+    for n in 0x01u32..=0xffff {
+        shared.insert(addr(&format!("0x{n:064x}")), 400_000 + n as u64);
+    }
+    shared
 }
 
 fn owned(hex: &str) -> ObjectInput {
@@ -71,8 +84,14 @@ fn an_order_builds_into_a_real_transaction() {
             .next()
             .unwrap()
     };
-    place_limit_order(&mut tx, addr(DEEPBOOK_PKG), &order("2.5", "1.5"), coin)
-        .expect("order should build");
+    place_limit_order(
+        &mut tx,
+        addr(DEEPBOOK_PKG),
+        &order("2.5", "1.5"),
+        coin,
+        &resolved(),
+    )
+    .expect("order should build");
     tx.try_build().expect("valid transaction");
 }
 
@@ -95,6 +114,7 @@ fn the_price_the_reference_rounds_wrong_builds_exactly() {
         addr(DEEPBOOK_PKG),
         &order("2362.123456", "1"),
         coin,
+        &resolved(),
     )
     .expect("an exactly-representable price must build");
     tx.try_build().expect("valid transaction");
@@ -114,7 +134,7 @@ fn a_price_that_cannot_be_represented_exactly_is_refused() {
     // More precision than the 1e12 multiplier can carry.
     let too_precise = order("1.0000000000000001", "1");
     assert!(matches!(
-        place_limit_order(&mut tx, addr(DEEPBOOK_PKG), &too_precise, coin),
+        place_limit_order(&mut tx, addr(DEEPBOOK_PKG), &too_precise, coin, &resolved()),
         Err(DeepBookError::Amount { .. })
     ));
 }
@@ -131,7 +151,13 @@ fn a_float_shaped_price_is_refused_before_it_reaches_the_chain() {
             .unwrap()
     };
     assert!(matches!(
-        place_limit_order(&mut tx, addr(DEEPBOOK_PKG), &order("1e-9", "1"), coin),
+        place_limit_order(
+            &mut tx,
+            addr(DEEPBOOK_PKG),
+            &order("1e-9", "1"),
+            coin,
+            &resolved()
+        ),
         Err(DeepBookError::Amount { .. })
     ));
 }
@@ -222,8 +248,16 @@ fn the_full_hero_path_builds_and_its_targets_are_the_pinned_sequence() {
     };
 
     let mut tx = funded_builder();
-    let coin = build_manifest_gated_spend(&mut tx, &binding, 1_000_000_000).expect("spend");
-    place_limit_order(&mut tx, addr(DEEPBOOK_PKG), &order("2.5", "1"), coin).expect("order");
+    let coin =
+        build_manifest_gated_spend(&mut tx, &binding, 1_000_000_000, &resolved()).expect("spend");
+    place_limit_order(
+        &mut tx,
+        addr(DEEPBOOK_PKG),
+        &order("2.5", "1"),
+        coin,
+        &resolved(),
+    )
+    .expect("order");
     tx.try_build()
         .expect("the hero path must produce a valid transaction");
 

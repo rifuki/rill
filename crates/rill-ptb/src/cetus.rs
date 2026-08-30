@@ -12,7 +12,9 @@
 
 use rill_core::amounts::AmountError;
 use sui_sdk_types::{Address, Identifier, TypeTag};
-use sui_transaction_builder::{Argument, Function, ObjectInput, TransactionBuilder};
+use sui_transaction_builder::{Argument, Function, TransactionBuilder};
+
+use crate::shared::{SharedObjects, UnknownSharedVersion};
 
 use crate::spend::CLOCK_ID;
 
@@ -38,6 +40,8 @@ pub struct Swap {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CetusError {
+    /// A shared object was referenced before its initial version was known.
+    UnknownShared(UnknownSharedVersion),
     BadIdentifier(String),
     Amount(AmountError),
     ZeroAmount,
@@ -46,6 +50,7 @@ pub enum CetusError {
 impl std::fmt::Display for CetusError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownShared(e) => write!(f, "{e}"),
             Self::BadIdentifier(s) => write!(f, "\"{s}\" is not a valid Move identifier or type"),
             Self::Amount(e) => write!(f, "{e}"),
             Self::ZeroAmount => write!(f, "refusing to build a swap of zero"),
@@ -54,6 +59,12 @@ impl std::fmt::Display for CetusError {
 }
 
 impl std::error::Error for CetusError {}
+
+impl From<UnknownSharedVersion> for CetusError {
+    fn from(e: UnknownSharedVersion) -> Self {
+        Self::UnknownShared(e)
+    }
+}
 
 fn ident(s: &str) -> Result<Identifier, CetusError> {
     Identifier::new(s).map_err(|_| CetusError::BadIdentifier(s.to_owned()))
@@ -82,6 +93,8 @@ pub fn swap(
     tx: &mut TransactionBuilder,
     swap: &Swap,
     funded_coin: Argument,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
 ) -> Result<Argument, CetusError> {
     if swap.amount == 0 {
         return Err(CetusError::ZeroAmount);
@@ -94,13 +107,9 @@ pub fn swap(
         (zero_coin(tx, &swap.coin_type_a)?, funded_coin)
     };
 
-    let config = tx.object(ObjectInput::shared(swap.global_config_id, 0, false));
-    let pool = tx.object(ObjectInput::shared(swap.pool_id, 0, true));
-    let clock = tx.object(ObjectInput::shared(
-        CLOCK_ID.parse().expect("0x6 is a valid address"),
-        0,
-        false,
-    ));
+    let config = tx.object(shared.input(swap.global_config_id, false)?);
+    let pool = tx.object(shared.input(swap.pool_id, true)?);
+    let clock = tx.object(shared.input(CLOCK_ID.parse().expect("0x6 is a valid address"), false)?);
 
     let args = vec![
         config,
