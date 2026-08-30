@@ -3,6 +3,7 @@
 //! The binary is a thin `main` over this. Tests build the same router the process does and drive
 //! it through `tower`, which means what they test is what ships rather than a re-declaration of it.
 
+pub mod build;
 pub mod envelope;
 pub mod mcp;
 pub mod routes;

@@ -1304,6 +1304,8 @@ name = "rill-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "bcs",
  "http-body-util",
  "rill-auth",
  "rill-chain",
@@ -1314,6 +1316,8 @@ dependencies = [
  "rill-store",
  "serde",
  "serde_json",
+ "sui-sdk-types",
+ "sui-transaction-builder",
  "tokio",
  "tower",
  "tower-http",

@@ -26,6 +26,14 @@ serde_json = { workspace = true }
 rill-policy = { workspace = true }
 tower-http = { version = "0.6", features = ["cors"] }
 
+sui-sdk-types = { workspace = true }
+
+sui-transaction-builder = { workspace = true }
+
+base64 = { workspace = true }
+
+bcs = "0.1"
+
 [dev-dependencies]
 rill-auth = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
