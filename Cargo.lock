@@ -1228,9 +1228,11 @@ dependencies = [
 name = "rill-chain"
 version = "0.1.0"
 dependencies = [
+ "prost-types",
  "rill-core",
  "sui-rpc",
  "sui-sdk-types",
+ "sui-transaction-builder",
  "thiserror 2.0.20",
  "tokio",
 ]
