@@ -1,0 +1,92 @@
+name: Release
+
+# The asset names are a contract, not a convention. The reference deployment hands users a curl
+# command pointing at these exact filenames, and its own tests assert them — so a rename here
+# silently breaks every install instruction already in the wild.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  wallet:
+    name: rill-wallet (${{ matrix.asset }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners rather than cross-compilation: the signer links a TLS stack and a
+          # crypto library, and a binary that builds under cross but fails at runtime on a user's
+          # machine is the worst of both.
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            asset: rill-wallet-darwin-arm64
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            asset: rill-wallet-darwin-x64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: rill-wallet-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin rill-wallet
+
+      # The binary must actually run on the machine it was built for. A cross-compiled artifact
+      # that cannot start is indistinguishable from a working one until a user downloads it.
+      - name: The binary must start and report itself
+        run: |
+          BIN=target/${{ matrix.target }}/release/rill-wallet
+          "$BIN" --status || true          # exits 1 with no key, which is correct
+          "$BIN" --status 2>&1 | grep -q "rill-wallet" || {
+            echo "::error::the binary did not identify itself"; exit 1; }
+
+      - name: Name it exactly what users already curl
+        run: |
+          cp target/${{ matrix.target }}/release/rill-wallet "${{ matrix.asset }}"
+          shasum -a 256 "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  publish:
+    needs: wallet
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      # Checksums ship alongside the binaries. A user handed a curl command has no other way to
+      # tell whether what arrived is what was built.
+      - name: Attach every asset to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rill-wallet-darwin-arm64
+            rill-wallet-darwin-arm64.sha256
+            rill-wallet-darwin-x64
+            rill-wallet-darwin-x64.sha256
+            rill-wallet-linux-x64
+            rill-wallet-linux-x64.sha256
+          fail_on_unmatched_files: true
