@@ -1,0 +1,227 @@
+{
+  "$schema_note": "Golden capability-manifest projections captured from the TypeScript reference before the Rust port was written. The declaration text is rendered in two places in the reference (the frontend locally, and the backend via /api/capabilities/preview) and had to agree exactly with nothing enforcing it; these vectors are what let the Rust implementation become the single producer without changing what anyone sees.",
+  "cases": [
+    {
+      "name": "budget only",
+      "manifest": {
+        "walletCoinType": "0x2::sui::SUI",
+        "rules": [
+          {
+            "kind": "budget",
+            "totalMist": "5000000000"
+          }
+        ]
+      },
+      "declaration": {
+        "summaryLines": [
+          "Budget \u2264 5 SUI total"
+        ],
+        "caps": [
+          {
+            "label": "Budget",
+            "value": "5 SUI",
+            "enforcement": "on-chain"
+          }
+        ]
+      },
+      "onChainRuleParams": [
+        {
+          "module": "budget",
+          "config": {
+            "totalMist": "5000000000"
+          }
+        }
+      ],
+      "signerPolicy": {
+        "maxAmountMist": "5000000000"
+      }
+    },
+    {
+      "name": "all eight rules",
+      "manifest": {
+        "walletCoinType": "0x2::sui::SUI",
+        "rules": [
+          {
+            "kind": "budget",
+            "totalMist": "5000000000"
+          },
+          {
+            "kind": "per_tx",
+            "maxMist": "1000000000"
+          },
+          {
+            "kind": "rate_limit",
+            "windowMs": "3600000",
+            "maxMist": "2000000000"
+          },
+          {
+            "kind": "time_window",
+            "notBeforeMs": "1756600000000",
+            "notAfterMs": "1756686400000"
+          },
+          {
+            "kind": "protocol_scope",
+            "allowedPackages": [
+              "0x000000000000000000000000000000000000000000000000000000000000dead"
+            ]
+          },
+          {
+            "kind": "slippage_floor",
+            "minOutMist": "990000"
+          },
+          {
+            "kind": "asset_scope",
+            "allowedCoinTypes": [
+              "0x2::sui::SUI"
+            ]
+          },
+          {
+            "kind": "recipient_allowlist",
+            "addresses": [
+              "0x000000000000000000000000000000000000000000000000000000000000beef"
+            ]
+          }
+        ]
+      },
+      "declaration": {
+        "summaryLines": [
+          "Budget \u2264 5 SUI total",
+          "Per-transaction \u2264 1 SUI",
+          "\u2264 2 SUI per 1h window",
+          "Time window: not before 2025-08-31T00:26:40.000Z; before 2025-09-01T00:26:40.000Z (exclusive)",
+          "Only protocols: 0x000000000000000000000000000000000000000000000000000000000000dead",
+          "Min swap output \u2265 0.00099 SUI",
+          "Only coins: 0x2::sui::SUI",
+          "Only recipients: 0x000000000000000000000000000000000000000000000000000000000000beef"
+        ],
+        "caps": [
+          {
+            "label": "Budget",
+            "value": "5 SUI",
+            "enforcement": "on-chain"
+          },
+          {
+            "label": "Per-tx max",
+            "value": "1 SUI",
+            "enforcement": "on-chain"
+          },
+          {
+            "label": "Rate limit",
+            "value": "2 SUI / 1h",
+            "enforcement": "on-chain"
+          },
+          {
+            "label": "Time window",
+            "value": "not before 2025-08-31T00:26:40.000Z; before 2025-09-01T00:26:40.000Z (exclusive)",
+            "enforcement": "on-chain"
+          },
+          {
+            "label": "Allowed protocols",
+            "value": "0x000000000000000000000000000000000000000000000000000000000000dead",
+            "enforcement": "pre-flight"
+          },
+          {
+            "label": "Min swap output",
+            "value": "0.00099 SUI",
+            "enforcement": "pre-flight"
+          },
+          {
+            "label": "Allowed coins",
+            "value": "0x2::sui::SUI",
+            "enforcement": "pre-flight"
+          },
+          {
+            "label": "Allowed recipients",
+            "value": "0x000000000000000000000000000000000000000000000000000000000000beef",
+            "enforcement": "pre-flight"
+          }
+        ]
+      },
+      "onChainRuleParams": [
+        {
+          "module": "budget",
+          "config": {
+            "totalMist": "5000000000"
+          }
+        },
+        {
+          "module": "per_tx",
+          "config": {
+            "maxMist": "1000000000"
+          }
+        },
+        {
+          "module": "rate_limit",
+          "config": {
+            "windowMs": "3600000",
+            "maxMist": "2000000000"
+          }
+        },
+        {
+          "module": "time_window",
+          "config": {
+            "notBeforeMs": "1756600000000",
+            "notAfterMs": "1756686400000"
+          }
+        }
+      ],
+      "signerPolicy": {
+        "maxAmountMist": "5000000000",
+        "perTxMaxMist": "1000000000",
+        "window": {
+          "windowMs": "3600000",
+          "maxMist": "2000000000"
+        },
+        "timeWindow": {
+          "notBeforeMs": "1756600000000",
+          "notAfterMs": "1756686400000"
+        },
+        "allowedPackages": [
+          "0x000000000000000000000000000000000000000000000000000000000000dead"
+        ],
+        "minSlippageOutMist": "990000",
+        "allowedCoinTypes": [
+          "0x2::sui::SUI"
+        ],
+        "allowedRecipients": [
+          "0x000000000000000000000000000000000000000000000000000000000000beef"
+        ]
+      }
+    },
+    {
+      "name": "unknown coin type degrades honestly",
+      "manifest": {
+        "walletCoinType": "0xabc::mystery::COIN",
+        "rules": [
+          {
+            "kind": "budget",
+            "totalMist": "12345"
+          }
+        ]
+      },
+      "declaration": {
+        "summaryLines": [
+          "Budget \u2264 12345 base units of 0xabc::mystery::COIN total"
+        ],
+        "caps": [
+          {
+            "label": "Budget",
+            "value": "12345 base units of 0xabc::mystery::COIN",
+            "enforcement": "on-chain"
+          }
+        ]
+      },
+      "onChainRuleParams": [
+        {
+          "module": "budget",
+          "config": {
+            "totalMist": "12345"
+          }
+        }
+      ],
+      "signerPolicy": {
+        "maxAmountMist": "12345"
+      }
+    }
+  ]
+}
