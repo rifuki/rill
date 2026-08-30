@@ -10,3 +10,4 @@
 //! it honest, so the majority of the system tests with no network and no mocks.
 
 pub mod amounts;
+pub mod envelope;
