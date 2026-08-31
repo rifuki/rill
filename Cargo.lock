@@ -1263,6 +1263,7 @@ dependencies = [
  "bcs",
  "prost-types",
  "rill-core",
+ "rill-ptb",
  "serde_json",
  "sui-rpc",
  "sui-sdk-types",
