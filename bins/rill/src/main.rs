@@ -16,6 +16,7 @@
 
 use std::io::{stdin, stdout, BufReader};
 
+use rill_chain::describe::describe_function;
 use rill_cli::keystore::Keystore;
 use rill_cli::runset::RunSet;
 use rill_cli::stdio::{serve, WalletContext};
@@ -24,19 +25,21 @@ use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
 /// What every subcommand needs, loaded once and reported on rather than exiting silently.
 struct Loaded {
     keystore: Option<Keystore>,
+    /// Why there is no key, kept rather than printed on load.
+    ///
+    /// Several commands need no key at all — `describe` reads a public package, `help` reads
+    /// nothing — and a warning they cannot act on trains the reader to skip warnings. So the reason
+    /// is carried and reported by the commands that are actually blocked by it.
+    keystore_error: Option<String>,
     run_set: Option<RunSet>,
     network: String,
     mainnet_allowed: bool,
 }
 
 fn load() -> Loaded {
-    let keystore = match Keystore::from_env() {
-        Ok(store) => Some(store),
-        Err(e) => {
-            // stderr, always. See the module note on why stdout is untouchable here.
-            eprintln!("rill: {e}");
-            None
-        }
+    let (keystore, keystore_error) = match Keystore::from_env() {
+        Ok(store) => (Some(store), None),
+        Err(e) => (None, Some(e.to_string())),
     };
 
     // Loaded at startup. A run-set paired with the wrong key must fail here, where the operator is
@@ -62,6 +65,7 @@ fn load() -> Loaded {
 
     Loaded {
         keystore,
+        keystore_error,
         run_set,
         network: std::env::var("SUI_NETWORK").unwrap_or_else(|_| "testnet".into()),
         mainnet_allowed: std::env::var("RILL_ALLOW_MAINNET").as_deref() == Ok("true"),
@@ -73,6 +77,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
     ("capabilities", "show what the loaded run-set permits"),
+    (
+        "describe",
+        "read a Move function's signature from chain: rill describe <pkg>::<module>::<fn>",
+    ),
     ("help", "this list"),
 ];
 
@@ -96,7 +104,9 @@ fn status(loaded: &Loaded) -> i32 {
         }
         None => {
             println!("  status : not ready — no key loaded");
-            println!("           set RILL_SUI_PRIVATE_KEY, then run `rill status` again");
+            if let Some(reason) = &loaded.keystore_error {
+                println!("  reason : {reason}");
+            }
         }
     }
     println!("  network: {}", loaded.network);
@@ -154,7 +164,13 @@ fn main() {
             // Bare, so it composes: `export SENDER=$(rill address)`.
             Some(store) => println!("{}", store.address()),
             None => {
-                eprintln!("rill: no key loaded, so there is no address to print");
+                eprintln!(
+                    "rill: {}",
+                    loaded
+                        .keystore_error
+                        .as_deref()
+                        .unwrap_or("no key loaded, so there is no address to print")
+                );
                 std::process::exit(1);
             }
         },
@@ -178,13 +194,64 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        // Integrating a protocol needs the exact shape of its call, and the chain publishes that.
+        // This is the whole of what a per-protocol SDK would otherwise be consulted for, without
+        // waiting for one to exist or trusting it to be current.
+        Some("describe") => {
+            let Some(target) = std::env::args().nth(2) else {
+                eprintln!("usage: rill describe <package>::<module>::<function>");
+                std::process::exit(1);
+            };
+            let parts: Vec<&str> = target.split("::").collect();
+            let [package, module, function] = parts.as_slice() else {
+                eprintln!("rill: expected <package>::<module>::<function>, got {target}");
+                std::process::exit(1);
+            };
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    eprintln!("rill: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match runtime.block_on(describe_function(&endpoint, package, module, function)) {
+                Ok(signature) => {
+                    println!("{signature}");
+                    println!(
+                        "\n{} argument(s) a PTB command must carry:",
+                        signature.arity()
+                    );
+                    for (i, parameter) in signature.call_arguments().iter().enumerate() {
+                        println!("  {i:2}  {parameter}");
+                    }
+                    if signature.parameters.len() != signature.arity() {
+                        println!("\n  (TxContext is declared but supplied by the runtime)");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("rill: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("mcp") => {
             if loaded.run_set.is_none() {
                 eprintln!("rill: no run-set configured; execution will refuse.");
             }
             match &loaded.keystore {
                 Some(store) => eprintln!("rill ready — {} ({})", loaded.network, store.address()),
-                None => eprintln!("rill started with no key; only read-only tools will answer"),
+                None => {
+                    eprintln!("rill started with no key; only read-only tools will answer");
+                    if let Some(reason) = &loaded.keystore_error {
+                        eprintln!("rill: {reason}");
+                    }
+                }
             }
             let mut context =
                 WalletContext::new(loaded.keystore, loaded.network, loaded.mainnet_allowed)

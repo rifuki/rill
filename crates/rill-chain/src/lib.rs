@@ -13,6 +13,7 @@
 //! `signatures` field, while `ExecuteTransactionRequest` does. Evaluating a transaction nobody has
 //! signed is the API's designed use, which is what makes Rill's build step able to hold no key.
 
+pub mod describe;
 pub mod fake;
 pub mod grpc;
 

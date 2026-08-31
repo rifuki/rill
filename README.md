@@ -9,7 +9,7 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds, 269 Rust tests pass — including reads against live testnet and mainnet
+The workspace builds, 272 Rust tests pass — including reads against live testnet and mainnet
 fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
 [Known gaps](#known-gaps), which names exactly what is missing and why.
 
@@ -67,7 +67,36 @@ rill mcp          # speak MCP over stdio — this is what an agent runs
 rill status       # readiness; exits non-zero when it cannot sign
 rill address      # just the address, so it composes
 rill capabilities # what the loaded run-set permits, in order
+rill describe <package>::<module>::<function>
 ```
+
+## Integrating a protocol without an SDK
+
+Building a call needs one thing: its exact shape. In TypeScript that comes from a per-protocol
+SDK, which is why "does it have an SDK?" decides there which protocols are reachable — and why a
+stale SDK is a class of bug. `@mysten/deepbook-v3` sends a price through a double; the reference
+signer required an entry point its deployed contract no longer had. Both are failures of the copy,
+not of the contract.
+
+The chain publishes the real thing, and it cannot drift from the contract because it *is* the
+contract:
+
+```console
+$ rill describe 0x1eabed72…89b2fb::pool::flash_swap     # Cetus, no Rust SDK anywhere
+public fun pool::flash_swap<T0, T1>(&…config::GlobalConfig, &mut …pool::Pool<T0, T1>, bool,
+  bool, u64, u128, &0x2::clock::Clock): …balance::Balance<T0>, …balance::Balance<T1>,
+  …pool::FlashSwapReceipt<T0, T1>
+
+7 argument(s) a PTB command must carry:
+   0  &0x1eabed72…89b2fb::config::GlobalConfig
+   1  &mut 0x1eabed72…89b2fb::pool::Pool<T0, T1>
+   …
+```
+
+So "is protocol X supported?" has the same answer for every X: it is deployed, so its signature is
+readable, so the call can be built. What remains is arranging arguments in the declared order —
+which `crates/rill-chain/tests/deepbook_signature.rs` checks the builder still does, against the
+deployed package rather than against its own fixtures.
 
 The key comes from `RILL_SUI_PRIVATE_KEY`, read from the environment of whatever launches the
 process — never from an MCP config file, a command-line argument, or anything the agent can read.
