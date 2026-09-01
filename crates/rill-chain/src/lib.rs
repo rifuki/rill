@@ -304,17 +304,44 @@ pub mod aborts {
             .unwrap_or(0);
 
         let meaning = match (module, code) {
-            ("budget", _) => "this spend would exceed the wallet's total budget",
-            ("per_tx", _) => "this spend is larger than the per-transaction cap",
-            ("rate_limit", _) => {
+            // Each rule module numbers its own aborts from 1, independently of agent_wallet's.
+            ("budget", 1) => "this spend would exceed the wallet's total budget",
+            ("per_tx", 1) => "this spend is larger than the per-transaction cap",
+            ("rate_limit", 1) => {
                 "this spend would exceed what may be spent in the current rolling window"
             }
-            ("time_window", _) => "the wallet is outside the window it is permitted to spend in",
-            ("agent_wallet", 1) => "the capability does not belong to this wallet",
-            ("agent_wallet", 2) => "the sender is not this wallet's agent",
-            ("agent_wallet", 3) => "the wallet has been revoked",
-            ("agent_wallet", 4) => "the wallet has expired",
-            ("agent_wallet", _) => "the wallet refused the request",
+            ("time_window", 1) => "the wallet is outside the window it is permitted to spend in",
+            ("time_window", 2) => {
+                "the time window itself is invalid — not_before is not before \
+                                   not_after"
+            }
+            // agent_wallet's codes, transcribed from its own source and pinned by a test that
+            // reads that source. An earlier version of this table was shifted by one across every
+            // entry, which turned "you signed with the wrong key" into "your capability is wrong"
+            // — sending whoever read it to inspect the one thing that was correct.
+            ("agent_wallet", 1) => {
+                "the sender is not this wallet's owner; owner-only calls must \
+                                    be signed by the key that created it"
+            }
+            ("agent_wallet", 2) => "the wallet has been revoked",
+            ("agent_wallet", 3) => "the wallet has expired",
+            ("agent_wallet", 4) => "the wallet does not hold that much",
+            ("agent_wallet", 5) => "that capability does not belong to this wallet",
+            ("agent_wallet", 6) => "a spend of zero was requested",
+            ("agent_wallet", 7) => {
+                "the sender is not this wallet's agent; the spend path must be \
+                                    signed by the agent's key, not the owner's"
+            }
+            ("agent_wallet", 8) => "an expiry may only be moved forward",
+            ("agent_wallet", 9) => {
+                "a rule was proved against a different wallet than the one \
+                                    being spent from"
+            }
+            ("agent_wallet", 10) => {
+                "the spend did not satisfy every rule attached to the wallet; \
+                                     the prove calls must match the wallet's live policy exactly"
+            }
+            ("agent_wallet", 11) => "that rule is already attached; adding rules is not idempotent",
             _ => "a rule refused it",
         };
 
