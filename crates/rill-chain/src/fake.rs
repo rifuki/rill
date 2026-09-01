@@ -191,6 +191,7 @@ impl SuiWrite for FakeSui {
             error: None,
             gas_used_mist: 1_000_000,
             balance_changes: Vec::<BalanceDelta>::new(),
+            created: Vec::new(),
         })
     }
 
@@ -201,6 +202,7 @@ impl SuiWrite for FakeSui {
             error: None,
             gas_used_mist: 1_000_000,
             balance_changes: Vec::new(),
+            created: Vec::new(),
         })
     }
 }

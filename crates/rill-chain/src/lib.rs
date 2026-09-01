@@ -93,6 +93,24 @@ pub mod rill_chain_types {
         pub error: Option<String>,
         pub gas_used_mist: u64,
         pub balance_changes: Vec<BalanceDelta>,
+        /// Objects this transaction brought into existence.
+        ///
+        /// Carried because a multi-step flow cannot continue without them: `create_wallet` shares a
+        /// wallet and mints a capability, and the ids of both are knowable only from the effects of
+        /// the transaction that made them. Without this the next step has nothing to reference.
+        pub created: Vec<CreatedObject>,
+    }
+
+    /// An object that did not exist before this transaction.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CreatedObject {
+        pub object_id: String,
+        pub object_type: Option<String>,
+        /// For a shared object, the version it was shared at — which is what any later transaction
+        /// must reference it by. `None` when it is owned.
+        pub shared_initial_version: Option<u64>,
+        /// The address it was transferred to, when it is owned by one.
+        pub owner: Option<String>,
     }
 }
 

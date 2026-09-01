@@ -16,5 +16,7 @@ pub mod deployments;
 pub mod guard;
 pub mod haedal;
 pub mod registry;
+pub mod rules;
 pub mod shared;
 pub mod spend;
+pub mod transfer;

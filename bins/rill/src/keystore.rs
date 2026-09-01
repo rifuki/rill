@@ -13,9 +13,21 @@
 //!
 //! # Where it comes from
 //!
-//! The environment of the process that launched the signer, and nowhere else. Never an MCP tool
-//! argument — `rill-mcp`'s keyless guard refuses those by name — never a config file the agent can
-//! read, and never a command-line argument, which is visible in `ps` to every user on the machine.
+//! Two sources, in this order:
+//!
+//! 1. `RILL_SUI_PRIVATE_KEY` in the environment of the process that launched the signer.
+//! 2. The `sui` CLI's own keystore at `~/.sui/sui_config/sui.keystore`, if the machine has one.
+//!
+//! The second exists because a developer who has used Sui already has a funded key, and asking them
+//! to export it into an environment variable is asking them to put a secret somewhere new — into a
+//! shell history, a `.env`, a screenshot. Reading the file they already have adds no copy.
+//!
+//! The environment still wins, so a deliberate override is never silently ignored in favour of
+//! whatever key happens to be on the machine.
+//!
+//! Never an MCP tool argument — `rill-mcp`'s keyless guard refuses those by name — never a config
+//! file the agent can read, and never a command-line argument, which is visible in `ps` to every
+//! user on the machine.
 
 use sui_crypto::simple::SimpleKeypair;
 use sui_crypto::SuiSigner;
@@ -24,9 +36,29 @@ use sui_sdk_types::{Address, Transaction, UserSignature};
 /// The environment variable the launching shell or secret manager sets.
 pub const PRIVATE_KEY_VAR: &str = "RILL_SUI_PRIVATE_KEY";
 
+/// The `sui` CLI's keystore, relative to the home directory.
+pub const SUI_KEYSTORE_PATH: &str = ".sui/sui_config/sui.keystore";
+
+/// Where the loaded key came from, so `rill status` can say it without saying anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Environment,
+    SuiKeystore,
+}
+
+impl std::fmt::Display for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment => write!(f, "{PRIVATE_KEY_VAR}"),
+            Self::SuiKeystore => write!(f, "~/{SUI_KEYSTORE_PATH}"),
+        }
+    }
+}
+
 pub struct Keystore {
     keypair: SimpleKeypair,
     address: Address,
+    source: KeySource,
 }
 
 /// Deliberately opaque. A `Debug` that printed the key is exactly the accident this prevents, and
@@ -35,6 +67,7 @@ impl std::fmt::Debug for Keystore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Keystore")
             .field("address", &self.address)
+            .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
@@ -53,8 +86,9 @@ impl std::fmt::Display for KeystoreError {
             Self::NotConfigured => write!(
                 f,
                 "no signing key is configured. Set {PRIVATE_KEY_VAR} in the shell or secret \
-                 manager that launches this process — never in an MCP config file, a command-line \
-                 argument, or anything the agent can read."
+                 manager that launches this process, or run `sui client new-address ed25519` so \
+                 there is a key at ~/{SUI_KEYSTORE_PATH}. Never put it in an MCP config file, a \
+                 command-line argument, or anything the agent can read."
             ),
             // The malformed value is not included on purpose: an error message is the most likely
             // place for a secret to end up somewhere it should not be.
@@ -82,7 +116,44 @@ impl Keystore {
         let keypair =
             SimpleKeypair::from_suiprivkey(trimmed).map_err(|_| KeystoreError::Malformed)?;
         let address = keypair.verifying_key().derive_address();
-        Ok(Self { keypair, address })
+        Ok(Self {
+            keypair,
+            address,
+            source: KeySource::Environment,
+        })
+    }
+
+    /// Read the first key from the `sui` CLI's keystore.
+    ///
+    /// The file is a JSON array of base64 `flag || secret` strings, which `sui-crypto` already
+    /// parses — `from_base64` is documented as being for exactly this file. Decoding it by hand
+    /// would mean re-deciding which schemes are valid, and getting that wrong produces an address
+    /// that is not the user's, which is worse than refusing: funds sent to it are gone.
+    pub fn from_sui_keystore(path: &std::path::Path) -> Result<Self, KeystoreError> {
+        let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
+        let entries: Vec<String> =
+            serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
+        let first = entries.first().ok_or(KeystoreError::NotConfigured)?;
+
+        let keypair =
+            SimpleKeypair::from_base64(first.trim()).map_err(|_| KeystoreError::Malformed)?;
+        let address = keypair.verifying_key().derive_address();
+        Ok(Self {
+            keypair,
+            address,
+            source: KeySource::SuiKeystore,
+        })
+    }
+
+    /// The `sui` CLI's keystore in this user's home directory, if there is one.
+    pub fn from_default_sui_keystore() -> Result<Self, KeystoreError> {
+        let home = std::env::var("HOME").map_err(|_| KeystoreError::NotConfigured)?;
+        Self::from_sui_keystore(&std::path::Path::new(&home).join(SUI_KEYSTORE_PATH))
+    }
+
+    /// Which source this key came from.
+    pub fn source(&self) -> KeySource {
+        self.source
     }
 
     /// Read from the process environment.
@@ -96,6 +167,19 @@ impl Keystore {
         // SAFETY-equivalent note: single-threaded startup, before any task is spawned.
         unsafe { std::env::remove_var(PRIVATE_KEY_VAR) };
         result
+    }
+
+    /// The environment first, then the `sui` CLI's keystore.
+    ///
+    /// A malformed environment variable is an error rather than a reason to fall through: someone
+    /// who set it meant to use that key, and quietly signing with a different one is the worst
+    /// possible recovery.
+    pub fn load() -> Result<Self, KeystoreError> {
+        match Self::from_env() {
+            Ok(store) => Ok(store),
+            Err(KeystoreError::Malformed) => Err(KeystoreError::Malformed),
+            Err(KeystoreError::NotConfigured) => Self::from_default_sui_keystore(),
+        }
     }
 
     /// The public address this key controls. Safe to log, and the only identity anything else

@@ -22,6 +22,10 @@ use rill_cli::runset::RunSet;
 use rill_cli::stdio::{serve, WalletContext};
 use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
 
+/// The `Version` object the testnet package gates itself on, from the reference deployment.
+const DEFAULT_VERSION_ID: &str =
+    "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65";
+
 /// What every subcommand needs, loaded once and reported on rather than exiting silently.
 struct Loaded {
     keystore: Option<Keystore>,
@@ -37,7 +41,7 @@ struct Loaded {
 }
 
 fn load() -> Loaded {
-    let (keystore, keystore_error) = match Keystore::from_env() {
+    let (keystore, keystore_error) = match Keystore::load() {
         Ok(store) => (Some(store), None),
         Err(e) => (None, Some(e.to_string())),
     };
@@ -80,6 +84,14 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "describe",
         "read a Move function's signature from chain: rill describe <pkg>::<module>::<fn>",
+    ),
+    (
+        "wallet create",
+        "mint an agent wallet + capability (add --submit to send it)",
+    ),
+    (
+        "wallet rules",
+        "attach the manifest's rules to a wallet — without this it has no limits",
     ),
     ("help", "this list"),
 ];
@@ -238,6 +250,103 @@ fn main() {
                     eprintln!("rill: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Some("wallet") => {
+            let action = std::env::args().nth(2).unwrap_or_default();
+            if action != "create" && action != "rules" {
+                eprintln!(
+                    "rill: usage:\n  rill wallet create [--submit] [--amount 0.2]\n  \
+                     rill wallet rules --wallet <id> [--submit]"
+                );
+                std::process::exit(1);
+            }
+            let Some(keystore) = &loaded.keystore else {
+                eprintln!(
+                    "rill: {}",
+                    loaded.keystore_error.as_deref().unwrap_or("no key loaded")
+                );
+                std::process::exit(1);
+            };
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let submit = argv.iter().any(|a| a == "--submit");
+            if submit && loaded.network == "mainnet" && !loaded.mainnet_allowed {
+                eprintln!(
+                    "rill: refusing to submit on mainnet. Set RILL_ALLOW_MAINNET=true if that is \
+                     really the intent."
+                );
+                std::process::exit(1);
+            }
+
+            let manifest = rill_core::manifest::CapabilityManifest {
+                wallet_coin_type: "0x2::sui::SUI".into(),
+                rules: vec![
+                    rill_core::manifest::CapabilityRule::Budget {
+                        total_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
+                    },
+                    rill_core::manifest::CapabilityRule::PerTx {
+                        max_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
+                    },
+                ],
+            };
+
+            let args = rill_cli::wallet::CreateArgs {
+                package_id: flag("--package")
+                    .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
+                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                version_id: flag("--version-object")
+                    .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                agent: flag("--agent"),
+                amount: flag("--amount").unwrap_or_else(|| "0.2".into()),
+                expires_in_days: flag("--days").and_then(|d| d.parse().ok()).unwrap_or(30),
+                manifest,
+                gas_budget: flag("--gas-budget")
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(100_000_000),
+                dry_run: !submit,
+            };
+
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis() as u64;
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime");
+            let outcome = if action == "create" {
+                runtime.block_on(rill_cli::wallet::create(&endpoint, keystore, &args, now_ms))
+            } else {
+                let Some(wallet_id) = flag("--wallet") else {
+                    eprintln!("rill: rill wallet rules needs --wallet <id>");
+                    std::process::exit(1);
+                };
+                runtime.block_on(rill_cli::rules_cmd::attach(
+                    &endpoint,
+                    keystore,
+                    &rill_cli::rules_cmd::RulesArgs {
+                        package_id: args.package_id.clone(),
+                        version_id: args.version_id.clone(),
+                        wallet_id,
+                        manifest: args.manifest.clone(),
+                        gas_budget: args.gas_budget,
+                        dry_run: args.dry_run,
+                    },
+                ))
+            };
+            if let Err(e) = outcome {
+                eprintln!("\nrill: {e}");
+                std::process::exit(1);
             }
         }
         Some("mcp") => {

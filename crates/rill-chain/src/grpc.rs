@@ -11,8 +11,8 @@ use sui_rpc::proto::sui::rpc::v2::{
 };
 
 use crate::{
-    classify_failure, BalanceDelta, ChainError, ChainResult, ExecutionOutcome, ObjectRef,
-    ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
+    classify_failure, BalanceDelta, ChainError, ChainResult, CreatedObject, ExecutionOutcome,
+    ObjectRef, ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
 };
 
 /// Fields worth asking for on an object read. Requesting a mask rather than everything keeps the
@@ -58,6 +58,40 @@ fn to_summary(o: &sui_rpc::proto::sui::rpc::v2::Object) -> ObjectSummary {
             .flatten()
         }),
     }
+}
+
+/// Objects created by a transaction, read from its effects.
+///
+/// `input_state == DOES_NOT_EXIST` is what marks a creation: the object had no prior version, so
+/// this transaction is where it began. Reading `output_owner` at the same time answers the question
+/// the caller actually has next — whether it is shared (and at which version) or owned, and by whom.
+fn created_objects(
+    effects: Option<&sui_rpc::proto::sui::rpc::v2::TransactionEffects>,
+) -> Vec<CreatedObject> {
+    use sui_rpc::proto::sui::rpc::v2::changed_object::InputObjectState;
+    use sui_rpc::proto::sui::rpc::v2::owner::OwnerKind;
+
+    let Some(effects) = effects else {
+        return Vec::new();
+    };
+    effects
+        .changed_objects
+        .iter()
+        .filter(|c| c.input_state() == InputObjectState::DoesNotExist)
+        .map(|c| {
+            let owner = c.output_owner.as_ref();
+            CreatedObject {
+                object_id: c.object_id().to_owned(),
+                object_type: c.object_type.clone(),
+                shared_initial_version: owner.and_then(|o| {
+                    matches!(o.kind(), OwnerKind::Shared)
+                        .then(|| o.version)
+                        .flatten()
+                }),
+                owner: owner.and_then(|o| o.address.clone()),
+            }
+        })
+        .collect()
 }
 
 fn balance_deltas(changes: &[sui_rpc::proto::sui::rpc::v2::BalanceChange]) -> Vec<BalanceDelta> {
@@ -280,14 +314,33 @@ impl SuiWrite for GrpcSui {
 
         let mut request = ExecuteTransactionRequest::default();
         request.transaction = Some(transaction);
-        request.signatures = signatures
-            .iter()
-            .map(|s| {
-                let mut sig = sui_rpc::proto::sui::rpc::v2::UserSignature::default();
-                sig.bcs = Some(s.as_bytes().to_vec().into());
-                sig
-            })
-            .collect();
+        // Without a mask the response carries nothing, and a submitted transaction whose digest
+        // comes back empty cannot be looked up afterwards — which is the one thing a caller
+        // certainly wants after sending one.
+        request.read_mask = Some(GrpcSui::mask(&["digest", "effects", "balance_changes"]));
+        // The `bcs` field takes the signature's *bytes* — flag byte, signature, public key. The
+        // base64 text must be decoded first: putting the text in directly makes the node read its
+        // first character as the scheme flag, and it reports `invalid signature scheme: 4f`, which
+        // is ASCII 'O' — the first character of a base64 string, not a scheme at all.
+        //
+        // Nothing short of a real submission finds this. A simulation carries no signature, so the
+        // whole path was green up to the moment it mattered.
+        let mut encoded = Vec::with_capacity(signatures.len());
+        for signature in signatures {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(signature.trim())
+                .map_err(|_| {
+                    ChainError::Rejected(
+                        "a signature that is not base64 cannot be submitted; it is not echoed here"
+                            .into(),
+                    )
+                })?;
+            let mut sig = sui_rpc::proto::sui::rpc::v2::UserSignature::default();
+            sig.bcs = Some(bytes.into());
+            encoded.push(sig);
+        }
+        request.signatures = encoded;
 
         let response = self
             .client
@@ -312,6 +365,7 @@ impl SuiWrite for GrpcSui {
             balance_changes: executed
                 .map(|t| balance_deltas(&t.balance_changes))
                 .unwrap_or_default(),
+            created: created_objects(effects),
         })
     }
 
@@ -344,6 +398,7 @@ impl SuiWrite for GrpcSui {
             balance_changes: executed
                 .map(|t| balance_deltas(&t.balance_changes))
                 .unwrap_or_default(),
+            created: created_objects(effects),
         })
     }
 }
