@@ -6,7 +6,8 @@
 
 use rill_chain::{grpc::GrpcSui, SuiRead, SuiWrite};
 use rill_core::manifest::CapabilityManifest;
-use rill_ptb::rules::{build_attach_rules, expected_attach_targets, RuleTarget};
+use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
+use rill_ptb::rules::{build_reconcile_rules, RuleTarget};
 use rill_ptb::shared::SharedObjects;
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -66,6 +67,38 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
         return Err(format!("{sender} holds no SUI to pay for this"));
     }
 
+    // What the wallet actually carries. Attaching is not idempotent — add_rule aborts
+    // E_RULE_ALREADY_SET — so this must be a reconciliation against the live set, not an attach.
+    let read_tx = policy_rules_transaction(
+        args.package_id
+            .parse()
+            .map_err(|_| format!("{} is not an address", args.package_id))?,
+        wallet_id,
+        "0x2::sui::SUI",
+        &shared,
+    )
+    .map_err(|e| e.to_string())?;
+    let read_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&read_tx).map_err(|e| e.to_string())?)
+    };
+    let read = chain
+        .simulate_read(&read_b64)
+        .await
+        .map_err(|e| format!("reading the wallet's rules: {e}"))?;
+    let names = read
+        .command_returns
+        .iter()
+        .flatten()
+        .next()
+        .ok_or("the wallet did not report its rules")
+        .and_then(|b| parse_type_names(b).map_err(|_| "the rule list did not decode"))?;
+    let attached: Vec<String> = attached_modules(&names)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
@@ -89,16 +122,27 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
         manifest: args.manifest.clone(),
     };
 
-    let count = build_attach_rules(&mut tx, &target, &shared).map_err(|e| e.to_string())?;
-    let targets =
-        expected_attach_targets(target.package_id, &args.manifest).map_err(|e| e.to_string())?;
+    let module_refs: Vec<&str> = attached.iter().map(String::as_str).collect();
+    let result = build_reconcile_rules(&mut tx, &target, &module_refs, &shared)
+        .map_err(|e| e.to_string())?;
 
     println!("wallet  : {wallet_id}");
     println!("owner   : {sender}");
-    println!("attaching {count} rule(s):");
-    for t in &targets {
-        println!("  {t}");
+    println!(
+        "attached: {}",
+        if attached.is_empty() {
+            "none".to_string()
+        } else {
+            attached.join(", ")
+        }
+    );
+    if !result.removed.is_empty() {
+        println!("re-set  : {}", result.removed.join(", "));
     }
+    if !result.orphaned.is_empty() {
+        println!("dropping: {}", result.orphaned.join(", "));
+    }
+    println!("result  : {}", result.added.join(", "));
 
     let built = tx.try_build().map_err(|e| format!("compiling: {e}"))?;
     let b64 = {
@@ -140,7 +184,8 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
     }
     println!("gas used: {}", outcome.gas_used_mist);
     println!(
-        "\nThe wallet is now bounded by {count} rule(s). Every spend must satisfy all of them."
+        "\nThe wallet is now bounded by {} rule(s). Every spend must satisfy all of them.",
+        result.added.len()
     );
     Ok(())
 }

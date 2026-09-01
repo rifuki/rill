@@ -108,6 +108,100 @@ pub fn build_attach_rules(
     Ok(rules.len())
 }
 
+/// Reconcile a wallet's attached rules to a manifest.
+///
+/// # Attaching is not idempotent, and there is no "set"
+///
+/// `add_rule` aborts `E_RULE_ALREADY_SET` (11) when the witness type is already attached, so
+/// re-running an attach fails, and adding a third rule later would re-emit the first two and fail
+/// with it. There is no update call either: changing a cap means `remove` then `add`.
+///
+/// So the operation a caller actually wants is a reconciliation against what is on chain — which is
+/// why this takes the live module list rather than assuming the wallet is empty. Read it with
+/// [`crate::policy_read`]; do not pass a guess.
+///
+/// Removes come first. A rule that is being replaced must be gone before its `add` runs, and
+/// ordering them the other way is the same abort with a more confusing cause.
+pub fn build_reconcile_rules(
+    tx: &mut TransactionBuilder,
+    target: &RuleTarget,
+    attached: &[&str],
+    shared: &SharedObjects,
+) -> Result<Reconciliation, RuleError> {
+    let wanted = to_on_chain_rule_params(&target.manifest).map_err(RuleError::Manifest)?;
+
+    let coin_type: sui_sdk_types::TypeTag = target
+        .coin_type
+        .parse()
+        .map_err(|_| RuleError::BadIdentifier(target.coin_type.clone()))?;
+
+    // A rule whose config is unchanged is still removed and re-added: the config is not readable
+    // from `policy_rules`, which reports types only. Re-attaching an identical limit is a no-op in
+    // effect and costs one command; guessing that it is unchanged would silently keep an old cap.
+    let to_remove: Vec<&str> = attached
+        .iter()
+        .copied()
+        .filter(|m| wanted.iter().any(|w| w.module == *m))
+        .collect();
+    let orphaned: Vec<String> = attached
+        .iter()
+        .filter(|m| !wanted.iter().any(|w| w.module == **m))
+        .map(|m| (*m).to_owned())
+        .collect();
+
+    let wallet = tx.object(shared.input(target.wallet_id, true)?);
+    let version = tx.object(shared.input(target.version_id, false)?);
+
+    for module in to_remove.iter().chain(
+        orphaned
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .iter(),
+    ) {
+        tx.move_call(
+            Function::new(target.package_id, ident(module)?, ident("remove")?)
+                .with_type_args(vec![coin_type.clone()]),
+            vec![wallet, version],
+        );
+    }
+
+    for rule in &wanted {
+        let mut args = vec![wallet, version];
+        for (_field, value) in &rule.config {
+            args.push(tx.pure(value));
+        }
+        tx.move_call(
+            Function::new(target.package_id, ident(rule.module)?, ident("add")?)
+                .with_type_args(vec![coin_type.clone()]),
+            args,
+        );
+    }
+
+    Ok(Reconciliation {
+        removed: to_remove.iter().map(|m| (*m).to_owned()).collect(),
+        orphaned,
+        added: wanted.iter().map(|r| r.module.to_owned()).collect(),
+    })
+}
+
+/// What a reconciliation did, so a caller can say it rather than guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reconciliation {
+    /// Attached, wanted, and re-attached with the manifest's current values.
+    pub removed: Vec<String>,
+    /// Attached but not in the manifest — detached and not restored.
+    pub orphaned: Vec<String>,
+    pub added: Vec<String>,
+}
+
+impl Reconciliation {
+    /// True when the wallet already carried exactly this manifest's rules.
+    pub fn is_no_change(&self) -> bool {
+        self.orphaned.is_empty() && self.removed.len() == self.added.len()
+    }
+}
+
 /// The targets attaching a manifest's rules emits, in order, for a pinned sequence.
 pub fn expected_attach_targets(
     package_id: Address,
