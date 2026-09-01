@@ -385,21 +385,6 @@ fn main() {
                 cap_id,
                 amount: flag("--amount").unwrap_or_else(|| "0.01".into()),
                 recipient: flag("--to"),
-                // Must match the rules actually attached on chain: confirm_spend counts receipts
-                // against the wallet's own policy, so a manifest that names fewer rules than the
-                // wallet carries aborts, and one that names more emits a prove for a rule that is
-                // not attached.
-                manifest: rill_core::manifest::CapabilityManifest {
-                    wallet_coin_type: "0x2::sui::SUI".into(),
-                    rules: vec![
-                        rill_core::manifest::CapabilityRule::Budget {
-                            total_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
-                        },
-                        rill_core::manifest::CapabilityRule::PerTx {
-                            max_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
-                        },
-                    ],
-                },
                 gas_budget: flag("--gas-budget")
                     .and_then(|g| g.parse().ok())
                     .unwrap_or(100_000_000),

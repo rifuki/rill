@@ -11,9 +11,9 @@
 //! sender otherwise. There is no path here that builds a spend and forgets the coin.
 
 use rill_chain::{grpc::GrpcSui, SuiRead, SuiWrite};
-use rill_core::manifest::CapabilityManifest;
+use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
 use rill_ptb::shared::SharedObjects;
-use rill_ptb::spend::{build_manifest_gated_spend, expected_spend_targets, WalletBinding};
+use rill_ptb::spend::{build_gated_spend_for_modules, WalletBinding};
 use rill_ptb::transfer::transfer_coin;
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -32,7 +32,6 @@ pub struct SpendArgs {
     pub amount: String,
     /// Where the released coin goes. The sender when absent.
     pub recipient: Option<String>,
-    pub manifest: CapabilityManifest,
     pub gas_budget: u64,
     pub dry_run: bool,
 }
@@ -85,6 +84,47 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
         return Err(format!("{sender} holds no SUI to pay for this"));
     }
 
+    // The prove list must name exactly the rules this wallet carries — not what a flag says. Too
+    // many aborts inside df::borrow_mut with no code of its own; too few aborts at the last
+    // command, after everything else has passed.
+    let read_tx = policy_rules_transaction(
+        args.package_id
+            .parse()
+            .map_err(|_| format!("{} is not an address", args.package_id))?,
+        wallet_id,
+        "0x2::sui::SUI",
+        &shared,
+    )
+    .map_err(|e| e.to_string())?;
+    let read_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&read_tx).map_err(|e| e.to_string())?)
+    };
+    let read = chain
+        .simulate_read(&read_b64)
+        .await
+        .map_err(|e| format!("reading the wallet's rules: {e}"))?;
+    let names = read
+        .command_returns
+        .iter()
+        .flatten()
+        .next()
+        .ok_or("the wallet did not report its rules")
+        .and_then(|b| parse_type_names(b).map_err(|_| "the rule list did not decode"))?;
+    let modules: Vec<String> = attached_modules(&names)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if modules.len() != names.len() {
+        return Err(format!(
+            "this wallet carries {} rule(s), and only {} of them have an emitter here: {names:?}\n\
+             Every attached rule must be proved, so this spend cannot be built.",
+            names.len(),
+            modules.len()
+        ));
+    }
+
     let amount_mist = rill_core::amounts::decimal_to_base_units(&args.amount, 9)
         .map_err(|e| format!("the amount: {e}"))?;
 
@@ -113,10 +153,16 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
         ),
         version_id,
         coin_type: "0x2::sui::SUI".into(),
-        manifest: args.manifest.clone(),
+        // Only used for the targets projection, which this path no longer takes — the rules come
+        // from the chain above.
+        manifest: rill_core::manifest::CapabilityManifest {
+            wallet_coin_type: "0x2::sui::SUI".into(),
+            rules: Vec::new(),
+        },
     };
 
-    let coin = build_manifest_gated_spend(&mut tx, &binding, amount_mist, &shared)
+    let module_refs: Vec<&str> = modules.iter().map(String::as_str).collect();
+    let coin = build_gated_spend_for_modules(&mut tx, &binding, amount_mist, &module_refs, &shared)
         .map_err(|e| e.to_string())?;
 
     let recipient = match &args.recipient {
@@ -129,10 +175,13 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
     println!("wallet   : {wallet_id}");
     println!("amount   : {} SUI ({amount_mist} mist)", args.amount);
     println!("recipient: {recipient}");
+    println!("rules    : {} (read from chain)", modules.join(", "));
     println!("call sequence:");
-    for target in expected_spend_targets(&binding).map_err(|e| e.to_string())? {
-        println!("  {target}");
+    println!("  {}::agent_wallet::request_spend", binding.package_id);
+    for module in &modules {
+        println!("  {}::{module}::prove", binding.package_id);
     }
+    println!("  {}::agent_wallet::confirm_spend", binding.package_id);
 
     let built = tx.try_build().map_err(|e| format!("compiling: {e}"))?;
     let b64 = {

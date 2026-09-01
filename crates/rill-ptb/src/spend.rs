@@ -81,6 +81,78 @@ impl From<UnknownSharedVersion> for SpendError {
 fn ident(s: &str) -> Result<Identifier, SpendError> {
     Identifier::new(s).map_err(|_| SpendError::BadIdentifier(s.to_owned()))
 }
+/// Emit the gated sequence for an explicit list of rule modules.
+///
+/// # The module list is the thing that must be right
+///
+/// `confirm_spend` compares the receipts on the hot potato against the wallet's *live* policy, so
+/// the sequence must name exactly the modules attached to that wallet — no more, no fewer. Emitting
+/// a `prove` for a rule that is not attached aborts inside `df::borrow_mut`, with no abort code of
+/// its own to explain it. Omitting one that is aborts `E_RULE_NOT_SATISFIED` at the last command,
+/// after every other check has passed.
+///
+/// A manifest is one way to obtain that list, and [`crate::policy_read`] — reading the chain — is
+/// the better one. This takes the list itself so the caller can use either, and so the two never
+/// silently disagree inside this function.
+pub fn build_gated_spend_for_modules(
+    tx: &mut TransactionBuilder,
+    binding: &WalletBinding,
+    amount_base_units: u64,
+    modules: &[&str],
+    shared: &SharedObjects,
+) -> Result<Argument, SpendError> {
+    if amount_base_units == 0 {
+        return Err(SpendError::ZeroAmount);
+    }
+
+    let coin_type: sui_sdk_types::TypeTag = binding
+        .coin_type
+        .parse()
+        .map_err(|_| SpendError::BadIdentifier(binding.coin_type.clone()))?;
+
+    // Shared objects. The wallet and version are mutated by the sequence; the clock is read.
+    // Each carries the version it was first shared at, read from the chain — see `shared`.
+    let wallet = tx.object(shared.input(binding.wallet_id, true)?);
+    let version = tx.object(shared.input(binding.version_id, false)?);
+    let clock = tx.object(shared.input(CLOCK_ID.parse().expect("0x6 is a valid address"), false)?);
+    let cap = tx.object(binding.cap.clone());
+    let amount = tx.pure(&amount_base_units);
+
+    let request = tx.move_call(
+        Function::new(
+            binding.package_id,
+            ident("agent_wallet")?,
+            ident("request_spend")?,
+        )
+        .with_type_args(vec![coin_type.clone()]),
+        vec![wallet, cap, version, amount, clock],
+    );
+
+    for module in modules {
+        // `rate_limit` and `time_window` decide against the current time and take the clock;
+        // `budget` and `per_tx` do not. Emitting three arguments for all four builds a call with
+        // the wrong arity, which the node rejects.
+        let mut args = vec![request, wallet, version];
+        if matches!(*module, "rate_limit" | "time_window") {
+            args.push(clock);
+        }
+        tx.move_call(
+            Function::new(binding.package_id, ident(module)?, ident("prove")?)
+                .with_type_args(vec![coin_type.clone()]),
+            args,
+        );
+    }
+
+    Ok(tx.move_call(
+        Function::new(
+            binding.package_id,
+            ident("agent_wallet")?,
+            ident("confirm_spend")?,
+        )
+        .with_type_args(vec![coin_type]),
+        vec![wallet, request, version, clock],
+    ))
+}
 
 /// Emit `request_spend` → one `prove` per attached rule → `confirm_spend`, returning the released
 /// coin.

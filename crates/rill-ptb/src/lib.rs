@@ -15,6 +15,7 @@ pub mod deepbook;
 pub mod deployments;
 pub mod guard;
 pub mod haedal;
+pub mod policy_read;
 pub mod registry;
 pub mod rules;
 pub mod shared;
