@@ -10,6 +10,7 @@
 
 pub mod book;
 pub mod cetus;
+pub mod create;
 pub mod deepbook;
 pub mod deployments;
 pub mod guard;

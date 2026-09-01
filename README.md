@@ -9,7 +9,7 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds, 272 Rust tests pass — including reads against live testnet and mainnet
+The workspace builds, 278 Rust tests pass — including reads against live testnet and mainnet
 fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
 [Known gaps](#known-gaps), which names exactly what is missing and why.
 
@@ -142,5 +142,17 @@ cannot authorise a call in another, so **an end-to-end submission needs a fresh 
 from `0xb02f39d6…` first.** `rill status` warns when a run-set names the old package rather than
 letting it surface as a Move abort at signing time.
 
-**Submission is unproven.** Everything up to signing is verified against live nodes; the final
-`execute` has not been run against a funded wallet on the current contract, for the reason above.
+**Submission is unproven, and a signature is the only thing missing.** `create_wallet` against the
+current package passes the **strict** simulation on testnet — checks on, real gas objects, the same
+gate the build path runs before anything may be signed:
+
+```text
+ok           : true
+verification : Verified
+gas          : 4477760
+balance      : -1004477760 …::sui::SUI      (1 SUI funded + gas)
+```
+
+Keyless, and nothing was submitted. `cargo test -p rill-ptb --test create_wallet_live -- --ignored`
+reproduces it. What it proves is that the transaction *would* execute; signing it needs a key this
+repo does not have, and that is the whole of what stands between here and an end-to-end run.
