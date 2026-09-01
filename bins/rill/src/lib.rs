@@ -6,5 +6,6 @@
 pub mod keystore;
 pub mod rules_cmd;
 pub mod runset;
+pub mod spend_cmd;
 pub mod stdio;
 pub mod wallet;

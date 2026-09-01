@@ -250,3 +250,123 @@ mod tests {
         );
     }
 }
+
+/// Which rule module aborted, and why — read out of a Move abort.
+///
+/// # A rule refusing is the system working
+///
+/// The chain reports a policy refusal as `MoveAbort(MoveLocation { module: ..., function_name:
+/// Some("prove") }, 1)`, which is indistinguishable at a glance from a bug. It is the opposite: the
+/// wallet's own limits stopped a spend that exceeded them, on chain, where no client can talk it
+/// out of the answer.
+///
+/// Presenting that as a raw abort teaches whoever reads it that refusals look like crashes. So it
+/// is named.
+pub mod aborts {
+    /// A refusal traced back to the rule that made it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RuleRefusal {
+        pub module: String,
+        pub code: u64,
+        /// What the rule is for, in the words a person would use.
+        pub meaning: &'static str,
+    }
+
+    impl std::fmt::Display for RuleRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} refused it: {}", self.module, self.meaning)
+        }
+    }
+
+    /// Recognise a rule abort in a simulation or execution error.
+    ///
+    /// Returns `None` for anything that is not one — a gas failure, a missing object, a bug — so a
+    /// caller never reports an unrelated failure as a policy decision.
+    pub fn classify_rule_abort(error: &str) -> Option<RuleRefusal> {
+        if !error.contains("MoveAbort") {
+            return None;
+        }
+        let module = [
+            "budget",
+            "per_tx",
+            "rate_limit",
+            "time_window",
+            "agent_wallet",
+        ]
+        .into_iter()
+        .find(|m| error.contains(&format!("Identifier(\"{m}\")")))?;
+
+        // The trailing `, N) in command` is the abort code.
+        let code = error
+            .rsplit_once("}, ")
+            .and_then(|(_, tail)| tail.split(')').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let meaning = match (module, code) {
+            ("budget", _) => "this spend would exceed the wallet's total budget",
+            ("per_tx", _) => "this spend is larger than the per-transaction cap",
+            ("rate_limit", _) => {
+                "this spend would exceed what may be spent in the current rolling window"
+            }
+            ("time_window", _) => "the wallet is outside the window it is permitted to spend in",
+            ("agent_wallet", 1) => "the capability does not belong to this wallet",
+            ("agent_wallet", 2) => "the sender is not this wallet's agent",
+            ("agent_wallet", 3) => "the wallet has been revoked",
+            ("agent_wallet", 4) => "the wallet has expired",
+            ("agent_wallet", _) => "the wallet refused the request",
+            _ => "a rule refused it",
+        };
+
+        Some(RuleRefusal {
+            module: module.to_owned(),
+            code,
+            meaning,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The exact text a testnet node returned when a 0.06 SUI spend hit a 0.05 cap.
+        const PER_TX: &str = "MoveAbort(MoveLocation { module: ModuleId { address: b02f39d6, \
+             name: Identifier(\"per_tx\") }, function: 2, instruction: 21, \
+             function_name: Some(\"prove\") }, 1) in command 2";
+
+        #[test]
+        fn a_per_tx_abort_is_named_as_the_cap_it_is() {
+            let refusal = classify_rule_abort(PER_TX).expect("this is a rule abort");
+            assert_eq!(refusal.module, "per_tx");
+            assert_eq!(refusal.code, 1);
+            assert!(refusal.to_string().contains("per-transaction cap"));
+        }
+
+        #[test]
+        fn a_budget_abort_names_the_budget() {
+            let error = PER_TX.replace("per_tx", "budget");
+            let refusal = classify_rule_abort(&error).unwrap();
+            assert_eq!(refusal.module, "budget");
+            assert!(refusal.to_string().contains("total budget"));
+        }
+
+        /// Reporting an unrelated failure as a policy decision would be worse than saying nothing:
+        /// it tells someone their limits are working when something else is broken.
+        #[test]
+        fn a_failure_that_is_not_a_rule_abort_is_not_dressed_up_as_one() {
+            assert_eq!(classify_rule_abort("InsufficientGas"), None);
+            assert_eq!(
+                classify_rule_abort("Could not find the referenced object 0x20 at version None"),
+                None
+            );
+            assert_eq!(
+                classify_rule_abort(
+                    "MoveAbort(MoveLocation { module: ModuleId { name: \
+                     Identifier(\"pool\") } }, 7) in command 1"
+                ),
+                None,
+                "an abort in someone else's module is not this wallet's policy"
+            );
+        }
+    }
+}

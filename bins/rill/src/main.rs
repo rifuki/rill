@@ -93,6 +93,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "wallet rules",
         "attach the manifest's rules to a wallet — without this it has no limits",
     ),
+    (
+        "spend",
+        "release a gated spend: request_spend -> prove x N -> confirm_spend",
+    ),
     ("help", "this list"),
 ];
 
@@ -345,6 +349,71 @@ fn main() {
                 ))
             };
             if let Err(e) = outcome {
+                eprintln!("\nrill: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("spend") => {
+            let Some(keystore) = &loaded.keystore else {
+                eprintln!(
+                    "rill: {}",
+                    loaded.keystore_error.as_deref().unwrap_or("no key loaded")
+                );
+                std::process::exit(1);
+            };
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let (Some(wallet_id), Some(cap_id)) = (flag("--wallet"), flag("--cap")) else {
+                eprintln!("rill: rill spend needs --wallet <id> --cap <id> [--amount 0.01]");
+                std::process::exit(1);
+            };
+            let submit = argv.iter().any(|a| a == "--submit");
+
+            let args = rill_cli::spend_cmd::SpendArgs {
+                package_id: flag("--package")
+                    .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
+                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                version_id: flag("--version-object")
+                    .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                wallet_id,
+                cap_id,
+                amount: flag("--amount").unwrap_or_else(|| "0.01".into()),
+                recipient: flag("--to"),
+                // Must match the rules actually attached on chain: confirm_spend counts receipts
+                // against the wallet's own policy, so a manifest that names fewer rules than the
+                // wallet carries aborts, and one that names more emits a prove for a rule that is
+                // not attached.
+                manifest: rill_core::manifest::CapabilityManifest {
+                    wallet_coin_type: "0x2::sui::SUI".into(),
+                    rules: vec![
+                        rill_core::manifest::CapabilityRule::Budget {
+                            total_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
+                        },
+                        rill_core::manifest::CapabilityRule::PerTx {
+                            max_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
+                        },
+                    ],
+                },
+                gas_budget: flag("--gas-budget")
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(100_000_000),
+                dry_run: !submit,
+            };
+
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime");
+            if let Err(e) = runtime.block_on(rill_cli::spend_cmd::spend(&endpoint, keystore, &args))
+            {
                 eprintln!("\nrill: {e}");
                 std::process::exit(1);
             }
