@@ -139,30 +139,37 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
             ),
         ],
         Surface::Wallet => vec![
-            // One read tool, not four. `rill_status`, `rill_capabilities`, `rill_wallet_limits`
-            // and `rill_explain_rejection` all answered the same question — what is the state — and
-            // four names for that is four things an agent has to learn before it can ask.
+            // One tool per question, not one tool with a switch.
             //
-            // What is NOT merged is the write. Annotations are per-tool, and an MCP client decides
-            // from `destructiveHint` whether to stop and ask a human. A single tool that could both
-            // read and spend would have to be marked destructive always, so every harmless read
-            // would raise an approval prompt — and a prompt that fires on everything is one people
-            // learn to click through. Merging the two would cost the only mechanism that makes an
-            // agent pause.
+            // These two answer different things and need different arguments: whether this signer
+            // can act, and what a particular wallet permits. Folding them into one tool with an
+            // optional argument makes the answer's shape depend on the call, which an agent has to
+            // discover by trying it.
+            //
+            // What is never folded is a read into a write. Annotations are per-tool, and an MCP
+            // client decides from `destructiveHint` whether to stop and ask a human. A tool that
+            // could both read and spend would carry that hint always, so every harmless read would
+            // raise an approval prompt — and a prompt that fires on everything is one people learn
+            // to click through.
             read_only(
                 "rill_status",
-                "What this signer can do and what a wallet's limits actually are. Reports readiness \
-                 and network; with `wallet`, also reads that wallet's live rules off chain — the \
-                 authoritative answer, since a Move contract enforces them, not this process. \
-                 Includes the last refusal and why, if there was one.",
+                "Whether this signer can act: its address, network, whether mainnet signing is \
+                 allowed, what run-set is pinned, and the last refusal with its reason if there \
+                 was one. Says nothing about any particular wallet — use rill_wallet for that.",
+                no_arguments(),
+            ),
+            read_only(
+                "rill_wallet",
+                "What one agent wallet permits, read live from the chain that enforces it: the \
+                 rules actually attached, and how the wallet is identified. Authoritative — a Move \
+                 contract holds these limits, not this process, so this is the answer rather than \
+                 a local copy of it.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
-                        "wallet": {
-                            "type": "string",
-                            "description": "An AgentWallet object id. Omit for signer status alone."
-                        }
+                        "wallet": { "type": "string", "description": "The AgentWallet object id." }
                     },
+                    "required": ["wallet"],
                     "additionalProperties": false
                 })),
             ),

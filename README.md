@@ -75,14 +75,13 @@ rill describe <package>::<module>::<function>
 `rill mcp` speaks MCP over stdio. An agent reads the wallet's limits from the chain that enforces
 them, spends within them, and is refused by the contract when it exceeds them — all in one session:
 
-Three tools, split on the one line that matters — one reads, two write:
+One tool per question, and reads never share a tool with writes:
 
 ```jsonc
-// rill_status { wallet }
-{ "ready": true, "network": "testnet",
-  "wallet": { "rules": ["budget", "per_tx"], "enforcement": "on-chain",
-             "note": "Enforced by a Move contract. Nothing in this process, and nothing you can
-                      pass to it, can widen them." } }
+// rill_wallet { wallet }
+{ "rules": ["budget", "per_tx"], "enforcement": "on-chain",
+  "note": "Enforced by a Move contract. Nothing in this process, and nothing you can pass
+           to it, can widen them." }
 
 // rill_spend  0.005 SUI
 { "submitted": true, "digest": "DpTPdMKbDSndfAqekmX8EUFyDdYePAk338Y9fqgmWhmW",
@@ -103,11 +102,14 @@ cannot widen it, the agent that asked cannot widen it, and the refusal arrives f
 The prove list is not a guess either — it is read from the wallet with `policy_rules`, because
 `confirm_spend` counts receipts against the wallet's live policy and a mismatch aborts.
 
-**Why reads are one tool and writes are separate.** An MCP client decides whether to stop and ask a
-human from a tool's `destructiveHint`, and annotations are per-tool. A single tool that could both
-read and spend would have to carry that hint always, so every harmless read would raise an approval
-prompt — and a prompt that fires on everything is one people learn to click through. So the four
-tools that answered "what is the state" became one, and the write stayed where it is.
+**Why a read never shares a tool with a write.** An MCP client decides whether to stop and ask a
+human from a tool's `destructiveHint`, and annotations are per-tool. A tool that could both read and
+spend would carry that hint always, so every harmless read would raise an approval prompt — and a
+prompt that fires on everything is one people learn to click through.
+
+The surface is `rill_status` (can this signer act), `rill_wallet` (what does this wallet permit),
+`rill_spend`, `rill_execute`. One question each, rather than one tool with a switch: an answer whose
+shape depends on which argument was passed is an answer an agent has to discover by trying it.
 
 ## Integrating a protocol without an SDK
 

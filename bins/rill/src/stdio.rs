@@ -143,7 +143,8 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     };
 
     match name {
-        "rill_status" => status(context, id, &params),
+        "rill_status" => status(context, id),
+        "rill_wallet" => wallet(context, id, &params),
         "rill_spend" => spend(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
@@ -184,14 +185,8 @@ fn argument<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// Everything read-only, in one answer.
-///
-/// Four tools used to say this — readiness, capabilities, a wallet's limits, the last refusal — and
-/// they all answered the same question. Four names for one question is four things an agent has to
-/// learn before it can ask, and three of them return most of the same fields.
-///
-/// The write is deliberately still separate; see the note in `rill-mcp`.
-fn status(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+/// Whether this signer can act. Says nothing about any particular wallet.
+fn status(context: &WalletContext, id: Value) -> Value {
     let mut answer = match &context.keystore {
         Some(keystore) => json!({
             "ready": true,
@@ -234,25 +229,32 @@ fn status(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         None => Value::Null,
     };
 
-    // The live read, only when a wallet was named. It costs a round trip, so it is not done for a
-    // caller that only asked whether the signer is up.
-    if let Some(wallet) = argument(params, "wallet") {
-        let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
-            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
-        match block_on(crate::wallet_read::read_limits(
-            &endpoint(context),
-            &package,
-            wallet,
-        )) {
-            Ok(Ok(limits)) => answer["wallet"] = limits,
-            Ok(Err(e)) | Err(e) => {
-                context.last_rejection = Some(e.clone());
-                return tool_error(id, "read_failed", &e);
-            }
+    tool_ok(id, answer)
+}
+
+/// What one wallet permits, read from the chain that enforces it.
+///
+/// Its own tool rather than an argument to `rill_status`: it answers a different question, needs an
+/// argument that one does not, and costs a round trip a caller asking about the signer should not
+/// pay for.
+fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(wallet) = argument(params, "wallet") else {
+        return tool_error(id, "invalid_arguments", "wallet is required.");
+    };
+    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
+
+    match block_on(crate::wallet_read::read_limits(
+        &endpoint(context),
+        &package,
+        wallet,
+    )) {
+        Ok(Ok(limits)) => tool_ok(id, limits),
+        Ok(Err(e)) | Err(e) => {
+            context.last_rejection = Some(e.clone());
+            tool_error(id, "read_failed", &e)
         }
     }
-
-    tool_ok(id, answer)
 }
 
 /// Read a wallet's limits from the chain that enforces them.
