@@ -124,3 +124,25 @@ the rule that refused.
 
 Mainnet anything. Deployment cutover. The OAuth server, which works and is not on the critical
 path.
+
+## Kalau kena limit di tengah jalan
+
+Workflow yang mati karena batas sesi **tidak perlu diulang dari nol**:
+
+```
+Workflow({ scriptPath: "<path yang dikembalikan waktu diluncurkan>",
+           resumeFromRunId: "wf_xxxxxxxx" })
+```
+
+Agent yang sudah selesai dikembalikan dari cache seketika; hanya yang error yang dijalankan lagi.
+Terbukti: dua run yang mati pada 2026-09-01 punya 6 dan 3 baris `result` di `journal.jsonl`, dan
+resume-nya hanya menjalankan sisanya.
+
+**Batasnya: cache itu milik sesi.** Sesi baru tidak bisa resume — run id-nya tidak dikenali, dan
+riset yang sama akan dikerjakan ulang dari awal. Jadi yang harus diselamatkan bukan run id-nya,
+melainkan **temuannya**: tulis hasil yang sudah masuk ke `docs/research/` sebelum sesi berakhir,
+dengan status verifikasinya ditandai jelas.
+
+Sebelum menutup sesi, cek `journal.jsonl` di
+`~/.claude/projects/*/subagents/workflows/<run>/` — satu baris `{"type":"result",...}` per agent
+yang selesai, berisi nilai kembaliannya utuh. Itu sumbernya, bukan ringkasan di chat.
