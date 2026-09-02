@@ -94,6 +94,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "attach the manifest's rules to a wallet — without this it has no limits",
     ),
     (
+        "deepbook provision",
+        "create a DeepBook BalanceManager and delegate it with a TradeCap + DepositCap",
+    ),
+    (
         "spend",
         "release a gated spend: request_spend -> prove x N -> confirm_spend",
     ),
@@ -398,6 +402,48 @@ fn main() {
                 .build()
                 .expect("a single-threaded runtime");
             if let Err(e) = runtime.block_on(rill_cli::spend_cmd::spend(&endpoint, keystore, &args))
+            {
+                eprintln!("\nrill: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("deepbook") => {
+            let action = std::env::args().nth(2).unwrap_or_default();
+            if action != "provision" {
+                eprintln!("rill: usage: rill deepbook provision [--agent <addr>] [--submit]");
+                std::process::exit(1);
+            }
+            let Some(keystore) = &loaded.keystore else {
+                eprintln!("rill: no key loaded");
+                std::process::exit(1);
+            };
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let network = if loaded.network == "mainnet" {
+                rill_ptb::registry::DeepBookNetwork::Mainnet
+            } else {
+                rill_ptb::registry::DeepBookNetwork::Testnet
+            };
+            let args = rill_cli::manager_cmd::ProvisionArgs {
+                deepbook_package: flag("--package")
+                    .unwrap_or_else(|| network.package_id().to_string()),
+                agent: flag("--agent"),
+                gas_budget: 200_000_000,
+                dry_run: !argv.iter().any(|a| a == "--submit"),
+            };
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime");
+            if let Err(e) =
+                runtime.block_on(rill_cli::manager_cmd::provision(&endpoint, keystore, &args))
             {
                 eprintln!("\nrill: {e}");
                 std::process::exit(1);

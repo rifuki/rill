@@ -8,6 +8,7 @@
 //! rule, then `confirm_spend`, which releases the coin only once the hot potato carries a
 //! receipt for every rule. The retired `spend()` entry point does not exist here.
 
+pub mod balance_manager;
 pub mod book;
 pub mod cetus;
 pub mod create;
