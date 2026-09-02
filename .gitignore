@@ -4,3 +4,8 @@
 .env*.local
 /data
 .DS_Store
+
+# Move build output. `sui move test` writes it, and it is 69MB of bytecode and
+# source maps regenerated from `sources/` on every build — committing it makes
+# every contract change look like a thousand-file diff.
+move/*/build/
