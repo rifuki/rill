@@ -329,7 +329,12 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
     if !outcome.ok {
         let error = outcome.error.unwrap_or_else(|| "no reason given".into());
         return Err(match rill_chain::aborts::classify_rule_abort(&error) {
-            Some(refusal) => format!("{refusal}.\n\nThe limit is on chain. Spend less."),
+            Some(refusal) => format!(
+                "{refusal}.
+
+{}",
+                refusal.advice()
+            ),
             None => format!("the chain refused it: {error}"),
         });
     }

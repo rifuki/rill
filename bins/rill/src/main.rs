@@ -132,6 +132,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "mint an agent wallet + capability (add --submit to send it)",
     ),
     (
+        "wallet revoke",
+        "owner-only kill switch: stop the wallet and take the remaining balance back",
+    ),
+    (
         "wallet rules",
         "attach the manifest's rules to a wallet — without this it has no limits",
     ),
@@ -310,10 +314,11 @@ fn main() {
         }
         Some("wallet") => {
             let action = positional().get(1).cloned().unwrap_or_default();
-            if action != "create" && action != "rules" {
+            if action != "create" && action != "rules" && action != "revoke" {
                 eprintln!(
                     "rill: usage:\n  rill wallet create [--submit] [--amount 0.2]\n  \
-                     rill wallet rules --wallet <id> [--submit]"
+                     rill wallet rules --wallet <id> [--submit]\n  \
+                     rill wallet revoke --wallet <id> [--submit]"
                 );
                 std::process::exit(1);
             }
@@ -380,7 +385,23 @@ fn main() {
                 .enable_all()
                 .build()
                 .expect("a single-threaded runtime");
-            let outcome = if action == "create" {
+            let outcome = if action == "revoke" {
+                let Some(wallet_id) = flag("--wallet") else {
+                    eprintln!("rill: rill wallet revoke needs --wallet <id>");
+                    std::process::exit(1);
+                };
+                runtime.block_on(rill_cli::revoke_cmd::revoke(
+                    &endpoint,
+                    keystore,
+                    &rill_cli::revoke_cmd::RevokeArgs {
+                        package_id: args.package_id.clone(),
+                        wallet_id,
+                        recipient: flag("--to"),
+                        gas_budget: args.gas_budget,
+                        dry_run: args.dry_run,
+                    },
+                ))
+            } else if action == "create" {
                 runtime.block_on(rill_cli::wallet::create(&endpoint, keystore, &args, now_ms))
             } else {
                 let Some(wallet_id) = flag("--wallet") else {

@@ -311,6 +311,47 @@ pub mod aborts {
         }
     }
 
+    impl RuleRefusal {
+        /// What to actually do about it.
+        ///
+        /// Generic advice is worse than none at the moment somebody is confused: telling the holder
+        /// of a revoked wallet to "spend less" sends them to try smaller amounts forever, when
+        /// nothing they can do to the amount will help. So the advice follows the refusal.
+        pub fn advice(&self) -> &'static str {
+            match (self.module.as_str(), self.code) {
+                // Amount limits. A smaller number is a real answer here.
+                ("budget", _) | ("per_tx", _) | ("rate_limit", _) => {
+                    "The limit is on chain, not in this client — raising it here changes nothing, \
+                     and neither will retrying with the same amount. Spend less, or have the \
+                     wallet's owner attach different rules."
+                }
+                ("time_window", _) => {
+                    "This is a time bound, not an amount. Retrying now will fail the same way; \
+                     either wait for the window, or have the owner change it."
+                }
+                ("agent_wallet", 2) => {
+                    "A revoked wallet cannot be un-revoked, and no capability still held will \
+                     work on it. The funds went back to the owner when it was revoked."
+                }
+                ("agent_wallet", 3) => {
+                    "The wallet has expired. Only its owner can move the expiry forward; nothing \
+                     the agent does will."
+                }
+                ("agent_wallet", 1) => {
+                    "This call is owner-only. Sign it with the owner's key — `--as <owner>`."
+                }
+                ("agent_wallet", 7) => {
+                    "This call is the agent's. Sign it with the agent's key — `--as <agent>`."
+                }
+                ("agent_wallet", 10) => {
+                    "The prove calls did not match the wallet's live policy. Read what it actually \
+                     carries rather than assuming."
+                }
+                _ => "Nothing about the amount will change this one.",
+            }
+        }
+    }
+
     /// Recognise a rule abort in a simulation or execution error.
     ///
     /// Returns `None` for anything that is not one — a gas failure, a missing object, a bug — so a
@@ -428,5 +469,51 @@ pub mod aborts {
                 "an abort in someone else's module is not this wallet's policy"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod advice_tests {
+    use crate::aborts::classify_rule_abort;
+
+    fn refusal(module: &str, code: u64) -> crate::aborts::RuleRefusal {
+        classify_rule_abort(&format!(
+            "MoveAbort(MoveLocation {{ module: ModuleId {{ name: Identifier(\"{module}\") }} }}, \
+             {code}) in command 0"
+        ))
+        .expect("recognised")
+    }
+
+    /// The bug this exists for: a revoked wallet told its holder to spend less.
+    #[test]
+    fn a_revoked_wallet_is_not_told_to_spend_less() {
+        let advice = refusal("agent_wallet", 2).advice();
+        assert!(
+            !advice.to_lowercase().contains("spend less"),
+            "no amount will help a revoked wallet: {advice}"
+        );
+        assert!(advice.contains("revoked"));
+    }
+
+    /// And an amount limit still gets the advice that does help.
+    #[test]
+    fn an_amount_limit_is_told_to_spend_less() {
+        assert!(refusal("per_tx", 1).advice().contains("Spend less"));
+        assert!(refusal("budget", 1).advice().contains("Spend less"));
+    }
+
+    /// A wrong-key refusal names which key, because that is the entire fix.
+    #[test]
+    fn a_wrong_signer_is_told_which_key_to_use() {
+        assert!(refusal("agent_wallet", 1).advice().contains("owner's key"));
+        assert!(refusal("agent_wallet", 7).advice().contains("agent's key"));
+    }
+
+    /// A time bound is not an amount, and saying so stops someone retrying smaller forever.
+    #[test]
+    fn a_time_window_says_the_amount_is_not_the_problem() {
+        let advice = refusal("time_window", 1).advice();
+        assert!(advice.contains("time bound"));
+        assert!(!advice.to_lowercase().contains("spend less"));
     }
 }

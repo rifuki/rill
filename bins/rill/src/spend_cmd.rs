@@ -266,9 +266,10 @@ pub async fn spend_json(
         // changes the amount and one that retries the same call forever.
         return Err(match rill_chain::aborts::classify_rule_abort(&error) {
             Some(refusal) => format!(
-                "{refusal}.\n\nThe limit is on chain, not in this client — raising it here \
-                 changes nothing, and neither will retrying with the same amount. Spend less, or \
-                 have the wallet's owner attach different rules."
+                "{refusal}.
+
+{}",
+                refusal.advice()
             ),
             None => format!("the chain refused it: {error}"),
         });
