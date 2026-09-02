@@ -31,6 +31,25 @@ Landed: `create_wallet`, `attach rules`
 (`8o4uqBDqhrLtYdeoXUYpmVBGfN9fxUjbx1KtVqTjMnAb`). A 0.06 SUI spend against the 0.05 cap was refused
 by `per_tx`, and raising the cap client-side changed nothing — the limit is on chain.
 
+## Sudah selesai sejak rencana ini ditulis
+
+- Daftar `prove` dibaca hidup dari chain lewat `policy_rules` (item 1).
+- Rule bisa direkonsiliasi, bukan cuma dipasang sekali (item 2) — dibuktikan dengan menurunkan
+  per-tx cap 0.05 → 0.02 dan spend 0.03 yang tadinya lolos jadi ditolak.
+- Lifecycle lengkap: `revoke`, `top_up`, `rotate_agent`, `extend_expiry` (item 3).
+- Permukaan MCP bisa didorong agent: `rill_status`, `rill_wallet`, `rill_spend`, `rill_execute`.
+- Tabel abort diperbaiki (geser satu di semua kode `agent_wallet`) dan dikunci ke sumber Move.
+
+Digest yang mendarat, urut: `DaVtZtYr…QzRv` (rules), `8o4uqBDq…MnAb` (spend), `7Hf7EGyR…HSzX`
+(spend dari policy chain), `CTkxPAZX…b1jF` (reconcile ulang), `6biB5gaM…ahKC` (turunkan cap),
+`DpTPdMKb…WhmW` (spend lewat MCP).
+
+## Riset yang sudah ada, dan statusnya
+
+`docs/research/2026-09-01-defi-addresses-unverified.md` — alamat Cetus, Haedal, DeepBook
+BalanceManager, pool testnet, dan framework Sui. **Satu lapis, belum diverifikasi ulang.** Jangan
+masuk registry sebelum dicek dengan `rill describe`. Header file itu menjelaskan kenapa.
+
 ## Queue
 
 ### 1. Read the wallet's live rule set from chain
