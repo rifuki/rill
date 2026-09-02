@@ -139,35 +139,32 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
             ),
         ],
         Surface::Wallet => vec![
+            // One read tool, not four. `rill_status`, `rill_capabilities`, `rill_wallet_limits`
+            // and `rill_explain_rejection` all answered the same question — what is the state — and
+            // four names for that is four things an agent has to learn before it can ask.
+            //
+            // What is NOT merged is the write. Annotations are per-tool, and an MCP client decides
+            // from `destructiveHint` whether to stop and ask a human. A single tool that could both
+            // read and spend would have to be marked destructive always, so every harmless read
+            // would raise an approval prompt — and a prompt that fires on everything is one people
+            // learn to click through. Merging the two would cost the only mechanism that makes an
+            // agent pause.
             read_only(
                 "rill_status",
-                "Report the local signer's readiness and the agent wallet's live budget and \
-                 revocation state.",
-                no_arguments(),
-            ),
-            read_only(
-                "rill_capabilities",
-                "Return this run's public ids, limits, allowed targets, and which layer enforces each.",
-                no_arguments(),
-            ),
-            read_only(
-                "rill_wallet_limits",
-                "Read an agent wallet's live limits off chain: the rules actually attached, its \
-                 remaining budget, expiry, and whether it has been revoked. These are enforced by \
-                 a Move contract, so this is the authoritative answer rather than a local copy.",
+                "What this signer can do and what a wallet's limits actually are. Reports readiness \
+                 and network; with `wallet`, also reads that wallet's live rules off chain — the \
+                 authoritative answer, since a Move contract enforces them, not this process. \
+                 Includes the last refusal and why, if there was one.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
-                        "wallet": { "type": "string", "description": "The AgentWallet object id." }
+                        "wallet": {
+                            "type": "string",
+                            "description": "An AgentWallet object id. Omit for signer status alone."
+                        }
                     },
-                    "required": ["wallet"],
                     "additionalProperties": false
                 })),
-            ),
-            read_only(
-                "rill_explain_rejection",
-                "Explain the last policy rejection. Reads only; changes no policy.",
-                no_arguments(),
             ),
             destructive(
                 "rill_spend",
@@ -197,11 +194,13 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
             ),
             destructive(
                 "rill_execute",
-                "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope. \
-                 THIS SUBMITS A REAL TRANSACTION and cannot be undone. Never retry this call for \
-                 the same envelope: a second call submits a second transaction. If it refused, \
-                 read why with rill_explain_rejection and change what it objected to — retrying \
-                 an unchanged envelope produces the same refusal.",
+                "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope built \
+                 elsewhere. Distinct from rill_spend, which builds locally: this is the path where \
+                 a keyless server proposes and this signer independently re-derives everything \
+                 before agreeing. THIS SUBMITS A REAL TRANSACTION and cannot be undone. Never \
+                 retry this call for the same envelope: a second call submits a second \
+                 transaction. If it refused, read why in rill_status and change what it objected \
+                 to — retrying an unchanged envelope produces the same refusal.",
                 object_schema(json!({
                     "type": "object",
                     "properties": { "envelope": { "type": "object" } },

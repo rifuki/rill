@@ -143,68 +143,8 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     };
 
     match name {
-        "rill_status" => match &context.keystore {
-            Some(keystore) => tool_ok(
-                id,
-                json!({
-                    "ready": true,
-                    "address": keystore.address().to_string(),
-                    "network": context.network,
-                    // Stated rather than assumed: an operator should be able to see that mainnet
-                    // signing is off without reading the launch environment.
-                    "mainnetSigningAllowed": context.mainnet_allowed,
-                }),
-            ),
-            None => tool_ok(
-                id,
-                json!({
-                    "ready": false,
-                    "network": context.network,
-                    "reason": "No signing key is configured. Set RILL_SUI_PRIVATE_KEY in the shell \
-                               or secret manager that launches this process."
-                }),
-            ),
-        },
-        "rill_capabilities" => match &context.run_set {
-            Some(run_set) => {
-                let declaration = rill_core::manifest::to_declaration(&run_set.capability_manifest)
-                    .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
-                    .unwrap_or(Value::Null);
-                tool_ok(
-                    id,
-                    json!({
-                        "label": run_set.label,
-                        "network": run_set.network,
-                        "actionId": run_set.action_id,
-                        "walletId": run_set.wallet_id,
-                        "allowedTargets": run_set.allowed_targets,
-                        "maxAmountBaseUnits": run_set.max_amount_base_units,
-                        "minimumRemainingBaseUnits": run_set.minimum_remaining_base_units,
-                        // Which layer holds each limit, so a reader is not left assuming the chain
-                        // enforces all of them.
-                        "declaration": declaration,
-                    }),
-                )
-            }
-            None => tool_ok(
-                id,
-                json!({
-                    "runSet": null,
-                    "note": "No run-set is loaded, so there are no capabilities to report. Stated \
-                             rather than answered with an empty object, which would read as \
-                             \"no limits\"."
-                }),
-            ),
-        },
-        "rill_wallet_limits" => wallet_limits(context, id, &params),
+        "rill_status" => status(context, id, &params),
         "rill_spend" => spend(context, id, &params),
-        "rill_explain_rejection" => match &context.last_rejection {
-            Some(reason) => tool_ok(id, json!({ "lastRejection": reason })),
-            None => tool_ok(
-                id,
-                json!({ "lastRejection": null, "note": "Nothing has been refused yet." }),
-            ),
-        },
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
@@ -244,31 +184,81 @@ fn argument<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+/// Everything read-only, in one answer.
+///
+/// Four tools used to say this — readiness, capabilities, a wallet's limits, the last refusal — and
+/// they all answered the same question. Four names for one question is four things an agent has to
+/// learn before it can ask, and three of them return most of the same fields.
+///
+/// The write is deliberately still separate; see the note in `rill-mcp`.
+fn status(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let mut answer = match &context.keystore {
+        Some(keystore) => json!({
+            "ready": true,
+            "address": keystore.address().to_string(),
+            "network": context.network,
+            // Stated rather than assumed: an operator should be able to see that mainnet signing
+            // is off without reading the launch environment.
+            "mainnetSigningAllowed": context.mainnet_allowed,
+        }),
+        None => json!({
+            "ready": false,
+            "network": context.network,
+            "reason": "No signing key is configured. Set RILL_SUI_PRIVATE_KEY in the shell or \
+                       secret manager that launches this process, or run \
+                       `sui client new-address ed25519`."
+        }),
+    };
+
+    if let Some(reason) = &context.last_rejection {
+        answer["lastRejection"] = Value::String(reason.clone());
+    }
+
+    // A run-set, when one is loaded, says what this run is pinned to. Reported as null rather than
+    // omitted: an absent field reads as "no limits", which is the opposite of what it means.
+    answer["runSet"] = match &context.run_set {
+        Some(run_set) => json!({
+            "label": run_set.label,
+            "network": run_set.network,
+            "actionId": run_set.action_id,
+            "walletId": run_set.wallet_id,
+            "allowedTargets": run_set.allowed_targets,
+            "maxAmountBaseUnits": run_set.max_amount_base_units,
+            "minimumRemainingBaseUnits": run_set.minimum_remaining_base_units,
+            // Which layer holds each limit, so a reader is not left assuming the chain enforces
+            // all of them.
+            "declaration": rill_core::manifest::to_declaration(&run_set.capability_manifest)
+                .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
+                .unwrap_or(Value::Null),
+        }),
+        None => Value::Null,
+    };
+
+    // The live read, only when a wallet was named. It costs a round trip, so it is not done for a
+    // caller that only asked whether the signer is up.
+    if let Some(wallet) = argument(params, "wallet") {
+        let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
+            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
+        match block_on(crate::wallet_read::read_limits(
+            &endpoint(context),
+            &package,
+            wallet,
+        )) {
+            Ok(Ok(limits)) => answer["wallet"] = limits,
+            Ok(Err(e)) | Err(e) => {
+                context.last_rejection = Some(e.clone());
+                return tool_error(id, "read_failed", &e);
+            }
+        }
+    }
+
+    tool_ok(id, answer)
+}
+
 /// Read a wallet's limits from the chain that enforces them.
 ///
 /// Not from the run-set, and not from anything this process was told at startup. A limit reported
 /// from a local copy is a limit an agent could be shown after it had already changed.
-fn wallet_limits(context: &mut WalletContext, id: Value, params: &Value) -> Value {
-    let Some(wallet) = argument(params, "wallet") else {
-        return tool_error(id, "invalid_arguments", "wallet is required.");
-    };
-    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
-
-    let outcome = block_on(crate::wallet_read::read_limits(
-        &endpoint(context),
-        &package,
-        wallet,
-    ));
-    match outcome {
-        Ok(Ok(limits)) => tool_ok(id, limits),
-        Ok(Err(e)) | Err(e) => {
-            context.last_rejection = Some(e.clone());
-            tool_error(id, "read_failed", &e)
-        }
-    }
-}
-
 /// Release funds from an agent wallet, gated by the rules the wallet carries on chain.
 ///
 /// # A refusal here is the wallet working
@@ -544,7 +534,7 @@ mod tests {
         let input = concat!(
             r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rill_execute","arguments":{"envelope":{}}}}"#,
             "\n",
-            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rill_explain_rejection","arguments":{}}}"#
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rill_status","arguments":{}}}"#
         );
         serve(&mut ctx, input.as_bytes(), &mut out).unwrap();
         let lines: Vec<Value> = String::from_utf8(out)
@@ -752,7 +742,7 @@ mod execution_tests {
             &mut ctx,
             &json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": { "name": "rill_explain_rejection", "arguments": {} }
+                "params": { "name": "rill_status", "arguments": {} }
             }),
         )
         .unwrap();
@@ -769,11 +759,11 @@ mod execution_tests {
             &mut ctx,
             &json!({
                 "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": { "name": "rill_capabilities", "arguments": {} }
+                "params": { "name": "rill_status", "arguments": {} }
             }),
         )
         .unwrap();
-        let caps = &out["result"]["structuredContent"]["declaration"]["caps"];
+        let caps = &out["result"]["structuredContent"]["runSet"]["declaration"]["caps"];
         assert_eq!(caps[0]["enforcement"], "on-chain");
     }
 }
