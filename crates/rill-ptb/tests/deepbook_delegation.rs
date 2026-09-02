@@ -91,3 +91,26 @@ fn the_order_builder_never_calls_the_owner_only_deposit() {
         );
     }
 }
+
+/// The deposited coin is the one the side actually pays with.
+///
+/// A bid pays in the quote; an ask delivers the base. The builder named the quote for both, which
+/// compiles — nothing checks a type argument against `is_bid` — and fails on chain as a type
+/// mismatch against a coin the manager was never given.
+#[test]
+fn the_deposited_coin_type_follows_the_side() {
+    let source = include_str!("../src/deepbook.rs");
+    assert!(
+        source.contains("if order.is_bid"),
+        "the deposit's type argument must depend on the side, not be fixed to the quote"
+    );
+    // And it must not have gone back to naming one of them unconditionally at the call site.
+    let deposit_call = source
+        .split("deposit_with_cap")
+        .nth(1)
+        .expect("the delegated deposit is emitted");
+    assert!(
+        !deposit_call[..200].contains("order.pool.quote_coin_type"),
+        "the deposit names the quote coin directly again; an ask delivers the base"
+    );
+}

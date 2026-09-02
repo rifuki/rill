@@ -139,15 +139,25 @@ pub fn place_limit_order(
     let manager = tx.object(shared.input(order.balance_manager_id, true)?);
     let deposit_cap = tx.object(order.deposit_cap.clone());
 
-    // 1. Deposit the funding coin, with the delegated capability. Type argument is the coin being
-    //    deposited. See `LimitOrder::deposit_cap` for why this is not the plain `deposit`.
+    // 1. Deposit the funding coin, with the delegated capability. See `LimitOrder::deposit_cap`
+    //    for why this is not the plain `deposit`.
+    //
+    //    The type argument is the coin actually being handed over, and which coin that is depends
+    //    on the side: a bid pays in the quote and an ask delivers the base. Naming the quote for
+    //    both compiles — the type argument is not checked against `is_bid` anywhere — and then
+    //    fails on chain as a type mismatch against a coin the manager was never given.
+    let deposited_coin_type = if order.is_bid {
+        &order.pool.quote_coin_type
+    } else {
+        &order.pool.base_coin_type
+    };
     tx.move_call(
         Function::new(
             deepbook_package,
             ident("balance_manager")?,
             ident("deposit_with_cap")?,
         )
-        .with_type_args(vec![type_tag(&order.pool.quote_coin_type)?]),
+        .with_type_args(vec![type_tag(deposited_coin_type)?]),
         vec![manager, deposit_cap, funding_coin],
     );
 
