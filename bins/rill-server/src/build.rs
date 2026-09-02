@@ -45,6 +45,10 @@ pub struct BuildRequest {
     pub balance_manager_id: Address,
     pub trade_cap: ObjectInput,
     pub trade_cap_id: String,
+    /// Funding the manager is a separate delegation from trading on it — see
+    /// [`rill_ptb::deepbook::LimitOrder::deposit_cap`].
+    pub deposit_cap: ObjectInput,
+    pub deposit_cap_id: String,
     pub client_order_id: u64,
     /// Decimal strings. They never become floats anywhere in this path.
     pub price: String,
@@ -155,6 +159,7 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
         pool: request.pool.clone(),
         balance_manager_id: request.balance_manager_id,
         trade_cap: request.trade_cap.clone(),
+        deposit_cap: request.deposit_cap.clone(),
         client_order_id: request.client_order_id,
         price: request.price.clone(),
         quantity: request.quantity.clone(),

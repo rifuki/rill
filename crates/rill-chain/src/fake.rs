@@ -36,7 +36,6 @@ impl Default for SimulationBehavior {
     }
 }
 
-#[derive(Default)]
 struct State {
     objects: HashMap<String, ObjectSummary>,
     owned: HashMap<String, Vec<String>>,
@@ -46,6 +45,23 @@ struct State {
     next_digest: usize,
     /// What `simulate_read` hands back, command by command.
     read_returns: Vec<Vec<Vec<u8>>>,
+    reference_gas_price: u64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            objects: HashMap::new(),
+            owned: HashMap::new(),
+            balances: HashMap::new(),
+            simulation: SimulationBehavior::default(),
+            executions: Vec::new(),
+            next_digest: 0,
+            read_returns: Vec::new(),
+            // Testnet's, at the time of writing. Real, and different from mainnet's 100.
+            reference_gas_price: 1_000,
+        }
+    }
 }
 
 /// A configurable in-memory chain.
@@ -158,6 +174,11 @@ impl SuiRead for FakeSui {
 
     /// A read returns whatever `command_returns` was staged with, so a caller reading a price can
     /// be tested without a node.
+    /// Testnet's value, so a test that forgets to stage one is not silently building at mainnet's.
+    async fn reference_gas_price(&self) -> ChainResult<u64> {
+        Ok(self.state.borrow().reference_gas_price)
+    }
+
     async fn simulate_read(&self, _unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
         let returns = self.state.borrow().read_returns.clone();
         Ok(SimulationOutcome {

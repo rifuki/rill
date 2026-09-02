@@ -145,6 +145,14 @@ pub fn parse_build_request(
         .parse()
         .map_err(|_| RequestError::at("params.tradeCapDigest", "is not an object digest"))?;
 
+    // Funding the manager and trading on it are two delegations, so they are two capabilities.
+    // Required rather than optional: a request that omits it would build a deposit the agent
+    // cannot authorise, and the failure would arrive as an owner assertion on chain.
+    let deposit_cap_id = address_at(arguments, "params.depositCapId")?;
+    let deposit_cap_digest: Digest = string_at(arguments, "params.depositCapDigest")?
+        .parse()
+        .map_err(|_| RequestError::at("params.depositCapDigest", "is not an object digest"))?;
+
     let gas_id = address_at(arguments, "params.gasObjectId")?;
     let gas_digest: Digest = string_at(arguments, "params.gasObjectDigest")?
         .parse()
@@ -182,6 +190,12 @@ pub fn parse_build_request(
             trade_cap_digest,
         ),
         trade_cap_id: trade_cap_id.to_string(),
+        deposit_cap: gas_object(
+            deposit_cap_id,
+            u64_at(arguments, "params.depositCapVersion")?,
+            deposit_cap_digest,
+        ),
+        deposit_cap_id: deposit_cap_id.to_string(),
         client_order_id: u64_at(arguments, "params.clientOrderId")?,
         price: amount_at(arguments, "params.price")?,
         quantity: amount_at(arguments, "params.quantity")?,
@@ -240,6 +254,9 @@ mod tests {
                 "tradeCapId": addr(0x22),
                 "tradeCapVersion": 1,
                 "tradeCapDigest": "11111111111111111111111111111111",
+                "depositCapId": addr(0x23),
+                "depositCapVersion": 1,
+                "depositCapDigest": "11111111111111111111111111111111",
                 "gasObjectId": addr(0x0a),
                 "gasObjectVersion": 1,
                 "gasObjectDigest": "11111111111111111111111111111111",

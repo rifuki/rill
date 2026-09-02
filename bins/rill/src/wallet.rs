@@ -85,7 +85,15 @@ pub async fn create(
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
-    tx.set_gas_price(1_000);
+    // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
+    // on one network is ten times the price on the other — and a price below the reference is
+    // rejected outright rather than merely running slow.
+    tx.set_gas_price(
+        chain
+            .reference_gas_price()
+            .await
+            .map_err(|e| format!("reading the reference gas price: {e}"))?,
+    );
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(
             c.reference.id.parse().expect("an id from the chain"),

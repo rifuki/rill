@@ -123,7 +123,12 @@ async fn does_gas_selection_repair_a_stale_gas_ref() {
                 let status = executed
                     .and_then(|e| e.effects.as_ref())
                     .and_then(|e| e.status.as_ref())
-                    .map(|s| (s.success, s.error.as_ref().and_then(|e| e.description.clone())));
+                    .map(|s| {
+                        (
+                            s.success,
+                            s.error.as_ref().and_then(|e| e.description.clone()),
+                        )
+                    });
                 println!(
                     "stale ref, do_gas_selection={selection:<5} Ok  status={status:?}\n  \
                      payment objects={:?}",
@@ -194,7 +199,10 @@ async fn the_returned_bytes_differ_only_in_gas_payment() {
     let back: sui_sdk_types::Transaction = bcs::from_bytes(back_bytes).expect("decode back");
 
     println!("sender      same: {}", sent.sender == back.sender);
-    println!("expiration  same: {:?} vs {:?}", sent.expiration, back.expiration);
+    println!(
+        "expiration  same: {:?} vs {:?}",
+        sent.expiration, back.expiration
+    );
     println!(
         "kind        same: {}",
         bcs::to_bytes(&sent.kind).unwrap() == bcs::to_bytes(&back.kind).unwrap()
@@ -249,7 +257,10 @@ async fn the_returned_bytes_can_be_signed_and_executed() {
         .expect("bcs back")
         .to_vec();
     let back: sui_sdk_types::Transaction = bcs::from_bytes(&back_bytes).expect("decode");
-    println!("gas objects chosen by the node: {}", back.gas_payment.objects.len());
+    println!(
+        "gas objects chosen by the node: {}",
+        back.gas_payment.objects.len()
+    );
 
     let signature = keypair.sign_transaction(&back).expect("sign");
 

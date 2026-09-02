@@ -1267,6 +1267,7 @@ dependencies = [
  "rill-core",
  "rill-ptb",
  "serde_json",
+ "sui-crypto",
  "sui-rpc",
  "sui-sdk-types",
  "sui-transaction-builder",

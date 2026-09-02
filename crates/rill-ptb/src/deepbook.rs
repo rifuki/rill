@@ -45,7 +45,17 @@ pub struct PoolSpec {
 pub struct LimitOrder {
     pub pool: PoolSpec,
     pub balance_manager_id: Address,
+    /// Authorises trading on the manager without its owner's key.
     pub trade_cap: ObjectInput,
+    /// Authorises *funding* it without the owner's key — a separate capability from the trade cap,
+    /// and separately minted.
+    ///
+    /// The plain `deposit(manager, coin)` takes no capability at all, and `deposit_with_cap` exists
+    /// beside it taking one. A function that anyone could call would not need a delegated twin, so
+    /// `deposit` is the owner's door and this is the agent's. Using the owner's door in a
+    /// transaction whose sender must be the *agent* — `request_spend` asserts exactly that — is a
+    /// transaction no single signer can produce.
+    pub deposit_cap: ObjectInput,
     pub client_order_id: u64,
     /// Decimal string. Never a float.
     pub price: String,
@@ -127,16 +137,18 @@ pub fn place_limit_order(
         })?;
 
     let manager = tx.object(shared.input(order.balance_manager_id, true)?);
+    let deposit_cap = tx.object(order.deposit_cap.clone());
 
-    // 1. Deposit the funding coin. Type argument is the coin being deposited.
+    // 1. Deposit the funding coin, with the delegated capability. Type argument is the coin being
+    //    deposited. See `LimitOrder::deposit_cap` for why this is not the plain `deposit`.
     tx.move_call(
         Function::new(
             deepbook_package,
             ident("balance_manager")?,
-            ident("deposit")?,
+            ident("deposit_with_cap")?,
         )
         .with_type_args(vec![type_tag(&order.pool.quote_coin_type)?]),
-        vec![manager, funding_coin],
+        vec![manager, deposit_cap, funding_coin],
     );
 
     // 2. Prove the agent may trade on this manager. The TradeCap is what makes the order
@@ -187,7 +199,7 @@ pub fn place_limit_order(
 /// The Move call targets a limit order emits, in order — the second half of what the signer pins.
 pub fn expected_order_targets(deepbook_package: Address) -> Vec<String> {
     vec![
-        format!("{deepbook_package}::balance_manager::deposit"),
+        format!("{deepbook_package}::balance_manager::deposit_with_cap"),
         format!("{deepbook_package}::balance_manager::generate_proof_as_trader"),
         format!("{deepbook_package}::pool::place_limit_order"),
     ]

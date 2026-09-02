@@ -241,6 +241,34 @@ impl SuiRead for GrpcSui {
         })
     }
 
+    async fn reference_gas_price(&self) -> ChainResult<u64> {
+        use sui_rpc::proto::sui::rpc::v2::GetEpochRequest;
+
+        let mut request = GetEpochRequest::default();
+        // No epoch named means the current one.
+        request.read_mask = Some(GrpcSui::mask(&["epoch", "reference_gas_price"]));
+
+        let response = self
+            .client
+            .clone()
+            .ledger_client()
+            .get_epoch(request)
+            .await
+            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .into_inner();
+
+        response
+            .epoch
+            .and_then(|e| e.reference_gas_price)
+            .ok_or_else(|| {
+                ChainError::NotFound(
+                    "the node did not report a reference gas price; building against a guess \
+                     would produce a transaction it may reject"
+                        .into(),
+                )
+            })
+    }
+
     async fn simulate_read(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
         let transaction = decode_transaction(unsigned_tx_b64)?;
 

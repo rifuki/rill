@@ -75,6 +75,8 @@ fn request() -> rill_server::build::BuildRequest {
         balance_manager_id: addr(0x21),
         trade_cap: gas_object(addr(0x22), 1, Digest::ZERO),
         trade_cap_id: addr(0x22).to_string(),
+        deposit_cap: gas_object(addr(0x23), 1, Digest::ZERO),
+        deposit_cap_id: addr(0x23).to_string(),
         client_order_id: 1,
         price: "2362.123456".into(),
         quantity: "1".into(),

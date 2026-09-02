@@ -128,6 +128,9 @@ pub fn mid_price_transaction(
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
     tx.set_gas_budget(10_000_000);
+    // A literal is correct here and only here: this transaction is never submitted, and its gas
+    // payment is emptied below so the node prices it itself. Reading the reference price for a
+    // read would be a round trip that changes nothing.
     tx.set_gas_price(1_000);
 
     let pool_object = tx.object(shared.input(pool.pool_id, false)?);

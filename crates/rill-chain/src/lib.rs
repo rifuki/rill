@@ -169,6 +169,18 @@ pub trait SuiRead {
     ///
     /// [`simulate`]: SuiRead::simulate
     async fn simulate_read(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome>;
+
+    /// The current epoch's reference gas price, in mist per gas unit.
+    ///
+    /// # It is not the same number on every network
+    ///
+    /// Testnet answers 1000 and mainnet answers 100, so a literal that happens to be right on the
+    /// network you developed against is ten times the price on the one you ship to. It also moves:
+    /// it is a per-epoch value the validators set, and a transaction built below it is rejected
+    /// outright rather than merely running slowly.
+    ///
+    /// So it is read, per build, from the chain the transaction is going to.
+    async fn reference_gas_price(&self) -> ChainResult<u64>;
 }
 
 /// Writes. Separated from [`SuiRead`] so that a component which only needs to read cannot be

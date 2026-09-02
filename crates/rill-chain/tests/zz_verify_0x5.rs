@@ -32,6 +32,10 @@ async fn probe(net: &str, id: &str) {
 #[ignore]
 async fn object_5_on_both() {
     for net in ["mainnet", "testnet"] {
-        probe(net, "0x0000000000000000000000000000000000000000000000000000000000000005").await;
+        probe(
+            net,
+            "0x0000000000000000000000000000000000000000000000000000000000000005",
+        )
+        .await;
     }
 }

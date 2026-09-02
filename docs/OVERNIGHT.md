@@ -103,7 +103,22 @@ key it signs with. Then: owner creates and bounds the wallet, agent spends from 
 **Done when.** The agent key spends successfully, and the *owner* key attempting the same spend is
 refused with `E_NOT_AGENT` (7) — which the abort table now names correctly.
 
-### 5. DeepBook, honestly
+### 5. DeepBook, honestly — SETTLED, and the fix is in
+
+`balance_manager::deposit` takes no capability; `deposit_with_cap` exists beside it taking one. A
+function anyone could call would not need a delegated twin, and confirmed on both networks the two
+differ by exactly that capability. The builder emitted the owner's form, which in a transaction
+whose sender must be the *agent* — `request_spend` asserts it — no single signer could produce.
+
+Now emits `deposit_with_cap`, and `LimitOrder` carries a `deposit_cap` beside the `trade_cap`.
+`tests/deepbook_delegation.rs` checks the arities live and greps the builder for the owner-only
+forms.
+
+**Still open:** nothing mints a `DepositCap` or a `TradeCap` yet, and no `BalanceManager` exists to
+mint them from. `mint_deposit_cap(bm)` and `mint_trade_cap(bm)` are both one argument and both
+owner-only. That is the next thing an order needs.
+
+### 5b. DeepBook, the leftovers
 
 **Why.** `balance_manager::deposit` appears to be owner-only: it calls `generate_proof_as_owner`,
 which asserts `ctx.sender() == owner`. `request_spend` asserts the sender is the *agent*. One PTB
@@ -116,7 +131,19 @@ delegated form, or write down plainly that the flow needs two transactions and w
 **Done when.** Either an order lands on testnet from a wallet-released coin, or `README.md` says
 exactly which part cannot work and what the contract would need.
 
-### 6. Gas, properly
+### 6. Gas, properly — HALF DONE
+
+Reference gas price is read from the chain now, per build, via `GetEpochRequest` with a
+`reference_gas_price` mask. It is **not the same on every network**: testnet answers 1000 and
+mainnet answers 100, so the literal `1_000` that had been in all three commands was ten times the
+mainnet price. It happened to be right on the network everything was tested against.
+
+Still open: `list_owned_objects` pages at 50 with no cursor, and gas refs go stale between the
+three transactions with nothing re-reading them. `crates/rill-chain/tests/gas_spike2.rs` has the
+experiments that would settle whether `do_gas_selection` repairs a stale ref or only fills an empty
+one — run it with `RILL_SPIKE_ADDRESS` set.
+
+### 6b. Gas, the leftovers
 
 **Why.** Gas price is hardcoded `1_000` in three places; a reference-price change makes all three
 build transactions the node rejects. `list_owned_objects` pages at 50 with no cursor, so gas
