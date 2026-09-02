@@ -98,6 +98,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "create a DeepBook BalanceManager and delegate it with a TradeCap + DepositCap",
     ),
     (
+        "order",
+        "the hero path: gated spend -> deposit -> proof -> DeepBook limit order",
+    ),
+    (
         "spend",
         "release a gated spend: request_spend -> prove x N -> confirm_spend",
     ),
@@ -444,6 +448,65 @@ fn main() {
                 .expect("a single-threaded runtime");
             if let Err(e) =
                 runtime.block_on(rill_cli::manager_cmd::provision(&endpoint, keystore, &args))
+            {
+                eprintln!("\nrill: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some("order") => {
+            let Some(keystore) = &loaded.keystore else {
+                eprintln!("rill: no key loaded");
+                std::process::exit(1);
+            };
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let need = |name: &str| match flag(name) {
+                Some(v) => v,
+                None => {
+                    eprintln!("rill: rill order needs {name}");
+                    std::process::exit(1);
+                }
+            };
+            let network = if loaded.network == "mainnet" {
+                rill_ptb::registry::DeepBookNetwork::Mainnet
+            } else {
+                rill_ptb::registry::DeepBookNetwork::Testnet
+            };
+            let args = rill_cli::order_cmd::OrderArgs {
+                package_id: flag("--package")
+                    .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
+                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                version_id: flag("--version-object")
+                    .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
+                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                wallet_id: need("--wallet"),
+                cap_id: need("--cap"),
+                deepbook_package: flag("--deepbook")
+                    .unwrap_or_else(|| network.package_id().to_string()),
+                pool_key: flag("--pool").unwrap_or_else(|| "SUI_DBUSDC".into()),
+                network,
+                balance_manager_id: need("--manager"),
+                trade_cap_id: need("--trade-cap"),
+                deposit_cap_id: need("--deposit-cap"),
+                spend: flag("--spend").unwrap_or_else(|| "0.01".into()),
+                price: need("--price"),
+                quantity: need("--quantity"),
+                is_bid: argv.iter().any(|a| a == "--bid"),
+                gas_budget: 200_000_000,
+                dry_run: !argv.iter().any(|a| a == "--submit"),
+            };
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime");
+            if let Err(e) = runtime.block_on(rill_cli::order_cmd::order(&endpoint, keystore, &args))
             {
                 eprintln!("\nrill: {e}");
                 std::process::exit(1);

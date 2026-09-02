@@ -10,6 +10,7 @@
 
 pub mod balance_manager;
 pub mod book;
+pub mod book_params;
 pub mod cetus;
 pub mod create;
 pub mod deepbook;

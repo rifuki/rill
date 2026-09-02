@@ -9,7 +9,7 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds, 312 Rust tests pass — including reads against live testnet and mainnet
+The workspace builds, 323 Rust tests pass — including reads against live testnet and mainnet
 fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
 [Known gaps](#known-gaps), which names exactly what is missing and why.
 
@@ -69,6 +69,24 @@ rill address      # just the address, so it composes
 rill capabilities # what the loaded run-set permits, in order
 rill describe <package>::<module>::<function>
 ```
+
+## The whole path, on chain
+
+One transaction, signed only by the agent, with no owner key anywhere in it:
+
+```
+request_spend -> budget::prove -> per_tx::prove -> confirm_spend
+              -> balance_manager::deposit_with_cap
+              -> balance_manager::generate_proof_as_trader
+              -> pool::place_limit_order
+```
+
+`GiL7unaYVnx7TF9QDtpUgc3nFSdWxVgkLb6sMDQfCm77` on testnet — 10 DEEP bid at 0.015 SUI, funded by
+coins the agent wallet released under its own on-chain rules.
+
+The DeepBook half runs on delegated capabilities: a `DepositCap` to fund the BalanceManager and a
+`TradeCap` to trade on it. Neither is the owner's key, which is what makes the transaction
+signable at all — `request_spend` asserts the sender is the *agent*, and a PTB has one sender.
 
 ## What an agent sees
 
