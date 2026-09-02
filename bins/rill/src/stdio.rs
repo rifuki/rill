@@ -196,6 +196,8 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
                 }),
             ),
         },
+        "rill_wallet_limits" => wallet_limits(context, id, &params),
+        "rill_spend" => spend(context, id, &params),
         "rill_explain_rejection" => match &context.last_rejection {
             Some(reason) => tool_ok(id, json!({ "lastRejection": reason })),
             None => tool_ok(
@@ -217,6 +219,117 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
 /// Submission is not wired: the validation chain ends at [`rill_policy::Simulated`], which is the
 /// only type that can be signed, and going further needs a live fullnode this function does not
 /// have. What is proven here is that a bad envelope never reaches that type.
+/// A single-threaded runtime, built per call.
+///
+/// The transport is synchronous by design — it reads lines and writes lines — and the chain client
+/// is not. Building a runtime per call costs microseconds and keeps the transport free of an
+/// executor it would otherwise have to own.
+fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())
+        .map(|rt| rt.block_on(future))
+}
+
+fn endpoint(context: &WalletContext) -> String {
+    std::env::var("SUI_RPC_URL")
+        .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", context.network))
+}
+
+fn argument<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
+    params
+        .get("arguments")
+        .and_then(|a| a.get(name))
+        .and_then(Value::as_str)
+}
+
+/// Read a wallet's limits from the chain that enforces them.
+///
+/// Not from the run-set, and not from anything this process was told at startup. A limit reported
+/// from a local copy is a limit an agent could be shown after it had already changed.
+fn wallet_limits(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(wallet) = argument(params, "wallet") else {
+        return tool_error(id, "invalid_arguments", "wallet is required.");
+    };
+    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
+
+    let outcome = block_on(crate::wallet_read::read_limits(
+        &endpoint(context),
+        &package,
+        wallet,
+    ));
+    match outcome {
+        Ok(Ok(limits)) => tool_ok(id, limits),
+        Ok(Err(e)) | Err(e) => {
+            context.last_rejection = Some(e.clone());
+            tool_error(id, "read_failed", &e)
+        }
+    }
+}
+
+/// Release funds from an agent wallet, gated by the rules the wallet carries on chain.
+///
+/// # A refusal here is the wallet working
+///
+/// The rules live in a Move contract, so this process cannot widen them and neither can the agent
+/// calling it. When the contract refuses, that is reported as a refusal naming the rule — not as an
+/// error, and never as something to retry with the same amount.
+fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so nothing can be signed.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    if context.network == "mainnet" && !context.mainnet_allowed {
+        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "mainnet_not_opted_in", &reason);
+    }
+
+    let (Some(wallet), Some(cap), Some(amount)) = (
+        argument(params, "wallet"),
+        argument(params, "cap"),
+        argument(params, "amount"),
+    ) else {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            "wallet, cap and amount are all required. amount is decimal text, never a number.",
+        );
+    };
+
+    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
+    let version = std::env::var("AGENT_WALLET_VERSION_ID").unwrap_or_else(|_| {
+        "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65".to_string()
+    });
+
+    let args = crate::spend_cmd::SpendArgs {
+        package_id: package,
+        version_id: version,
+        wallet_id: wallet.to_string(),
+        cap_id: cap.to_string(),
+        amount: amount.to_string(),
+        recipient: argument(params, "to").map(str::to_owned),
+        gas_budget: 100_000_000,
+        dry_run: false,
+    };
+
+    match block_on(crate::spend_cmd::spend_json(
+        &endpoint(context),
+        keystore,
+        &args,
+    )) {
+        Ok(Ok(result)) => tool_ok(id, result),
+        Ok(Err(e)) | Err(e) => {
+            context.last_rejection = Some(e.clone());
+            tool_error(id, "refused", &e)
+        }
+    }
+}
+
 fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let Some(run_set) = context.run_set.as_ref() else {
         let reason = "No run-set is loaded, so there are no pinned limits to validate against. \

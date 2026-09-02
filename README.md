@@ -9,7 +9,7 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds, 278 Rust tests pass — including reads against live testnet and mainnet
+The workspace builds, 312 Rust tests pass — including reads against live testnet and mainnet
 fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
 [Known gaps](#known-gaps), which names exactly what is missing and why.
 
@@ -69,6 +69,36 @@ rill address      # just the address, so it composes
 rill capabilities # what the loaded run-set permits, in order
 rill describe <package>::<module>::<function>
 ```
+
+## What an agent sees
+
+`rill mcp` speaks MCP over stdio. An agent reads the wallet's limits from the chain that enforces
+them, spends within them, and is refused by the contract when it exceeds them — all in one session:
+
+```jsonc
+// rill_wallet_limits
+{ "rules": ["budget", "per_tx"], "enforcement": "on-chain",
+  "note": "These rules are enforced by a Move contract. Nothing in this process, and nothing you
+           can pass to it, can widen them." }
+
+// rill_spend  0.005 SUI
+{ "submitted": true, "digest": "DpTPdMKbDSndfAqekmX8EUFyDdYePAk338Y9fqgmWhmW",
+  "callSequence": ["…::request_spend", "…::budget::prove", "…::per_tx::prove",
+                   "…::confirm_spend"] }
+
+// rill_spend  0.05 SUI  — over the per-transaction cap
+isError: true
+"per_tx refused it: this spend is larger than the per-transaction cap.
+ The limit is on chain, not in this client — raising it here changes nothing, and neither will
+ retrying with the same amount. Spend less, or have the wallet's owner attach different rules."
+```
+
+The last one is the point. A custodial agent wallet enforces limits in a server, and a server can be
+talked out of an answer. Here the limit is a Move contract: the client that built the transaction
+cannot widen it, the agent that asked cannot widen it, and the refusal arrives from the chain.
+
+The prove list is not a guess either — it is read from the wallet with `policy_rules`, because
+`confirm_spend` counts receipts against the wallet's live policy and a mismatch aborts.
 
 ## Integrating a protocol without an SDK
 

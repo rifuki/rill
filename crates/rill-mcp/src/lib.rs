@@ -151,14 +151,57 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 no_arguments(),
             ),
             read_only(
+                "rill_wallet_limits",
+                "Read an agent wallet's live limits off chain: the rules actually attached, its \
+                 remaining budget, expiry, and whether it has been revoked. These are enforced by \
+                 a Move contract, so this is the authoritative answer rather than a local copy.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": { "type": "string", "description": "The AgentWallet object id." }
+                    },
+                    "required": ["wallet"],
+                    "additionalProperties": false
+                })),
+            ),
+            read_only(
                 "rill_explain_rejection",
                 "Explain the last policy rejection. Reads only; changes no policy.",
                 no_arguments(),
             ),
             destructive(
+                "rill_spend",
+                "Release funds from an agent wallet and send them, gated by the rules the wallet \
+                 carries on chain. THIS SUBMITS A REAL TRANSACTION and cannot be undone. If the \
+                 amount exceeds a rule, the contract refuses it and nothing moves — that is the \
+                 wallet working, not an error to retry. Do not retry a refusal with the same or a \
+                 larger amount, and do not retry a success at all: a second call sends a second \
+                 payment.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": { "type": "string", "description": "The AgentWallet object id." },
+                        "cap": { "type": "string", "description": "The AgentCap this signer holds." },
+                        "amount": {
+                            "type": "string",
+                            "description": "Decimal SUI, as text — never a number. \"0.01\", not 0.01."
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "Recipient address. Defaults to the signer."
+                        }
+                    },
+                    "required": ["wallet", "cap", "amount"],
+                    "additionalProperties": false
+                })),
+            ),
+            destructive(
                 "rill_execute",
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope. \
-                 THIS SUBMITS A REAL TRANSACTION and cannot be undone.",
+                 THIS SUBMITS A REAL TRANSACTION and cannot be undone. Never retry this call for \
+                 the same envelope: a second call submits a second transaction. If it refused, \
+                 read why with rill_explain_rejection and change what it objected to — retrying \
+                 an unchanged envelope produces the same refusal.",
                 object_schema(json!({
                     "type": "object",
                     "properties": { "envelope": { "type": "object" } },
@@ -236,16 +279,62 @@ mod tests {
         }
     }
 
-    /// The separation the annotations exist to express.
+    /// Every tool that submits is marked destructive, and nothing else is.
+    ///
+    /// The list is written out rather than counted. An earlier version asserted there was exactly
+    /// one, which failed the moment a second submitting tool was added correctly — a test that
+    /// makes the right change look like a break trains people to edit the test without reading it.
+    /// Naming them means adding a submitting tool without its annotation still fails, which is the
+    /// thing worth catching: an agent decides whether to ask a human from this flag.
     #[test]
-    fn exactly_one_tool_is_destructive_and_it_is_the_one_that_submits() {
+    fn every_submitting_tool_is_marked_destructive_and_no_other_is() {
+        const SUBMITS: &[&str] = &["rill_spend", "rill_execute"];
+
         let destructive: Vec<String> = [Surface::Actions, Surface::Wallet]
             .into_iter()
             .flat_map(tools)
             .filter(|t| t.annotations.as_ref().unwrap().destructive_hint == Some(true))
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(destructive, vec!["rill_execute".to_string()]);
+        assert_eq!(destructive, SUBMITS);
+
+        // And the inverse: nothing that submits is left unmarked.
+        for tool in [Surface::Actions, Surface::Wallet]
+            .into_iter()
+            .flat_map(tools)
+        {
+            let submits = SUBMITS.contains(&tool.name.as_ref());
+            let marked = tool.annotations.as_ref().unwrap().destructive_hint == Some(true);
+            assert_eq!(
+                submits, marked,
+                "{} submits={submits} but is marked destructive={marked}",
+                tool.name
+            );
+        }
+    }
+
+    /// A tool that moves money must say so in words, not only in a flag an agent may not read.
+    #[test]
+    fn every_destructive_tool_says_it_cannot_be_undone() {
+        for tool in [Surface::Actions, Surface::Wallet]
+            .into_iter()
+            .flat_map(tools)
+        {
+            if tool.annotations.as_ref().unwrap().destructive_hint != Some(true) {
+                continue;
+            }
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("cannot be undone"),
+                "{} submits a real transaction and its description does not say it is irreversible",
+                tool.name
+            );
+            assert!(
+                description.to_lowercase().contains("retry"),
+                "{} must tell an agent what not to retry; a money tool is not idempotent",
+                tool.name
+            );
+        }
     }
 
     /// The keyless surface must offer nothing that can spend.

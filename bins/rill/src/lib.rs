@@ -9,3 +9,4 @@ pub mod runset;
 pub mod spend_cmd;
 pub mod stdio;
 pub mod wallet;
+pub mod wallet_read;

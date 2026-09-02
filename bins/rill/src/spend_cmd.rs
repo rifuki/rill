@@ -36,7 +36,59 @@ pub struct SpendArgs {
     pub dry_run: bool,
 }
 
+/// The printing command. Everything it knows comes from [`spend_json`]; it only renders.
 pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Result<(), String> {
+    let result = spend_json(endpoint, keystore, args).await?;
+    for (label, key) in [
+        ("wallet   ", "wallet"),
+        ("amount   ", "amount"),
+        ("recipient", "recipient"),
+        ("rules    ", "rules"),
+    ] {
+        if let Some(value) = result.get(key) {
+            println!("{label}: {}", render(value));
+        }
+    }
+    if let Some(sequence) = result.get("callSequence").and_then(|s| s.as_array()) {
+        println!("call sequence:");
+        for target in sequence {
+            println!("  {}", render(target));
+        }
+    }
+    println!(
+        "\nsimulation: ok=true gas={}",
+        render(result.get("gasUsed").unwrap_or(&serde_json::Value::Null))
+    );
+    if args.dry_run {
+        println!("\ndry run — nothing signed. Re-run with --submit.");
+        return Ok(());
+    }
+    println!(
+        "\ndigest  : {}",
+        render(result.get("digest").unwrap_or(&serde_json::Value::Null))
+    );
+    println!("success : true");
+    Ok(())
+}
+
+fn render(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(a) => a.iter().map(render).collect::<Vec<_>>().join(", "),
+        other => other.to_string(),
+    }
+}
+
+/// Build, simulate, sign, submit — and return what happened as structured data.
+///
+/// Returns `Err` for a refusal as well as a failure, with the rule named when the contract is what
+/// refused. A caller that renders this for an agent must not present a refusal as an error to
+/// retry: the amount has to change, or nothing will.
+pub async fn spend_json(
+    endpoint: &str,
+    keystore: &Keystore,
+    args: &SpendArgs,
+) -> Result<serde_json::Value, String> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
     let sender = keystore.address();
 
@@ -172,16 +224,20 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
     // The released coin, consumed. See the module note.
     transfer_coin(&mut tx, coin, recipient);
 
-    println!("wallet   : {wallet_id}");
-    println!("amount   : {} SUI ({amount_mist} mist)", args.amount);
-    println!("recipient: {recipient}");
-    println!("rules    : {} (read from chain)", modules.join(", "));
-    println!("call sequence:");
-    println!("  {}::agent_wallet::request_spend", binding.package_id);
-    for module in &modules {
-        println!("  {}::{module}::prove", binding.package_id);
-    }
-    println!("  {}::agent_wallet::confirm_spend", binding.package_id);
+    let call_sequence: Vec<String> = std::iter::once(format!(
+        "{}::agent_wallet::request_spend",
+        binding.package_id
+    ))
+    .chain(
+        modules
+            .iter()
+            .map(|m| format!("{}::{m}::prove", binding.package_id)),
+    )
+    .chain(std::iter::once(format!(
+        "{}::agent_wallet::confirm_spend",
+        binding.package_id
+    )))
+    .collect();
 
     let built = tx.try_build().map_err(|e| format!("compiling: {e}"))?;
     let b64 = {
@@ -194,26 +250,38 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
         .simulate(&b64)
         .await
         .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
-    println!(
-        "\nsimulation: ok={} verification={:?} gas={}",
-        outcome.ok, outcome.verification, outcome.gas_used_mist
-    );
+
     if !outcome.ok {
         let error = outcome.error.unwrap_or_else(|| "no reason given".into());
-        // A rule refusing is the wallet working. Saying so is the difference between a user who
-        // trusts the limits and one who thinks the tool is broken.
+        // A rule refusing is the wallet working. Saying so is the difference between a caller who
+        // trusts the limits and one who thinks the tool is broken — and between an agent that
+        // changes the amount and one that retries the same call forever.
         return Err(match rill_chain::aborts::classify_rule_abort(&error) {
             Some(refusal) => format!(
                 "{refusal}.\n\nThe limit is on chain, not in this client — raising it here \
-                 changes nothing. Attach different rules, or spend less.",
+                 changes nothing, and neither will retrying with the same amount. Spend less, or \
+                 have the wallet's owner attach different rules."
             ),
             None => format!("the chain refused it: {error}"),
         });
     }
 
+    let mut result = serde_json::json!({
+        "wallet": wallet_id.to_string(),
+        "amount": format!("{} SUI ({amount_mist} mist)", args.amount),
+        "recipient": recipient.to_string(),
+        "rules": modules,
+        "rulesSource": "read from chain",
+        "callSequence": call_sequence,
+        "gasUsed": outcome.gas_used_mist,
+        "submitted": false,
+    });
+
     if args.dry_run {
-        println!("\ndry run — nothing signed. Re-run with --submit.");
-        return Ok(());
+        result["note"] = serde_json::Value::String(
+            "Simulated only. Nothing was signed and nothing was submitted.".into(),
+        );
+        return Ok(result);
     }
 
     let signature = keystore.sign(&built).map_err(|e| e.to_string())?;
@@ -222,14 +290,21 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
         .await
         .map_err(|e| format!("submitting: {e}"))?;
 
-    println!("\ndigest  : {}", outcome.digest);
-    println!("success : {}", outcome.success);
     if let Some(error) = &outcome.error {
         return Err(format!("the transaction failed on chain: {error}"));
     }
-    println!("gas used: {}", outcome.gas_used_mist);
-    for delta in &outcome.balance_changes {
-        println!("balance : {} {}", delta.amount, delta.coin_type);
-    }
-    Ok(())
+
+    result["submitted"] = serde_json::Value::Bool(true);
+    result["digest"] = serde_json::Value::String(outcome.digest.clone());
+    result["gasUsed"] = serde_json::json!(outcome.gas_used_mist);
+    result["balanceChanges"] = serde_json::json!(outcome
+        .balance_changes
+        .iter()
+        .map(|d| serde_json::json!({ "amount": d.amount, "coinType": d.coin_type }))
+        .collect::<Vec<_>>());
+    result["note"] = serde_json::Value::String(
+        "Submitted and confirmed. This cannot be undone, and calling again sends a second payment."
+            .into(),
+    );
+    Ok(result)
 }
