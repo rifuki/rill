@@ -78,6 +78,8 @@ pub enum KeystoreError {
     NotConfigured,
     /// The value was present but not a key. The value itself is **never** echoed.
     Malformed,
+    /// A specific address was asked for and the keystore does not hold its key.
+    NoSuchAddress(Address),
 }
 
 impl std::fmt::Display for KeystoreError {
@@ -92,6 +94,11 @@ impl std::fmt::Display for KeystoreError {
             ),
             // The malformed value is not included on purpose: an error message is the most likely
             // place for a secret to end up somewhere it should not be.
+            Self::NoSuchAddress(address) => write!(
+                f,
+                "no key for {address} in ~/{SUI_KEYSTORE_PATH}. Run `sui client addresses` to see \
+                 which ones are there, or `sui client new-address ed25519` to add one."
+            ),
             Self::Malformed => write!(
                 f,
                 "{PRIVATE_KEY_VAR} is set but could not be parsed as a Sui private key. Expected a \
@@ -145,6 +152,52 @@ impl Keystore {
         })
     }
 
+    /// Every address the `sui` keystore holds, without exposing any key.
+    ///
+    /// Derived rather than read from `sui.aliases`, because the aliases file is a label a human
+    /// edits and the address is a fact about the key. A label that has drifted from its key would
+    /// select the wrong signer, and selecting the wrong signer is how funds move from the wrong
+    /// wallet.
+    pub fn addresses_in_sui_keystore(
+        path: &std::path::Path,
+    ) -> Result<Vec<Address>, KeystoreError> {
+        let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
+        let entries: Vec<String> =
+            serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| SimpleKeypair::from_base64(e.trim()).ok())
+            .map(|k| k.verifying_key().derive_address())
+            .collect())
+    }
+
+    /// Select the key for one specific address.
+    ///
+    /// Each entry is decoded and its address derived, then compared. There is no index to trust and
+    /// no name to trust — the address a key produces is the only thing that identifies it, and an
+    /// entry that does not decode is skipped rather than aborting the search, since one unreadable
+    /// key should not hide the others.
+    pub fn for_address(path: &std::path::Path, wanted: Address) -> Result<Self, KeystoreError> {
+        let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
+        let entries: Vec<String> =
+            serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
+
+        for entry in &entries {
+            let Ok(keypair) = SimpleKeypair::from_base64(entry.trim()) else {
+                continue;
+            };
+            let address = keypair.verifying_key().derive_address();
+            if address == wanted {
+                return Ok(Self {
+                    keypair,
+                    address,
+                    source: KeySource::SuiKeystore,
+                });
+            }
+        }
+        Err(KeystoreError::NoSuchAddress(wanted))
+    }
+
     /// The `sui` CLI's keystore in this user's home directory, if there is one.
     pub fn from_default_sui_keystore() -> Result<Self, KeystoreError> {
         let home = std::env::var("HOME").map_err(|_| KeystoreError::NotConfigured)?;
@@ -177,9 +230,25 @@ impl Keystore {
     pub fn load() -> Result<Self, KeystoreError> {
         match Self::from_env() {
             Ok(store) => Ok(store),
-            Err(KeystoreError::Malformed) => Err(KeystoreError::Malformed),
             Err(KeystoreError::NotConfigured) => Self::from_default_sui_keystore(),
+            Err(other) => Err(other),
         }
+    }
+
+    /// Load the key for one address, environment first.
+    ///
+    /// The environment variable wins only when it holds the key that was asked for. Signing as
+    /// whoever the environment happens to name, when a specific address was requested, is how an
+    /// owner-only call ends up signed by the agent — which aborts, and the abort names the wrong
+    /// thing.
+    pub fn load_for(wanted: Address) -> Result<Self, KeystoreError> {
+        if let Ok(store) = Self::from_env() {
+            if store.address() == wanted {
+                return Ok(store);
+            }
+        }
+        let home = std::env::var("HOME").map_err(|_| KeystoreError::NotConfigured)?;
+        Self::for_address(&std::path::Path::new(&home).join(SUI_KEYSTORE_PATH), wanted)
     }
 
     /// The public address this key controls. Safe to log, and the only identity anything else

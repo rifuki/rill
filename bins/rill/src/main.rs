@@ -26,6 +26,26 @@ use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
 const DEFAULT_VERSION_ID: &str =
     "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65";
 
+/// The positional arguments, with `--as <address>` removed.
+///
+/// Written once because every subcommand that reads a position would otherwise be shifted by two
+/// the moment somebody signs as a different key — and the failure is a usage message for a command
+/// that was typed correctly.
+fn positional() -> Vec<String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--as" {
+            i += 2;
+            continue;
+        }
+        out.push(argv[i].clone());
+        i += 1;
+    }
+    out
+}
+
 /// What every subcommand needs, loaded once and reported on rather than exiting silently.
 struct Loaded {
     keystore: Option<Keystore>,
@@ -41,9 +61,31 @@ struct Loaded {
 }
 
 fn load() -> Loaded {
-    let (keystore, keystore_error) = match Keystore::load() {
-        Ok(store) => (Some(store), None),
-        Err(e) => (None, Some(e.to_string())),
+    // `--as <address>` selects which key signs. Owner-only calls and agent-only calls are different
+    // keys by design — `add_rule` asserts the owner, `request_spend` asserts the agent — so a tool
+    // that can only sign as one of them can exercise only half the contract.
+    let argv: Vec<String> = std::env::args().collect();
+    let requested = argv
+        .iter()
+        .position(|a| a == "--as")
+        .and_then(|i| argv.get(i + 1))
+        .map(|a| {
+            a.parse::<sui_sdk_types::Address>()
+                .map_err(|_| format!("--as {a} is not an address"))
+        });
+
+    let (keystore, keystore_error) = match requested {
+        // An address was asked for and does not parse. Falling back to whatever key happens to be
+        // first would sign as somebody the caller did not name.
+        Some(Err(why)) => (None, Some(why)),
+        Some(Ok(address)) => match Keystore::load_for(address) {
+            Ok(store) => (Some(store), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+        None => match Keystore::load() {
+            Ok(store) => (Some(store), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
     };
 
     // Loaded at startup. A run-set paired with the wrong key must fail here, where the operator is
@@ -163,7 +205,9 @@ fn status(loaded: &Loaded) -> i32 {
 }
 
 fn main() {
-    let command = std::env::args().nth(1);
+    // The first argument that is not `--as <address>`. Without this the flag becomes the command,
+    // and `rill --as 0x… status` reports that `--as` is not a command it knows.
+    let command = positional().first().cloned();
     let loaded = load();
 
     // `--status` predates the subcommands and is kept working: a flag that quietly stops being
@@ -222,7 +266,7 @@ fn main() {
         // This is the whole of what a per-protocol SDK would otherwise be consulted for, without
         // waiting for one to exist or trusting it to be current.
         Some("describe") => {
-            let Some(target) = std::env::args().nth(2) else {
+            let Some(target) = positional().get(1).cloned() else {
                 eprintln!("usage: rill describe <package>::<module>::<function>");
                 std::process::exit(1);
             };
@@ -265,7 +309,7 @@ fn main() {
             }
         }
         Some("wallet") => {
-            let action = std::env::args().nth(2).unwrap_or_default();
+            let action = positional().get(1).cloned().unwrap_or_default();
             if action != "create" && action != "rules" {
                 eprintln!(
                     "rill: usage:\n  rill wallet create [--submit] [--amount 0.2]\n  \
@@ -412,7 +456,7 @@ fn main() {
             }
         }
         Some("deepbook") => {
-            let action = std::env::args().nth(2).unwrap_or_default();
+            let action = positional().get(1).cloned().unwrap_or_default();
             if action != "provision" {
                 eprintln!("rill: usage: rill deepbook provision [--agent <addr>] [--submit]");
                 std::process::exit(1);
