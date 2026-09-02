@@ -11,6 +11,17 @@
 
 use crate::Rejection;
 
+/// An address in the one spelling the chain uses.
+///
+/// Anything that does not parse as an address is left exactly as written — this is a comparison
+/// helper, not a validator, and silently rewriting a string it does not understand would hide the
+/// mismatch rather than resolve it.
+fn normalise(id: &str) -> String {
+    id.parse::<sui_sdk_types::Address>()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 /// Compare the transaction's Move call targets against the approved sequence.
 ///
 /// Two failures are reported differently on purpose. An **off-scope** target names a call nobody
@@ -35,9 +46,13 @@ pub fn check_target_sequence(expected: &[String], found: &[String]) -> Result<()
 /// One-directional by design: an approved object the transaction did not use is fine — the run-set
 /// lists what *may* be touched, not what must be. An object that was not approved is not.
 pub fn check_object_scope(approved: &[String], touched: &[String]) -> Result<(), Rejection> {
+    // `0x6` and `0x0000…0006` are the same object and different strings. The chain always writes
+    // the expanded form; a human, a config file and a constant write the short one. Comparing them
+    // raw rejects a transaction for touching an object that was approved under its other spelling.
+    let approved: Vec<String> = approved.iter().map(|o| normalise(o)).collect();
     let unexpected: Vec<String> = touched
         .iter()
-        .filter(|o| !approved.contains(o))
+        .filter(|o| !approved.contains(&normalise(o)))
         .cloned()
         .collect();
     if unexpected.is_empty() {
@@ -212,5 +227,37 @@ mod tests {
     #[test]
     fn the_active_cap_passes() {
         assert!(check_active_cap("0xsame", "0xsame").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod address_form_tests {
+    use super::*;
+
+    /// The clock is written `0x6` in a constant and `0x0000…0006` by the chain.
+    #[test]
+    fn the_same_object_in_two_spellings_is_one_object() {
+        let short = vec!["0x6".to_string()];
+        let expanded =
+            vec!["0x0000000000000000000000000000000000000000000000000000000000000006".to_string()];
+        assert!(check_object_scope(&short, &expanded).is_ok());
+        assert!(check_object_scope(&expanded, &short).is_ok());
+    }
+
+    /// Normalising must not turn two different objects into one.
+    #[test]
+    fn two_different_objects_stay_different() {
+        let approved = vec!["0x6".to_string()];
+        let touched =
+            vec!["0x0000000000000000000000000000000000000000000000000000000000000007".to_string()];
+        assert!(check_object_scope(&approved, &touched).is_err());
+    }
+
+    /// A string that is not an address is compared as written rather than quietly rewritten.
+    #[test]
+    fn something_that_is_not_an_address_is_left_alone() {
+        let approved = vec!["not-an-address".to_string()];
+        assert!(check_object_scope(&approved, &["not-an-address".to_string()]).is_ok());
+        assert!(check_object_scope(&approved, &["other".to_string()]).is_err());
     }
 }

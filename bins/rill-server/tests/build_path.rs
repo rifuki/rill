@@ -210,7 +210,7 @@ async fn what_the_server_builds_is_what_the_signer_accepts() {
     let validated = RawEnvelope::new(*envelope)
         .validate(&policy, NOW)
         .expect("the signer must accept what the server built");
-    let pinned = validated.pin_bytes().expect("byte pin");
+    let pinned = validated.pin_bytes(&policy).expect("byte pin");
     pinned
         .simulate(&chain, &policy)
         .await

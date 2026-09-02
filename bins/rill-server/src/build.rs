@@ -260,10 +260,22 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
         }),
         steps: Vec::new(),
         allowed_targets,
+        // Every object the transaction actually references, because the signer compares this
+        // against what it decodes from the bytes and refuses anything it did not expect. Listing
+        // only the interesting three left the version object, the clock and all three capabilities
+        // out — so a signer that reads the bytes rejects every transaction the server builds. That
+        // went unnoticed for as long as nothing read them.
         required_object_ids: vec![
             request.wallet_id.to_string(),
+            request.version_id.to_string(),
+            request.agent_cap_id.clone(),
             request.balance_manager_id.to_string(),
+            request.trade_cap_id.clone(),
+            request.deposit_cap_id.clone(),
             request.pool.pool_id.to_string(),
+            // Sui's shared Clock. An input like any other, and its absence from this list is not
+            // more benign for being a framework object.
+            rill_ptb::spend::CLOCK_ID.to_string(),
         ],
         required_guards: Vec::new(),
         unsigned_ptb,

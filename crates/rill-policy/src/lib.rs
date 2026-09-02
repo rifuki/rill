@@ -38,6 +38,7 @@ use rill_core::envelope::{
     digest_unsigned_ptb, EnvelopeError, ExecutionEnvelope, Network, Verification,
 };
 
+pub mod decode;
 pub mod inspect;
 
 /// The longest an envelope may be signable for. An envelope is minted, carried to the signer, and
@@ -77,6 +78,15 @@ pub struct LocalPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
     Shape(EnvelopeError),
+    /// The bytes that would be signed are not a transaction this signer can read.
+    ///
+    /// Refused rather than treated as a transaction with no commands: an empty command list
+    /// compares equal to an empty expectation, so a decode failure that returned one would pass
+    /// every structural check by having nothing to check.
+    UndecodableTransaction(String),
+    /// A command kind a spend has no business containing — a `Publish`, an `Upgrade`, or something
+    /// this build does not recognise at all.
+    UnexpectedCommand(String),
     Expired {
         expires_at: String,
     },
@@ -159,6 +169,16 @@ impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Shape(e) => write!(f, "{e}"),
+            Self::UndecodableTransaction(why) => write!(
+                f,
+                "the bytes that would be signed do not decode as a transaction ({why}), so nothing \
+                 about them can be checked. Refusing rather than signing something unreadable."
+            ),
+            Self::UnexpectedCommand(kind) => write!(
+                f,
+                "this transaction contains a {kind} command, which a spend has no reason to carry. \
+                 Refusing rather than executing a shape nobody approved."
+            ),
             Self::Expired { expires_at } => write!(f, "this envelope expired at {expires_at}"),
             Self::UnparseableExpiry(v) => write!(f, "\"{v}\" is not a usable expiry timestamp"),
             Self::TtlTooLong { ttl_ms } => write!(
@@ -269,6 +289,15 @@ pub struct BytePinned {
     envelope: ExecutionEnvelope,
     spend_base_units: u64,
     pinned_digest: String,
+    /// What the bytes actually say, read once and carried rather than re-decoded.
+    decoded: crate::decode::Decoded,
+}
+
+impl BytePinned {
+    /// The commands this transaction really contains, in order.
+    pub fn decoded(&self) -> &crate::decode::Decoded {
+        &self.decoded
+    }
 }
 
 /// Re-simulated successfully against live chain state. **This is the only type that can be
@@ -414,7 +443,12 @@ impl Validated {
     /// This is deliberately a second computation rather than a reuse of the first. The window
     /// between "we validated this" and "we signed this" is exactly where a substitution would go,
     /// and a check that trusts its own earlier result does not close it.
-    pub fn pin_bytes(self) -> Result<BytePinned, Rejection> {
+    /// Pin the bytes, then read them.
+    ///
+    /// Takes the policy because this is where the transaction's own commands are compared against
+    /// the approved sequence — the check `inspect` exists for, and the one thing no amount of
+    /// envelope validation can substitute for.
+    pub fn pin_bytes(self, policy: &LocalPolicy) -> Result<BytePinned, Rejection> {
         let recomputed = digest_unsigned_ptb(&self.envelope.unsigned_ptb);
         if recomputed != self.envelope.action_digest {
             return Err(Rejection::BytesChangedAfterApproval {
@@ -422,10 +456,19 @@ impl Validated {
                 now: recomputed,
             });
         }
+        // Read the bytes themselves, not what the envelope says about them. Everything checked up
+        // to here came from the server's own description of the transaction, which is exactly the
+        // thing a compromised server would misreport.
+        let decoded = crate::decode::decode(&self.envelope.unsigned_ptb)?;
+        crate::decode::check_command_kinds(&decoded)?;
+        crate::inspect::check_target_sequence(&policy.allowed_targets, &decoded.targets)?;
+        crate::inspect::check_object_scope(&policy.required_object_ids, &decoded.object_inputs)?;
+
         Ok(BytePinned {
             pinned_digest: recomputed,
             envelope: self.envelope,
             spend_base_units: self.spend_base_units,
+            decoded,
         })
     }
 }

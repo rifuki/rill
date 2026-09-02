@@ -14,7 +14,7 @@ use rill_policy::{LocalPolicy, RawEnvelope, Rejection, MAX_TTL_MS};
 use serde_json::{json, Value};
 
 const NOW: u64 = 1_756_600_000_000;
-const SENDER: &str = "0xagent";
+const SENDER: &str = WALLET;
 
 fn expiry_at(ms: u64) -> String {
     // 2026-08-31T00:26:40.000Z is NOW; build a valid RFC 3339 from the same arithmetic the
@@ -45,10 +45,46 @@ fn civil(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-const PTB: &str = "AAA=";
+const PKG: &str = "0x000000000000000000000000000000000000000000000000000000000000cafe";
+const CAP: &str = "0x0000000000000000000000000000000000000000000000000000000000000002";
+const WALLET: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+/// A real transaction, not a placeholder.
+///
+/// This was `"AAA="` — three zero bytes. The whole chain passed on it, because nothing decoded the
+/// bytes; `pin_bytes` does now, and a state machine tested against something that is not a
+/// transaction was not testing the state machine.
+fn ptb() -> String {
+    use sui_sdk_types::{Address, Digest, Identifier};
+    use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
+
+    let mut tx = TransactionBuilder::new();
+    tx.set_sender(WALLET.parse::<Address>().unwrap());
+    tx.set_gas_budget(50_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(
+        "0x000000000000000000000000000000000000000000000000000000000000000a"
+            .parse()
+            .unwrap(),
+        1,
+        Digest::ZERO,
+    )]);
+    let wallet = tx.object(ObjectInput::shared(WALLET.parse().unwrap(), 400_001, true));
+    tx.move_call(
+        Function::new(
+            PKG.parse().unwrap(),
+            Identifier::new("agent_wallet").unwrap(),
+            Identifier::new("request_spend").unwrap(),
+        ),
+        vec![wallet],
+    );
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(bcs::to_bytes(&tx.try_build().unwrap()).unwrap())
+}
 
 fn digest_of_ptb() -> String {
-    rill_core::envelope::digest_unsigned_ptb(PTB)
+    rill_core::envelope::digest_unsigned_ptb(&ptb())
 }
 
 fn envelope_json() -> Value {
@@ -58,9 +94,9 @@ fn envelope_json() -> Value {
         "actionDigest": digest_of_ptb(),
         "network": "testnet",
         "sender": SENDER,
-        "walletPackageId": "0xpkg",
-        "walletId": "0xwallet",
-        "agentCapId": "0xcap",
+        "walletPackageId": PKG,
+        "walletId": WALLET,
+        "agentCapId": CAP,
         "balanceManagerId": "0xbm",
         "tradeCapId": "0xtc",
         "resolvedParams": {
@@ -74,10 +110,10 @@ fn envelope_json() -> Value {
             "isBid": true,
             "payWithDeep": false
         },
-        "allowedTargets": ["0xpkg::agent_wallet::request_spend"],
-        "requiredObjectIds": ["0xwallet"],
+        "allowedTargets": [format!("{PKG}::agent_wallet::request_spend")],
+        "requiredObjectIds": [WALLET],
         "requiredGuards": [],
-        "unsignedPtb": PTB,
+        "unsignedPtb": ptb(),
         "preview": "place a limit order",
         "simulation": {
             "ok": true,
@@ -99,11 +135,11 @@ fn policy() -> LocalPolicy {
         network: Network::Testnet,
         sender: SENDER.into(),
         action_id: "skill_hero".into(),
-        wallet_package_id: "0xpkg".into(),
-        wallet_id: "0xwallet".into(),
-        agent_cap_id: "0xcap".into(),
-        allowed_targets: vec!["0xpkg::agent_wallet::request_spend".into()],
-        required_object_ids: vec!["0xwallet".into()],
+        wallet_package_id: PKG.into(),
+        wallet_id: WALLET.into(),
+        agent_cap_id: CAP.into(),
+        allowed_targets: vec![format!("{PKG}::agent_wallet::request_spend")],
+        required_object_ids: vec![WALLET.into()],
         max_amount_base_units: 2_000_000_000,
         declared_spend_base_units: 2_000_000_000,
         minimum_remaining_base_units: 0,
@@ -117,12 +153,12 @@ async fn a_good_envelope_walks_the_whole_chain() {
     let simulated = RawEnvelope::new(parse(envelope_json()))
         .validate(&policy(), NOW)
         .expect("validate")
-        .pin_bytes()
+        .pin_bytes(&policy())
         .expect("pin")
         .simulate(&chain, &policy())
         .await
         .expect("simulate");
-    assert_eq!(simulated.signable_bytes(), PTB);
+    assert_eq!(simulated.signable_bytes(), ptb());
     assert_eq!(simulated.spend_base_units(), 1_000_000_000);
 }
 
@@ -249,7 +285,7 @@ fn bytes_swapped_after_validation_are_caught_by_the_pin() {
         .expect("validate");
     // The pin recomputes from the envelope's own bytes rather than trusting the earlier result,
     // so a consistent envelope passes...
-    assert!(validated.pin_bytes().is_ok());
+    assert!(validated.pin_bytes(&policy()).is_ok());
 
     // ...while one whose bytes no longer match its digest does not. Constructed directly, because
     // reaching this state through the API is exactly what the design prevents.
@@ -270,7 +306,7 @@ async fn a_re_simulation_that_fails_stops_the_chain() {
     let pinned = RawEnvelope::new(parse(envelope_json()))
         .validate(&policy(), NOW)
         .unwrap()
-        .pin_bytes()
+        .pin_bytes(&policy())
         .unwrap();
     assert!(matches!(
         pinned.simulate(&chain, &policy()).await,
@@ -286,7 +322,7 @@ async fn an_unreachable_node_stops_the_chain_rather_than_waving_it_through() {
     let pinned = RawEnvelope::new(parse(envelope_json()))
         .validate(&policy(), NOW)
         .unwrap()
-        .pin_bytes()
+        .pin_bytes(&policy())
         .unwrap();
     assert!(matches!(
         pinned.simulate(&chain, &policy()).await,
@@ -302,7 +338,7 @@ async fn a_re_simulation_that_burns_more_gas_than_the_ceiling_is_refused() {
     let pinned = RawEnvelope::new(parse(envelope_json()))
         .validate(&policy(), NOW)
         .unwrap()
-        .pin_bytes()
+        .pin_bytes(&policy())
         .unwrap();
     assert!(matches!(
         pinned.simulate(&chain, &policy()).await,

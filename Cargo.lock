@@ -1302,11 +1302,14 @@ dependencies = [
 name = "rill-policy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bcs",
  "rill-chain",
  "rill-core",
  "rill-ptb",
  "serde_json",
  "sui-sdk-types",
+ "sui-transaction-builder",
  "thiserror 2.0.20",
  "tokio",
 ]

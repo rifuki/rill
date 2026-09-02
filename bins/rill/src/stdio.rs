@@ -372,7 +372,7 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
             return tool_error(id, "policy_rejection", &reason);
         }
     };
-    let pinned = match validated.pin_bytes() {
+    let pinned = match validated.pin_bytes(&policy) {
         Ok(p) => p,
         Err(rejection) => {
             let reason = rejection.to_string();
@@ -577,18 +577,18 @@ mod execution_tests {
         serde_json::from_value(serde_json::json!({
             "label": "hero-testnet",
             "network": "testnet",
-            "sender": "0xagent",
+            "sender": WALLET,
             "actionId": "skill_hero",
-            "walletPackageId": "0xpkg",
-            "walletId": "0xwallet",
+            "walletPackageId": PKG,
+            "walletId": WALLET,
             "agentCapId": "0xcap",
             "versionId": "0xversion",
             "capabilityManifest": {
                 "walletCoinType": "0x2::sui::SUI",
                 "rules": [{ "kind": "budget", "totalMist": "5000000000" }]
             },
-            "allowedTargets": ["0xpkg::agent_wallet::request_spend"],
-            "allowedObjectIds": ["0xwallet"],
+            "allowedTargets": [format!("{PKG}::agent_wallet::request_spend")],
+            "allowedObjectIds": [WALLET],
             "maxAmountBaseUnits": "2000000000",
             "declaredSpendBaseUnits": "2000000000",
             "minimumRemainingBaseUnits": "0",
@@ -608,17 +608,54 @@ mod execution_tests {
         .with_run_set(Some(run_set()))
     }
 
-    const PTB: &str = "AAA=";
+    /// The package and wallet the fixture's transaction really calls.
+    const PKG: &str = "0x000000000000000000000000000000000000000000000000000000000000cafe";
+    const WALLET: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+    /// A real transaction, built the way the server builds one.
+    ///
+    /// This used to be `"AAA="` — three zero bytes, which is not a transaction. Every local check
+    /// passed on it, because nothing read the bytes. Once `pin_bytes` started decoding them, the
+    /// fixture failed, which is the whole point: the signer's own tests were exercising a signer
+    /// that never looked at what it was about to sign.
+    fn real_ptb() -> String {
+        use sui_sdk_types::{Address, Digest, Identifier};
+        use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
+
+        let mut tx = TransactionBuilder::new();
+        tx.set_sender(WALLET.parse::<Address>().unwrap());
+        tx.set_gas_budget(50_000_000);
+        tx.set_gas_price(1_000);
+        tx.add_gas_objects([ObjectInput::owned(
+            "0x000000000000000000000000000000000000000000000000000000000000000a"
+                .parse()
+                .unwrap(),
+            1,
+            Digest::ZERO,
+        )]);
+        let wallet = tx.object(ObjectInput::shared(WALLET.parse().unwrap(), 400_001, true));
+        tx.move_call(
+            Function::new(
+                PKG.parse().unwrap(),
+                Identifier::new("agent_wallet").unwrap(),
+                Identifier::new("request_spend").unwrap(),
+            ),
+            vec![wallet],
+        );
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&tx.try_build().unwrap()).unwrap())
+    }
 
     fn envelope(overrides: serde_json::Value) -> Value {
         let mut base = json!({
             "version": "1",
             "actionId": "skill_hero",
-            "actionDigest": rill_core::envelope::digest_unsigned_ptb(PTB),
+            "actionDigest": rill_core::envelope::digest_unsigned_ptb(&real_ptb()),
             "network": "testnet",
-            "sender": "0xagent",
-            "walletPackageId": "0xpkg",
-            "walletId": "0xwallet",
+            "sender": WALLET,
+            "walletPackageId": PKG,
+            "walletId": WALLET,
             "agentCapId": "0xcap",
             "balanceManagerId": "0xbm",
             "tradeCapId": "0xtc",
@@ -627,10 +664,10 @@ mod execution_tests {
                 "spendAmountMist": "1000000000", "price": "2.5", "quantity": "1",
                 "depositSui": "1", "isBid": true, "payWithDeep": false
             },
-            "allowedTargets": ["0xpkg::agent_wallet::request_spend"],
+            "allowedTargets": [format!("{PKG}::agent_wallet::request_spend")],
             "requiredObjectIds": ["0xwallet"],
             "requiredGuards": [],
-            "unsignedPtb": PTB,
+            "unsignedPtb": real_ptb(),
             "preview": "place a limit order",
             "simulation": {
                 "ok": true, "verification": "verified", "gasEstimate": "2000000",
