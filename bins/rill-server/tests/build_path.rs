@@ -147,7 +147,7 @@ async fn a_failing_simulation_refuses_and_says_why() {
 async fn an_inconclusive_simulation_refuses() {
     let error = format!(
         "MoveAbort in {}::config: checked_package_version",
-        rill_chain::CETUS_PACKAGE_IDS[0]
+        rill_chain::CETUS_PACKAGE_IDS[0].1
     );
     let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Fails { error });
     let BuildOutcome::Refused { code, .. } = build(&request(), &chain, NOW).await else {

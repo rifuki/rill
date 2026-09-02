@@ -182,12 +182,31 @@ pub trait SuiWrite {
 // ── simulation classification ─────────────────────────────────────────────────────────────────
 
 /// Cetus package ids whose `checked_package_version` abort is a known simulation artefact rather
-/// than a real failure. Curated, because matching the abort text alone would let any package that
-/// happens to use the same assertion name be waved through.
-pub const CETUS_PACKAGE_IDS: &[&str] = &[
-    "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb",
-    "0x0868b71c0cba55bf0faf6c40df8c179c67a4d0ba0e79965b68b3d72d7dfbf666",
-    "0x70968826ad1b4ba895753f634b0aea68d0672908ca1075a2abdf0fc9e0b2fc6a",
+/// than a real failure.
+///
+/// Curated, because matching the abort text alone would let any package that happens to use the
+/// same assertion name be waved through — and this is the one hole in the simulation gate, so
+/// widening it by accident is the expensive mistake.
+///
+/// The list mixes networks deliberately: an error string is matched by substring, and which network
+/// a package lives on has no bearing on whether its id appears in one. Marked here so the mix is
+/// not later "tidied" into a single-network list that then fails to match half the aborts.
+///
+/// Every entry is checked against the chain by `tests/cetus_ids.rs` — a curated list nobody
+/// verifies is folklore, and this one guards a gate.
+pub const CETUS_PACKAGE_IDS: &[(&str, &str)] = &[
+    (
+        "mainnet",
+        "0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb",
+    ),
+    (
+        "testnet",
+        "0x0868b71c0cba55bf0faf6c40df8c179c67a4d0ba0e79965b68b3d72d7dfbf666",
+    ),
+    (
+        "mainnet",
+        "0x70968826ad1b4ba895753f634b0aea68d0672908ca1075a2abdf0fc9e0b2fc6a",
+    ),
 ];
 
 /// Decide whether a failed simulation tells us anything about execution.
@@ -198,7 +217,9 @@ pub const CETUS_PACKAGE_IDS: &[&str] = &[
 /// an unrelated package's abort as "inconclusive" would quietly widen the one hole in the gate.
 pub fn classify_failure(error: &str) -> Verification {
     let mentions_assertion = error.contains("checked_package_version");
-    let mentions_cetus = CETUS_PACKAGE_IDS.iter().any(|id| error.contains(id));
+    let mentions_cetus = CETUS_PACKAGE_IDS
+        .iter()
+        .any(|(_network, id)| error.contains(id));
     if mentions_assertion && mentions_cetus {
         Verification::Unverified
     } else {
@@ -223,7 +244,7 @@ mod tests {
     fn the_cetus_version_abort_is_inconclusive() {
         let err = format!(
             "MoveAbort in {}::config: checked_package_version",
-            CETUS_PACKAGE_IDS[0]
+            CETUS_PACKAGE_IDS[0].1
         );
         assert_eq!(classify_failure(&err), Verification::Unverified);
     }
@@ -241,7 +262,7 @@ mod tests {
     fn a_cetus_package_id_alone_is_not_enough() {
         let err = format!(
             "MoveAbort in {}::pool: EInsufficientLiquidity",
-            CETUS_PACKAGE_IDS[1]
+            CETUS_PACKAGE_IDS[1].1
         );
         assert_eq!(
             classify_failure(&err),

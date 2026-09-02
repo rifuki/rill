@@ -84,7 +84,7 @@ async fn a_genuine_abort_is_a_verified_failure() {
 async fn the_cetus_version_abort_comes_back_unverified() {
     let error = format!(
         "MoveAbort in {}::config: checked_package_version",
-        rill_chain::CETUS_PACKAGE_IDS[0]
+        rill_chain::CETUS_PACKAGE_IDS[0].1
     );
     let chain = FakeSui::new().with_simulation(SimulationBehavior::Fails { error });
     let outcome = chain.simulate("AAA=").await.unwrap();
