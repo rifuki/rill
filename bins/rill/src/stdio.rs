@@ -157,9 +157,10 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
 /// and every refusal names which check failed rather than saying "policy violation" — an operator
 /// reading the latter learns nothing about what to fix.
 ///
-/// Submission is not wired: the validation chain ends at [`rill_policy::Simulated`], which is the
-/// only type that can be signed, and going further needs a live fullnode this function does not
-/// have. What is proven here is that a bad envelope never reaches that type.
+/// The chain runs to the end: validate, pin the bytes and read them, re-simulate against a live
+/// fullnode, sign, submit. Only [`rill_policy::Simulated`] can be signed, and only a re-simulation
+/// this signer ran itself produces one — the build-time simulation belongs to the server, which is
+/// the party this whole path exists to not trust.
 /// A single-threaded runtime, built per call.
 ///
 /// The transport is synchronous by design — it reads lines and writes lines — and the chain client
@@ -381,18 +382,85 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         }
     };
 
+    let digest = pinned.pinned_digest().to_string();
+    let targets = pinned.decoded().targets.clone();
+
+    // The client is built inside the runtime: its transport registers with the reactor, and
+    // constructing it outside panics rather than returning an error.
+    let endpoint = endpoint(context);
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+
+    // Our own simulation, against live state. The server's proves only that the server thought so.
+    let simulated = match block_on(async {
+        let chain = rill_chain::grpc::GrpcSui::new(&endpoint).map_err(|e| e.to_string())?;
+        let simulated = pinned
+            .simulate(&chain, &policy)
+            .await
+            .map_err(|r| r.to_string())?;
+        Ok::<_, String>((chain, simulated))
+    }) {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(reason)) | Err(reason) => {
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, "chain_unavailable", &reason);
+        }
+    };
+    let (chain, simulated) = simulated;
+    let transaction = match decode_for_signing(simulated.signable_bytes()) {
+        Ok(t) => t,
+        Err(reason) => {
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, "malformed_envelope", &reason);
+        }
+    };
+    let signature = match keystore.sign(&transaction) {
+        Ok(s) => s,
+        Err(e) => return tool_error(id, "signing_failed", &e.to_string()),
+    };
+
+    let outcome = match block_on(rill_chain::SuiWrite::execute(
+        &chain,
+        simulated.signable_bytes(),
+        &[signature.to_base64()],
+    )) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => return tool_error(id, "submit_failed", &e.to_string()),
+        Err(e) => return tool_error(id, "submit_failed", &e),
+    };
+
+    if let Some(error) = &outcome.error {
+        context.last_rejection = Some(error.clone());
+        return tool_error(id, "execution_failed", error);
+    }
+
     tool_ok(
         id,
         json!({
-            "validated": true,
-            "digest": pinned.pinned_digest(),
-            "spendBaseUnits": pinned.envelope().resolved_params.as_ref()
-                .map(|p| p.spend_amount_mist.clone()),
-            "note": "The envelope passed every local check and is byte-pinned. Submission is not \
-                     wired on this build: the next step re-simulates against a live fullnode, and \
-                     only the type produced by that step can be signed."
+            "submitted": true,
+            "digest": outcome.digest,
+            "pinnedDigest": digest,
+            "callSequence": targets,
+            "gasUsed": outcome.gas_used_mist,
+            "spendBaseUnits": simulated.spend_base_units().to_string(),
+            "note": "Submitted and confirmed. This cannot be undone, and calling again with the \
+                     same envelope submits a second transaction."
         }),
     )
+}
+
+/// Turn the signable bytes back into a transaction.
+///
+/// `sign` takes a [`Transaction`] rather than bytes on purpose — signing arbitrary bytes is how a
+/// "sign this message" flow becomes a transaction signature. So the bytes are decoded here, and a
+/// failure to decode is a refusal rather than something to sign anyway.
+fn decode_for_signing(base64_bytes: &str) -> Result<sui_sdk_types::Transaction, String> {
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(base64_bytes.trim())
+        .map_err(|_| "the signable bytes are not base64".to_string())?;
+    bcs::from_bytes(&raw).map_err(|e| format!("the signable bytes are not a transaction: {e}"))
 }
 
 /// Read messages from `input`, write replies to `output`.
@@ -719,13 +787,24 @@ mod execution_tests {
         handle(ctx, &message).expect("a request gets a reply")
     }
 
+    /// A good envelope reaches the chain step, which is as far as a test without a node can see.
+    ///
+    /// The assertion is on WHICH step failed, not that nothing did. Every local check — freshness,
+    /// network, identity, ceilings, the byte pin, the decoded target sequence and object scope —
+    /// happens before a node is contacted, so a failure code of `chain_unavailable` proves all of
+    /// them passed. A test that only asserted `isError == true` would pass just as happily if the
+    /// envelope had been rejected on its first field.
     #[test]
-    fn a_good_envelope_passes_every_local_check_and_is_byte_pinned() {
+    fn a_good_envelope_passes_every_local_check_and_reaches_the_chain() {
         let mut ctx = context_with_run_set();
         let out = execute_with(&mut ctx, envelope(json!({})));
-        assert_eq!(out["result"]["isError"], false, "{out}");
-        assert_eq!(out["result"]["structuredContent"]["validated"], true);
-        assert!(out["result"]["structuredContent"]["digest"].is_string());
+        let code = out["result"]["structuredContent"]["code"]
+            .as_str()
+            .unwrap_or("(none)");
+        assert_eq!(
+            code, "chain_unavailable",
+            "a good envelope must get past every local check; it stopped at {code}: {out}"
+        );
     }
 
     #[test]
