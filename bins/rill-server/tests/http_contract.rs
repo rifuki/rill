@@ -730,3 +730,102 @@ async fn the_build_tool_tells_an_agent_that_amounts_are_strings() {
         "an agent reads this to know not to send a number: {params}"
     );
 }
+
+/// POST a JSON body and return the status.
+async fn post_status(path: &str, body: Value) -> StatusCode {
+    app()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Discovery names four endpoints. They have to exist.
+///
+/// They did not: `/.well-known/oauth-authorization-server` advertised `/oauth/register`,
+/// `/oauth/authorize`, `/oauth/token` and `/oauth/revoke`, and every one returned 404. An MCP
+/// client that respects discovery could not connect, and the failure read as a broken server
+/// rather than a missing one.
+#[tokio::test]
+async fn every_endpoint_the_discovery_document_names_exists() {
+    let (_, discovery, _) = get("/.well-known/oauth-authorization-server").await;
+
+    for field in [
+        "registration_endpoint",
+        "authorization_endpoint",
+        "token_endpoint",
+        "revocation_endpoint",
+    ] {
+        let url = discovery[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} is advertised: {discovery}"));
+        let path = url
+            .split_once("//")
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .map(|(_, p)| format!("/{p}"))
+            .unwrap_or_else(|| url.to_string());
+
+        // The method is part of existing: an endpoint that 405s is as unreachable as one that 404s.
+        let status = if field == "authorization_endpoint" {
+            get(&path).await.0
+        } else {
+            post_status(&path, serde_json::json!({})).await
+        };
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{field} advertises {path}, which does not exist"
+        );
+        assert_ne!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{field} advertises {path}, which does not accept that method"
+        );
+    }
+}
+
+/// A redirect URI this server would not send a code to is refused before anything is stored.
+#[tokio::test]
+async fn an_open_redirect_is_refused_at_registration() {
+    let status = post_status(
+        "/oauth/register",
+        serde_json::json!({ "redirect_uris": ["http://evil.example.com/steal"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Registration with no redirect URI at all is refused rather than defaulted.
+#[tokio::test]
+async fn registration_without_a_redirect_uri_is_refused() {
+    let status = post_status(
+        "/oauth/register",
+        serde_json::json!({ "redirect_uris": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A grant type this server does not issue is named rather than silently ignored.
+#[tokio::test]
+async fn an_unsupported_grant_type_is_refused_by_name() {
+    let status = post_status(
+        "/oauth/token",
+        serde_json::json!({ "grant_type": "client_credentials" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// RFC 7009: revocation answers 200 whether or not the token was real, so the endpoint cannot be
+/// used to learn which tokens exist.
+#[tokio::test]
+async fn revoking_a_token_that_never_existed_still_answers_ok() {
+    let status = post_status("/oauth/revoke", serde_json::json!({ "token": "nonsense" })).await;
+    assert_eq!(status, StatusCode::OK);
+}

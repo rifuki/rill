@@ -36,7 +36,6 @@ pub struct Config {
     pub public_base_url: String,
     /// Read once `rill-chain` is wired into the build endpoints. Resolved at boot rather than at
     /// first use so a misconfigured endpoint is visible in `/health` before anyone calls it.
-    #[allow(dead_code)]
     pub sui_rpc_url: String,
     /// Empty only on a misconfigured mainnet — see [`Config::boot_check`].
     pub oauth_secret: String,
@@ -138,7 +137,6 @@ pub struct AppState {
     pub skills: Arc<FileSkillStore>,
     /// Loaded at boot — a corrupt file must surface at startup, not on the first sign-in. Read
     /// once the OAuth endpoints are wired.
-    #[allow(dead_code)]
     pub oauth: Arc<FileOAuthStore>,
     /// The only thing here that talks to Sui. Reads and simulates; it cannot sign, because nothing
     /// in this process holds a key.

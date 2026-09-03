@@ -44,7 +44,6 @@ pub fn api_err_typed(
 /// A successful `/oauth/*` response.
 ///
 /// Unused until the consent endpoints land; see the note on `api_err_typed`.
-#[allow(dead_code)]
 pub fn oauth_ok<T: Serialize>(data: T) -> Response {
     Json(json!({ "success": true, "data": data })).into_response()
 }

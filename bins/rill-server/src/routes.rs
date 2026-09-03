@@ -17,7 +17,7 @@ use rill_store::SkillStore;
 use serde_json::json;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::envelope::{api_err, api_ok, bare, oauth_err};
+use crate::envelope::{api_err, api_ok, bare};
 use crate::state::AppState;
 
 /// The frontend hard-caps its own requests, and this caps the other direction. 512 KB is far more
@@ -71,6 +71,12 @@ pub fn router(state: AppState) -> Router {
         // gets 405, which its SDK understands. Both answers come before any auth check, because
         // making discovery require a token is how a connector becomes unaddable.
         .route("/mcp", get(mcp_get).post(mcp_post))
+        // The four addresses the discovery document has always named. Until now none of them
+        // existed, so a client that respected discovery — the point of discovery — got a 404.
+        .route("/oauth/register", post(crate::oauth_routes::register))
+        .route("/oauth/authorize", get(crate::oauth_routes::authorize))
+        .route("/oauth/token", post(crate::oauth_routes::token))
+        .route("/oauth/revoke", post(crate::oauth_routes::revoke))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{id}", get(get_skill))
         .route("/api/protocols", get(protocols))
@@ -206,15 +212,5 @@ async fn introspect(_body: axum::body::Bytes) -> Response {
         StatusCode::NOT_IMPLEMENTED,
         "Introspection is unavailable: the gRPC client cannot read Move bytecode or ABIs. Use the \
          curated semantic manifests instead.",
-    )
-}
-
-/// Kept for the OAuth error shape, which differs from the `/api/*` one on purpose.
-#[allow(dead_code)]
-fn oauth_not_implemented() -> Response {
-    oauth_err(
-        StatusCode::NOT_IMPLEMENTED,
-        "temporarily_unavailable",
-        "not yet wired",
     )
 }
