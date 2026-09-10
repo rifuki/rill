@@ -784,6 +784,7 @@ decides, and what it costs. Nothing here has spent real money.
   **Resolved 2026-09-10 (U5): `rifuki/rill`.** It is this repository's only remote, so a tag pushed here can only produce assets here; `naisu-one/rill` and `eseslabs/rill` are the TypeScript specification, which is not edited.
 - **Is `api.rill.naisu.one` recovered or replaced?** U7 must close it and record the answer here.
 - **Does the ported generator become authoritative over the TypeScript one?** U13 must answer it.
+  **Resolved 2026-09-11 (U13): yes, authoritative, and the drift guard is a pinned section structure.** `bins/rill-server/src/agent_docs.rs` is what the server serves and the only generator that can reach `PUBLIC_BASE_URL`, `RuleKind::enforcement` and the resolved release origin; the TypeScript pair stays the specification for *structure* only, pinned per section in `fixtures/reference-doc-sections.json` as ported, corrected, or omitted with a reason, and checked by `bins/rill-server/tests/generated_docs.rs`, whose `#[ignore]`d conformance test re-reads both reference sources when `RILL_REFERENCE_DIR` is set and fails when their headings change.
 - **Is the slippage floor's pre-flight status acceptable as a shipped guarantee,** or does the
   injected `rill_guard` call need a Move rule requiring its presence before the product says the
   chain holds it? KTD-7 states the honest position; this asks whether to change the design.

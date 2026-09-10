@@ -9,10 +9,13 @@
 ///
 /// Declared once because it is a contract in four places, and a rename that reaches three of
 /// them produces a release whose smoke step fails, or worse, one whose binary answers to a name
-/// nobody downloaded. The cargo target is also built as `rill` for this repository's own use; a
-/// stranger downloads `rill-wallet-<platform>`, and the first thing they run should answer with
-/// the name they downloaded.
-pub const BINARY_NAME: &str = "rill-wallet";
+/// nobody downloaded. A stranger downloads `rill-wallet-<platform>`, and the first thing they run
+/// should answer with the name they downloaded.
+///
+/// The value itself now lives in `rill_core::release`, beside the asset filenames that are builds
+/// of it and the origin that publishes them, because the server generates install instructions and
+/// cannot link this crate: the signer's library is exactly what a keyless builder must not hold.
+pub const BINARY_NAME: &str = rill_core::release::WALLET_BINARY;
 
 pub mod keystore;
 pub mod manager_cmd;

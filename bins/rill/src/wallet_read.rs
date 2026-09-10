@@ -162,16 +162,10 @@ fn labelled(kind: RuleKind) -> Value {
     json!({
         "module": kind.module(),
         "enforcement": enforcement.as_str(),
-        "enforcedBy": enforced_by(enforcement),
+        // The sentence comes from the producer too. The generated instructions print the same one,
+        // and a read that worded it here would be the second place the same claim is made.
+        "enforcedBy": enforcement.enforced_by(),
     })
-}
-
-/// Who refuses, in words an agent can act on. Exhaustive, so a third layer cannot arrive unnamed.
-fn enforced_by(enforcement: Enforcement) -> &'static str {
-    match enforcement {
-        Enforcement::OnChain => "the Move contract, which aborts the transaction",
-        Enforcement::PreFlight => "the signer, before it signs",
-    }
 }
 
 /// Which layer holds what, stated once, in the read every agent makes before it spends.

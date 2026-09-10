@@ -153,27 +153,43 @@ impl RuleKind {
     ///
     /// Not a match over strings. That would need a wildcard arm for unknown names, and a wildcard
     /// arm is where a kind added later would quietly fall. Instead every kind is asked for its own
-    /// name in turn, so the two spellings cannot disagree, and the match that steps from one kind
-    /// to the next is over kinds and has no wildcard: a kind added to the enum without an arm here
-    /// fails to compile rather than becoming a name this lookup does not know.
+    /// name in turn, so the two spellings cannot disagree, and the walk over kinds is
+    /// [`Self::all`], whose successor match has no wildcard: a kind added to the enum without an
+    /// arm there fails to compile rather than becoming a name this lookup does not know.
     pub fn from_module(module: &str) -> Option<Self> {
-        let mut kind = Self::Budget;
-        loop {
-            if kind.module() == module {
-                return Some(kind);
-            }
-            kind = match kind {
-                Self::Budget => Self::PerTx,
-                Self::PerTx => Self::RateLimit,
-                Self::RateLimit => Self::ProtocolScope,
-                Self::ProtocolScope => Self::SlippageFloor,
-                Self::SlippageFloor => Self::AssetScope,
-                Self::AssetScope => Self::RecipientAllowlist,
-                Self::RecipientAllowlist => Self::TimeWindow,
-                // The last kind. Nothing follows it, so the name matched none of them.
-                Self::TimeWindow => return None,
-            };
+        Self::all().find(|kind| kind.module() == module)
+    }
+
+    /// The kind declared after this one, or `None` at the end of the enum.
+    ///
+    /// The successor chain, written once. No wildcard arm, for the same reason
+    /// [`Self::enforcement`] has none: a kind added without a decision here must fail to compile.
+    /// What it would otherwise fall out of is everything built on [`Self::all`], and the symptom is
+    /// silence rather than an error. A generated document that lists which layer holds which limit
+    /// would simply not mention the new rule, and an owner reading it would conclude no such limit
+    /// exists.
+    fn next(self) -> Option<Self> {
+        match self {
+            Self::Budget => Some(Self::PerTx),
+            Self::PerTx => Some(Self::RateLimit),
+            Self::RateLimit => Some(Self::ProtocolScope),
+            Self::ProtocolScope => Some(Self::SlippageFloor),
+            Self::SlippageFloor => Some(Self::AssetScope),
+            Self::AssetScope => Some(Self::RecipientAllowlist),
+            Self::RecipientAllowlist => Some(Self::TimeWindow),
+            // The last kind. Nothing follows it.
+            Self::TimeWindow => None,
         }
+    }
+
+    /// Every kind, in declaration order.
+    ///
+    /// For a consumer that has to say something about all of them: the wallet read labels the rules
+    /// one wallet carries, but a document explaining which layer holds which limit has to cover the
+    /// whole set, and a hand-written list of eight would be the ninth place a new kind has to be
+    /// remembered.
+    pub fn all() -> impl Iterator<Item = Self> {
+        std::iter::successors(Some(Self::Budget), |kind| kind.next())
     }
 
     pub fn as_str(self) -> &'static str {
@@ -193,6 +209,21 @@ impl Enforcement {
         match self {
             Self::OnChain => "on-chain",
             Self::PreFlight => "pre-flight",
+        }
+    }
+
+    /// Who refuses, in words an agent or an owner can act on.
+    ///
+    /// Here rather than beside either consumer because two of them say it: the wallet read emits it
+    /// as `enforcedBy`, and the generated instructions print it in the table that tells an owner
+    /// which limits the chain holds. The label and the sentence explaining it must agree, and when
+    /// each consumer worded its own there was nothing making them.
+    ///
+    /// Exhaustive, so a third layer cannot arrive unnamed.
+    pub fn enforced_by(self) -> &'static str {
+        match self {
+            Self::OnChain => "the Move contract, which aborts the transaction",
+            Self::PreFlight => "the signer, before it signs",
         }
     }
 }

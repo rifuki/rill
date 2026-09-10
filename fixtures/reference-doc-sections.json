@@ -1,0 +1,118 @@
+{
+  "$schema_note": "The section structure of the two document generators in the TypeScript reference (rill-backend/src/features/mcp/skill-doc.ts and agent-instructions.ts), read on 2026-09-11, and what happened to each section in the Rust port at bins/rill-server/src/agent_docs.rs. The port is authoritative: it is what the server serves, it interpolates the configured base URL, and it is the only one that can reach this repository's enforcement producer. This file is what keeps the two from drifting in silence. bins/rill-server/tests/generated_docs.rs asserts every ported or corrected section still appears in the generated document and that no section was added here without a reason recorded; with RILL_REFERENCE_DIR pointing at a checkout of the reference it also re-reads those two sources and fails when their heading set changes, which is the signal to come back to this file.",
+  "$heading_note": "Headings are recorded up to the first em dash or template placeholder, and compared by prefix. Two of the reference's headings carry the character this repository forbids in anything it emits, so recording them whole would mean writing it into this file.",
+  "reference": {
+    "skill_doc": {
+      "path": "rill-backend/src/features/mcp/skill-doc.ts",
+      "headings": [
+        "# Rill Actions",
+        "## Parameters",
+        "## Run it",
+        "### MCP (Claude Code, OpenCode, Thiny, …)",
+        "### REST (any agent / script)",
+        "## Onboarding",
+        "## Signing (you hold the key, not Rill)",
+        "## Safety"
+      ]
+    },
+    "agent_instructions": {
+      "path": "rill-backend/src/features/mcp/agent-instructions.ts",
+      "headings": [
+        "# Set up & run",
+        "## 1. Agent: install & connect",
+        "## 2. Agent: onboard the wallet (after the restart)",
+        "## 3. Agent: tool sequence for each request",
+        "## 4. Guardrails the wallet enforces on-chain",
+        "## 5. Then you just prompt"
+      ]
+    }
+  },
+  "sections": [
+    {
+      "reference": "# Rill Actions",
+      "disposition": "ported",
+      "ours": "Rill: set up and run",
+      "why": "One document, so one title. The reference's two titles name the same thing from two generators."
+    },
+    {
+      "reference": "# Set up & run",
+      "disposition": "ported",
+      "ours": "Rill: set up and run",
+      "why": "Same title, reached from the other reference generator."
+    },
+    {
+      "reference": "## 1. Agent: install & connect",
+      "disposition": "ported",
+      "ours": "Install the local signer",
+      "why": "Split in two here, install and connect, because the install is four commands a reader runs once and the connect step is two per agent."
+    },
+    {
+      "reference": "## 3. Agent: tool sequence for each request",
+      "disposition": "ported",
+      "ours": "Call the tools in this order",
+      "why": "Every name now read from rill_mcp::tools rather than written into the document. The reference names execute_rill_action, signer_status, create_run_set and request_faucet, none of which exists on either surface here."
+    },
+    {
+      "reference": "## Run it",
+      "disposition": "ported",
+      "ours": "Call the tools in this order",
+      "why": "The reference's Run it and tool sequence are the same instruction in two documents."
+    },
+    {
+      "reference": "### MCP (Claude Code, OpenCode, Thiny, …)",
+      "disposition": "ported",
+      "ours": "Connect both MCP servers",
+      "why": "MCP is the only transport offered here, so it is a step rather than one of two choices."
+    },
+    {
+      "reference": "## 4. Guardrails the wallet enforces on-chain",
+      "disposition": "corrected",
+      "ours": "Which layer holds which limit",
+      "why": "The heading itself makes the claim U1 removed: the reference lists the recipient allowlist, the asset scope and the protocol scope underneath it, and nothing on the chain checks any of those. Each rule's layer is now the label RuleKind::enforcement computes."
+    },
+    {
+      "reference": "## Safety",
+      "disposition": "corrected",
+      "ours": "Which layer holds which limit",
+      "why": "Same correction from the other generator: the reference says every spend aborts outside the manifest's bounds, which is true of four kinds and false of the other four."
+    },
+    {
+      "reference": "## Signing (you hold the key, not Rill)",
+      "disposition": "ported",
+      "ours": "Checking the builder holds no key",
+      "why": "Kept and turned into something a reader can run: one curl against this deployment, plus the statement that no tool on the remote surface is marked destructive. The reference's version points at TypeScript source files in the reference repository, which a stranger installing a binary does not have."
+    },
+    {
+      "reference": "## 5. Then you just prompt",
+      "disposition": "ported",
+      "ours": "Then you just prompt",
+      "why": "Unchanged in intent. The prompt differs by whether a grant is attached, which is the same honest split the reference makes."
+    },
+    {
+      "reference": "## Parameters",
+      "disposition": "omitted",
+      "why": "This server advertises one open params object on rill_build_action rather than a per-action schema, so there is no parameter table to render. rill_describe_action is the live answer, and a table copied into a document would be the stale one."
+    },
+    {
+      "reference": "### REST (any agent / script)",
+      "disposition": "omitted",
+      "why": "There is no REST build route on this server. Naming one would be an instruction that answers 404, which is the failure this unit exists to remove."
+    },
+    {
+      "reference": "## Onboarding",
+      "disposition": "omitted",
+      "why": "It names create_run_set, list_run_sets and request_faucet, tools that exist on no surface in this repository. The cold-start path is owned by its own unit; this document does not invent one."
+    },
+    {
+      "reference": "## 2. Agent: onboard the wallet (after the restart)",
+      "disposition": "omitted",
+      "why": "Same three tools, same reason. What survives is the restart sentence, which is in the connect step because an MCP server added to a running agent is invisible to it."
+    }
+  ],
+  "added": [
+    {
+      "ours": "What this wallet grants",
+      "why": "The reference folds the owner's actual grant into its on-chain guardrails heading. Separated here because one is a property of the rule kinds and the other is a property of this wallet, and only the second can be absent. With no manifest attached it says so rather than describing limits that are not there."
+    }
+  ]
+}

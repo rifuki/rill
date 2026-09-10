@@ -13,7 +13,11 @@
 //! a second connected server could plausibly offer the same names, and an agent choosing between
 //! two identically-named tools chooses arbitrarily.
 
-use rmcp::model::{Tool, ToolAnnotations};
+/// Re-exported so a consumer can name what [`tools`] returns without taking a dependency on the
+/// MCP crate itself. The server renders the agent-facing document from this list, and a document
+/// that names a tool nobody offers is an instruction an agent cannot follow.
+pub use rmcp::model::Tool;
+use rmcp::model::ToolAnnotations;
 use serde_json::{json, Map, Value};
 use std::borrow::Cow;
 use std::sync::Arc;

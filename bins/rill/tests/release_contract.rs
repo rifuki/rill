@@ -33,15 +33,17 @@ const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../RE
 const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
 
 /// The one origin. A download line that names any other repository is a broken instruction.
-const ORIGIN: &str = "https://github.com/rifuki/rill/releases";
+///
+/// Read from `rill_core::release` rather than typed here, and likewise the asset names below. The
+/// server generates install instructions from those same constants, so a rename now moves the
+/// workflow, the README and the document an agent is handed together or fails this test.
+const ORIGIN: &str = rill_core::release::RELEASES_URL;
 
-/// The asset names, pinned. These are what the README hands out, so a rename here renames every
-/// install instruction already in the wild and must be deliberate.
-const ASSETS: [&str; 3] = [
-    "rill-wallet-darwin-arm64",
-    "rill-wallet-darwin-x64",
-    "rill-wallet-linux-x64",
-];
+/// The asset names, pinned in `rill_core::release`. These are what the README hands out, so a
+/// rename there renames every install instruction already in the wild and must be deliberate.
+fn assets() -> [&'static str; 3] {
+    rill_core::release::wallet_asset_files()
+}
 
 /// The runner labels this release is built on, pinned.
 ///
@@ -238,14 +240,15 @@ fn rill_wallet_status_names_itself_and_exits_not_ready_without_a_key() {
 
 #[test]
 fn every_matrix_asset_carries_the_released_name() {
-    let assets = matrix_assets();
+    let matrix = matrix_assets();
     assert_eq!(
-        assets, ASSETS,
+        matrix,
+        assets(),
         "the matrix `asset:` values are the filenames the README hands out"
     );
-    for asset in &assets {
+    for asset in &matrix {
         assert!(
-            asset.starts_with("rill-wallet-"),
+            asset.starts_with(BINARY_NAME),
             "{asset} does not carry the released name"
         );
     }
@@ -254,7 +257,7 @@ fn every_matrix_asset_carries_the_released_name() {
 #[test]
 fn the_publish_list_names_every_asset_and_its_checksum() {
     let files = block_after("files: |");
-    let expected: Vec<String> = ASSETS
+    let expected: Vec<String> = assets()
         .iter()
         .flat_map(|asset| [asset.to_string(), format!("{asset}.sha256")])
         .collect();
@@ -456,7 +459,7 @@ fn the_matrix_runs_on_the_pinned_runners_and_nothing_else() {
 fn the_readme_install_block_curls_every_asset_from_the_one_origin() {
     let install = install_section();
     let lines: Vec<&str> = install.lines().map(str::trim).collect();
-    for asset in ASSETS {
+    for asset in assets() {
         for name in [asset.to_string(), format!("{asset}.sha256")] {
             // The whole line, not a substring: the binary's URL is a prefix of its checksum's,
             // so a substring match would let the binary line name any origin at all.

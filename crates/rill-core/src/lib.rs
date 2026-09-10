@@ -13,4 +13,5 @@ pub mod amounts;
 pub mod envelope;
 pub mod flow;
 pub mod manifest;
+pub mod release;
 pub mod tokens;
