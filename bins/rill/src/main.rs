@@ -141,6 +141,10 @@ fn load() -> Loaded {
 }
 
 const COMMANDS: &[(&str, &str)] = &[
+    (
+        "init",
+        "from nothing to a bounded wallet: check the keys, fund, mint, attach rules, write a run-set",
+    ),
     ("mcp", "speak MCP over stdio: this is what an agent runs"),
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
@@ -255,6 +259,167 @@ fn main() {
         Some("help") | Some("--help") | Some("-h") => {
             println!("rill: the local half of Rill. Holds the key, checks the work, signs.");
             print_commands();
+        }
+        Some("init") => {
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let wait = argv.iter().any(|a| a == "--wait");
+
+            // Read, never write. The keystore is the sui CLI's, and generating a key is its job:
+            // see the note at the top of `init`.
+            let home = std::env::var("HOME").unwrap_or_default();
+            let keystore_path =
+                std::path::Path::new(&home).join(rill_cli::keystore::SUI_KEYSTORE_PATH);
+            let held = rill_cli::keystore::Keystore::addresses_in_sui_keystore(&keystore_path)
+                .unwrap_or_default();
+
+            let manifest = rill_core::manifest::CapabilityManifest {
+                wallet_coin_type: "0x2::sui::SUI".into(),
+                rules: vec![
+                    rill_core::manifest::CapabilityRule::Budget {
+                        total_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
+                    },
+                    rill_core::manifest::CapabilityRule::PerTx {
+                        max_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
+                    },
+                ],
+            };
+
+            let run_set_path = flag("--run-set")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var(rill_cli::runset::RUN_SET_VAR)
+                        .ok()
+                        .map(Into::into)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("./rill-run-set.json"));
+
+            // The first two keys, in keystore order: owner first, agent second. Stated rather than
+            // inferred, because which is which decides who can revoke.
+            let owner = held.first().copied();
+            let agent = held.get(1).copied();
+
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a single-threaded runtime");
+
+            let code = runtime.block_on(async {
+                let chain = match rill_chain::grpc::GrpcSui::new(&endpoint) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("rill: {e}");
+                        return 1;
+                    }
+                };
+                let balance = match (owner, agent) {
+                    (Some(o), Some(_)) => {
+                        rill_chain::SuiRead::get_balance(&chain, &o.to_string(), "0x2::sui::SUI")
+                            .await
+                            .unwrap_or(0)
+                    }
+                    // Without two keys the balance is not the thing to report, and asking the node
+                    // about an address that may not exist yet would only add a second error.
+                    _ => 0,
+                };
+
+                if let Some(stopped) = rill_cli::init::refuse_early(
+                    held.len(),
+                    &manifest,
+                    &owner.unwrap_or(sui_sdk_types::Address::ZERO),
+                    balance,
+                    wait,
+                ) {
+                    eprintln!("rill: {stopped}");
+                    return 1;
+                }
+                let (owner, agent) = (owner.expect("two keys"), agent.expect("two keys"));
+
+                if wait && balance == 0 {
+                    println!("fund the owner and this will continue on its own:");
+                    println!("  {}", rill_cli::init::faucet_link(&owner));
+                    print!("waiting");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    loop {
+                        if rill_chain::SuiRead::get_balance(
+                            &chain,
+                            &owner.to_string(),
+                            "0x2::sui::SUI",
+                        )
+                        .await
+                        .unwrap_or(0)
+                            > 0
+                        {
+                            println!(
+                                "
+funded."
+                            );
+                            break;
+                        }
+                        print!(".");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    }
+                }
+
+                let keystore = match rill_cli::keystore::Keystore::load_for(owner) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        eprintln!("rill: {e}");
+                        return 1;
+                    }
+                };
+                let args = rill_cli::init::InitArgs {
+                    package_id: flag("--package")
+                        .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
+                        .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                    version_id: flag("--version-object")
+                        .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
+                        .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                    amount: flag("--amount").unwrap_or_else(|| "0.2".into()),
+                    budget_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
+                    per_tx_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
+                    gas_budget: flag("--gas-budget")
+                        .and_then(|g| g.parse().ok())
+                        .unwrap_or(100_000_000),
+                    run_set_path: run_set_path.clone(),
+                };
+                let identities = rill_cli::init::Identities { owner, agent };
+                match rill_cli::init::run_on(
+                    &chain,
+                    &keystore,
+                    &identities,
+                    &args,
+                    &manifest,
+                    now_ms,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("rill: {e}");
+                        1
+                    }
+                }
+            });
+            std::process::exit(code);
         }
         Some("address") => match &loaded.keystore {
             // Bare, so it composes: `export SENDER=$(rill address)`.

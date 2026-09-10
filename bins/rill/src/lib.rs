@@ -17,6 +17,7 @@
 /// cannot link this crate: the signer's library is exactly what a keyless builder must not hold.
 pub const BINARY_NAME: &str = rill_core::release::WALLET_BINARY;
 
+pub mod init;
 pub mod keystore;
 pub mod manager_cmd;
 pub mod order_cmd;

@@ -156,6 +156,40 @@ origin, which will not carry releases built from this source. Moving them is owe
 `docs/plans/2026-09-10-001-feat-rill-operational-mcp-plan.md`; until that lands, the install lines
 above are the ones that resolve.
 
+## From nothing to a bounded wallet
+
+One command, on a machine with no Sui setup.
+
+```sh
+./rill-wallet init --wait
+```
+
+What it does, and what it refuses:
+
+1. **Checks for two keys** and stops if there are not two, naming the command that makes them. Two,
+   not one: the owner creates the wallet and can revoke it, the agent spends inside its rules, and
+   the delegation is only proved when they are different addresses. This never writes a key. When
+   keys are missing it tells you to run `sui client new-address ed25519`, which is the sui CLI's own
+   job and already the thing you would otherwise be told to run.
+2. **Refuses an empty rule set**, because a capability with no rules is bounded by nothing:
+   `confirm_spend` on an empty policy requires zero receipts, so the wallet would hand out its whole
+   balance on request. Pass `--budget` and `--per-tx`, or take the defaults.
+3. **Prints a faucet link with your owner address already in it** and, with `--wait`, polls until the
+   coins land instead of exiting. There is no faucet this process can call: the CLI one was removed
+   and the web one is interactive, so this is the one step a human has to do.
+4. **Mints the wallet and attaches the rules**, then reports the wallet id, the capability id, and
+   both digests.
+5. **Does nothing on a second run.** Minting again would leave the first wallet funded and forgotten,
+   which on testnet is waste and on mainnet is money, so a run-set that already names a wallet is
+   reported and nothing is sent.
+
+Flags: `--wait`, `--budget <mist>`, `--per-tx <mist>`, `--amount <SUI>`, `--run-set <path>`,
+`--gas-budget <mist>`, `--package`, `--version-object`.
+
+The whole path is covered offline in `bins/rill/tests/cold_start.rs`, including both refusals and the
+second-run no-op, so the command that onboards a stranger is not itself only tested by onboarding a
+stranger.
+
 ## Why a rebuild rather than a port
 
 Three problems in the TypeScript version are one problem: invariants the code documents but the
