@@ -22,11 +22,14 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::Json;
 use rill_auth::oauth::{
-    check_redirect_uri_registered, is_allowed_redirect_uri, is_valid_pkce_value, normalize_scope,
-    resolve_resource, verify_pkce,
+    check_redirect_uri_registered, is_allowed_redirect_uri, is_valid_pkce_value,
+    narrow_to_build_surface, normalize_scope, resolve_resource, verify_pkce,
 };
-use rill_auth::tokens::{random_id, sign_token, verify_token, Expectation, TokenClaims, TokenKind};
-use rill_store::{AuthorizationCode, OAuthClient, OAuthStore, RefreshHandle};
+use rill_auth::tokens::{
+    bearer_from_header, random_id, secret_matches, sign_token, verify_token, Expectation,
+    TokenClaims, TokenKind,
+};
+use rill_store::{AgentHandle, AuthorizationCode, OAuthClient, OAuthStore, RefreshHandle};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -38,6 +41,28 @@ use crate::state::AppState;
 const ACCESS_TTL_SECS: u64 = 60 * 60;
 /// How long a refresh handle lives. Rotated on every use.
 const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// How long a long-lived agent credential lives: 90 days.
+///
+/// Long enough that a deployed agent is not re-provisioned weekly, which is the whole reason this
+/// kind exists, and short enough that one forgotten in an environment variable eventually dies on
+/// its own. Unlike an access token it is revocable at any point inside that window, because every
+/// request checks the store.
+const AGENT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+
+/// The extension grant that mints an agent credential.
+///
+/// An absolute URI because RFC 6749 section 4.5 requires one for any grant type outside the spec,
+/// and because a bare name like `agent_token` would collide with whatever a future RFC calls its
+/// own. Advertised in the discovery document only when this deployment is configured to issue one.
+pub const AGENT_TOKEN_GRANT: &str = "urn:rill:params:oauth:grant-type:agent-token";
+
+/// The client id recorded on an agent credential.
+///
+/// There is no registered OAuth client here: a deployed agent never ran dynamic registration, which
+/// is the point. A fixed, recognisable id names the path the credential came from, so a handle in
+/// the store says how it was minted rather than naming a client that does not exist.
+pub const AGENT_CLIENT_ID: &str = "rill-agent-credential";
+
 /// How long an authorization code lives. Long enough to redirect, short enough to be useless if
 /// it leaks into a log or a referrer header.
 const CODE_TTL_MS: u64 = 60 * 1000;
@@ -236,6 +261,7 @@ pub struct TokenRequest {
     pub client_id: Option<String>,
     pub refresh_token: Option<String>,
     pub resource: Option<String>,
+    pub scope: Option<String>,
 }
 
 /// Exchange a code, or rotate a refresh token.
@@ -253,33 +279,44 @@ pub async fn token(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    // Form first: it is what the RFC mandates and what arrives in practice. A missing or unknown
-    // content type is treated as form too, since that is the likelier intent at this endpoint.
-    let parsed: Result<TokenRequest, String> = if content_type.contains("application/json") {
-        serde_json::from_str(&body).map_err(|e| e.to_string())
-    } else {
-        serde_urlencoded::from_str(&body).map_err(|e| e.to_string())
-    };
-
-    let Ok(request) = parsed else {
+    let Ok(request) = parse_form_or_json::<TokenRequest>(&headers, &body) else {
         return bad_request(
             "invalid_request",
             "a token request body is required, form-encoded per RFC 6749 section 4.1.3",
         );
     };
+    let owner_credential = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
     match request.grant_type.as_str() {
         "authorization_code" => authorization_code_grant(state, request).await,
         "refresh_token" => refresh_token_grant(state, request).await,
+        AGENT_TOKEN_GRANT => agent_token_grant(state, owner_credential, request),
         other => bad_request(
             "unsupported_grant_type",
             &format!("{other} is not a grant type this server issues"),
         ),
+    }
+}
+
+/// Parse an OAuth request body, preferring the form encoding the RFCs mandate.
+///
+/// Shared by `/oauth/token` and `/oauth/revoke` because both are form endpoints by specification
+/// (RFC 6749 section 4.1.3 and RFC 7009 section 2.1) and both once accepted JSON only. A missing or
+/// unknown content type is treated as form, since that is the likelier intent at these endpoints.
+fn parse_form_or_json<T: serde::de::DeserializeOwned>(
+    headers: &axum::http::HeaderMap,
+    body: &str,
+) -> Result<T, String> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if content_type.contains("application/json") {
+        serde_json::from_str(body).map_err(|e| e.to_string())
+    } else {
+        serde_urlencoded::from_str(body).map_err(|e| e.to_string())
     }
 }
 
@@ -352,6 +389,144 @@ async fn refresh_token_grant(state: AppState, request: TokenRequest) -> Response
     issue(state, &claims.sub, &claims.cid, &claims.scope, &claims.aud)
 }
 
+// ── the agent credential ───────────────────────────────────────────────────
+
+/// Mint a long-lived, revocable credential for an agent that cannot open a browser.
+///
+/// # Why this exists at all
+///
+/// The interactive flow beside it is complete and correct, and inert for a deployed agent: seven of
+/// eleven agent frameworks accept only a static bearer, and the Claude Agent SDK does not open a
+/// browser. It reports `needs-auth` and carries on without the server's tools, which is a silent
+/// failure. An access token would not do, because an hour is not a deployment.
+///
+/// # Who may ask, and how that is enforced
+///
+/// Only the deployment owner, proved by presenting `RILL_OWNER_SECRET` as the bearer on this
+/// request. Three consequences, each deliberate:
+///
+/// - **A token cannot mint a token.** An access token, an agent credential, or a refresh token in
+///   the `Authorization` header fails the comparison against the configured secret, so a leaked
+///   credential cannot extend itself or mint a sibling that outlives its own revocation.
+/// - **The subject is configuration, not input.** `sub` comes from `RILL_OWNER_ADDRESS`. Even the
+///   owner secret cannot mint a credential that acts for another address, so the scoping that keeps
+///   one owner's catalogue out of another's holds by construction.
+/// - **The scope is narrowed and refused, not dropped.** Anything outside the build surface is a
+///   named refusal, per [`narrow_to_build_surface`].
+///
+/// # The gap this leaves, stated rather than hidden
+///
+/// A configured shared secret is the only owner identity this repository has today: `rill-auth`'s
+/// Sign-In With Sui module builds the message a wallet signs but nothing here verifies a signature,
+/// so there is no way to prove control of an address over HTTP yet. That makes this an
+/// operator-level credential rather than a wallet-level one, and it is why the address is pinned in
+/// configuration instead of taken from the request.
+fn agent_token_grant(
+    state: AppState,
+    owner_credential: Option<&str>,
+    request: TokenRequest,
+) -> Response {
+    let (Some(owner_secret), Some(owner_address)) =
+        (&state.config.owner_secret, &state.config.owner_address)
+    else {
+        return bad_request(
+            "unsupported_grant_type",
+            "this deployment issues no agent credentials: set RILL_OWNER_SECRET and \
+             RILL_OWNER_ADDRESS to enable the grant. It is advertised in \
+             /.well-known/oauth-authorization-server only where it is configured.",
+        );
+    };
+
+    // Constant-time, and against the header rather than the body: the secret is the whole of the
+    // authentication here, and a plain comparison leaks it to anyone who can time this endpoint.
+    let presented = bearer_from_header(owner_credential).unwrap_or_default();
+    if !secret_matches(presented, owner_secret) {
+        return oauth_err(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "minting an agent credential requires the deployment owner's secret as the bearer \
+             on this request. Holding an access token is not sufficient, deliberately: a \
+             credential that could mint its own replacement would survive being revoked.",
+        );
+    }
+
+    let scope = match narrow_to_build_surface(request.scope.as_deref().unwrap_or("mcp")) {
+        Ok(scope) => scope,
+        Err(e) => return bad_request(e.code, &e.description),
+    };
+    let canonical = format!("{}/mcp", state.config.public_base_url);
+    let resource = match resolve_resource(
+        request.resource.as_deref(),
+        &canonical,
+        &state.config.public_base_url,
+    ) {
+        Ok(resource) => resource,
+        Err(e) => return bad_request(e.code, &e.description),
+    };
+
+    let now = now_secs();
+    let claims = TokenClaims {
+        t: TokenKind::Agent,
+        sub: owner_address.clone(),
+        cid: AGENT_CLIENT_ID.to_owned(),
+        scope: scope.clone(),
+        aud: resource.clone(),
+        exp: now + AGENT_TTL_SECS,
+        jti: random_id(),
+    };
+
+    // The handle is saved before the token is signed, and the order is load-bearing. A handle with
+    // no token is harmless and expires on its own; a token with no handle is a credential that
+    // authenticates nowhere, and the operator would read that as the server being broken.
+    let handle = AgentHandle {
+        jti: claims.jti.clone(),
+        sub: claims.sub.clone(),
+        client_id: AGENT_CLIENT_ID.to_owned(),
+        scope: scope.clone(),
+        resource: resource.clone(),
+        issued_at: now * 1000,
+        expires_at: (now + AGENT_TTL_SECS) * 1000,
+    };
+    if let Err(e) = state.oauth.save_agent(handle) {
+        return oauth_err(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            format!(
+                "the credential was not issued because its revocation handle could not be \
+                 stored: {e}. Issuing it anyway would hand out a 90-day bearer that no revoke \
+                 could stop."
+            ),
+        );
+    }
+
+    let token = match sign_token(&claims, &state.config.oauth_secret) {
+        Ok(token) => token,
+        Err(e) => {
+            // Leave nothing behind: a stored handle whose token never reached the caller is dead
+            // weight an operator would have to tell apart from a live credential.
+            let _ = state.oauth.revoke_agent(&claims.jti);
+            return oauth_err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                e.to_string(),
+            );
+        }
+    };
+
+    // Flat, per RFC 6749 section 5.1. No refresh token: this credential does not rotate, and a
+    // second revocable thing is a second thing an operator has to remember to kill.
+    oauth_ok(json!({
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": AGENT_TTL_SECS,
+        "scope": scope,
+        "resource": resource,
+        // Named so an operator can see they received the revocable kind rather than an hour-long
+        // access token that /oauth/revoke could not touch.
+        "rill_token_kind": "agent",
+    }))
+}
+
 /// Mint an access token, and a refresh token when the scope asks for one.
 fn issue(state: AppState, sub: &str, client_id: &str, scope: &str, resource: &str) -> Response {
     let now = now_secs();
@@ -415,26 +590,73 @@ fn issue(state: AppState, sub: &str, client_id: &str, scope: &str, resource: &st
 #[derive(Debug, Deserialize)]
 pub struct RevokeRequest {
     pub token: String,
+    /// RFC 7009 section 2.1's optional hint. Read for completeness and not trusted: the kind is
+    /// inside the MAC, so a hint that disagrees with the token changes nothing.
+    #[allow(dead_code)]
+    pub token_type_hint: Option<String>,
 }
 
-/// Revoke a refresh token.
+/// Revoke a store-backed credential: a refresh handle, or an agent credential.
 ///
 /// RFC 7009 requires 200 whether or not the token existed, so that an attacker cannot use this
-/// endpoint to learn which tokens are real.
-pub async fn revoke(State(state): State<AppState>, body: Option<Json<RevokeRequest>>) -> Response {
-    let Some(Json(request)) = body else {
+/// endpoint to learn which tokens are real. Both store-backed kinds are handled here, which is what
+/// makes revoking an agent credential take effect on its very next call rather than at expiry.
+///
+/// # One case answers 400, and RFC 7009 section 2.2.1 is why
+///
+/// A stateless access token cannot be revoked: nothing checks it against a store, so deleting
+/// nothing and answering `{"revoked": true}` would tell an operator the leak was closed when it was
+/// not. That is the exact misreading this unit exists to remove, so an access token gets
+/// `unsupported_token_type` and a description naming what to do instead. It is not a probing
+/// oracle: reaching that answer requires presenting a token this deployment signed, which the
+/// caller already holds.
+pub async fn revoke(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
+    let Ok(request) = parse_form_or_json::<RevokeRequest>(&headers, &body) else {
+        // An unparseable body names no token, so there is nothing to reveal by answering 200.
         return oauth_ok(json!({ "revoked": true }));
     };
+    let audience = format!("{}/mcp", state.config.public_base_url);
+    let expect = |kind: TokenKind| Expectation {
+        kind,
+        audience: &audience,
+        now_secs: now_secs(),
+    };
+
     if let Ok(claims) = verify_token(
         &request.token,
         &state.config.oauth_secret,
-        Expectation {
-            kind: TokenKind::Refresh,
-            audience: &format!("{}/mcp", state.config.public_base_url),
-            now_secs: now_secs(),
-        },
+        expect(TokenKind::Refresh),
     ) {
         let _ = state.oauth.take_refresh(&claims.jti, now_ms());
+        return oauth_ok(json!({ "revoked": true }));
     }
+    if let Ok(claims) = verify_token(
+        &request.token,
+        &state.config.oauth_secret,
+        expect(TokenKind::Agent),
+    ) {
+        let _ = state.oauth.revoke_agent(&claims.jti);
+        return oauth_ok(json!({ "revoked": true }));
+    }
+    if verify_token(
+        &request.token,
+        &state.config.oauth_secret,
+        expect(TokenKind::Access),
+    )
+    .is_ok()
+    {
+        return bad_request(
+            "unsupported_token_type",
+            "that is an access token, and this server cannot revoke one: it is a stateless \
+             signature checked only against its own expiry, so nothing here could stop it before \
+             it runs out in an hour. Revoke the refresh token or the agent credential it came \
+             from, or rotate RILL_OAUTH_SECRET to invalidate every token at once.",
+        );
+    }
+    // Unknown, forged, or expired. Indistinguishable on purpose.
     oauth_ok(json!({ "revoked": true }))
 }

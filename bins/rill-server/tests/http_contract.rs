@@ -26,6 +26,11 @@ use rill_server::state::{AppState, Config, Network};
 /// exercised end to end. A counter per call is enough, and a router that needs continuity across
 /// several requests is cloned rather than rebuilt.
 fn app() -> axum::Router {
+    routes::router(AppState::new(config_in(&fresh_dir())))
+}
+
+/// A directory no other test in this binary writes to.
+fn fresh_dir() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -34,18 +39,28 @@ fn app() -> axum::Router {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let config = Config {
+    dir
+}
+
+/// The test deployment's configuration, over a store directory the caller names.
+///
+/// Separate from [`app`] so a test can keep the directory: a credential that must survive a restart
+/// needs a second router reading the same files, and seeding a skill owned by somebody else needs
+/// the path before the router exists.
+fn config_in(dir: &std::path::Path) -> Config {
+    Config {
         port: 3939,
         network: Network::Testnet,
         public_base_url: "https://api.rill.test".into(),
         sui_rpc_url: "https://fullnode.testnet.sui.io:443".into(),
-        oauth_secret: "test-secret".into(),
+        oauth_secret: TEST_SECRET.into(),
         oauth_secret_from_env: true,
         guard_package_id: Some("0xguard".into()),
+        owner_secret: None,
+        owner_address: None,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
         oauth_store_path: dir.join("oauth.json").to_string_lossy().into(),
-    };
-    routes::router(AppState::new(config))
+    }
 }
 
 async fn get(path: &str) -> (StatusCode, Value, axum::http::HeaderMap) {
@@ -272,6 +287,8 @@ fn mainnet_config(secret: &str, guard: Option<&str>) -> Config {
         oauth_secret: secret.into(),
         oauth_secret_from_env: !secret.is_empty(),
         guard_package_id: guard.map(str::to_owned),
+        owner_secret: None,
+        owner_address: None,
         skills_store_path: "/tmp/x.json".into(),
         oauth_store_path: "/tmp/y.json".into(),
     }
@@ -1034,4 +1051,492 @@ async fn no_oauth_success_carries_the_api_envelope() {
         body.get("success").is_none() && body.get("data").is_none(),
         "an OAuth client does not unwrap an envelope: {body}"
     );
+}
+
+// ── R8: the credential a deployed agent can use ─────────────────────────────────────────────
+//
+// The interactive flow beside this one is correct and unusable by a deployed agent: the Claude
+// Agent SDK does not open a browser, and most frameworks accept only a static bearer. The
+// long-lived thing this server used to offer was a refresh token, which `/mcp` refuses on purpose.
+// A long-lived access token was not the answer either, because nothing checks a stateless HMAC
+// against a store, so `/oauth/revoke` would have answered `{"revoked": true}` and revoked nothing.
+//
+// These tests are about the part that cannot be proved in `rill-auth`: the store is consulted on
+// every request, so a revoke lands on the very next call, and the credential still works after a
+// restart.
+
+/// Long enough to pass the boot check, which refuses a short owner secret.
+const OWNER_SECRET: &str = "3f7c1d9b5a2e48c6903fb17e4d8a6c52";
+/// The owner address agent credentials are minted for, taken from configuration and never from a
+/// request.
+const OWNER_ADDRESS: &str = "0xb649a075e07c7cf0baebeaa82150416218c63943e2e767fe93a24aa5c7ce64a9";
+const AGENT_GRANT_FORM: &str = "grant_type=urn%3Arill%3Aparams%3Aoauth%3Agrant-type%3Aagent-token";
+
+/// A deployment configured to issue agent credentials, over a store directory the caller keeps.
+fn agent_app_in(dir: &std::path::Path) -> axum::Router {
+    let mut config = config_in(dir);
+    config.owner_secret = Some(OWNER_SECRET.into());
+    config.owner_address = Some(OWNER_ADDRESS.into());
+    assert!(
+        config.boot_check().is_ok(),
+        "the test configuration must be one this server would actually start on"
+    );
+    routes::router(AppState::new(config))
+}
+
+/// Ask for an agent credential the way an operator does: the owner secret as the bearer, the grant
+/// type in a form body.
+async fn mint(
+    router: &axum::Router,
+    owner_bearer: Option<&str>,
+    extra: &str,
+) -> (StatusCode, Value) {
+    let mut request = Request::post("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(bearer) = owner_bearer {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+    let body = format!("{AGENT_GRANT_FORM}{extra}");
+    let response = router
+        .clone()
+        .oneshot(request.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Call `/mcp` on one specific router, so a test can keep a store across calls.
+async fn mcp_on(router: &axum::Router, bearer: &str, body: Value) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn revoke_on(router: &axum::Router, token: &str) -> (StatusCode, Value) {
+    post_raw_on(
+        router,
+        "/oauth/revoke",
+        "application/x-www-form-urlencoded",
+        &format!("token={token}"),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_long_lived_credential_authenticates_on_mcp() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    let (status, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let credential = body["access_token"].as_str().expect("a credential");
+
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(
+        body["expires_in"], 7_776_000,
+        "90 days: an hour is not a deployment"
+    );
+    assert_eq!(body["scope"], "mcp");
+    assert_eq!(
+        body["rill_token_kind"], "agent",
+        "an operator has to be able to see they got the revocable kind"
+    );
+    assert!(
+        body.get("refresh_token").is_none(),
+        "a credential that does not rotate needs no refresh token, and a second revocable thing is \
+         a second thing to forget to kill"
+    );
+    assert!(
+        body.get("success").is_none() && body.get("data").is_none(),
+        "RFC 6749 section 5.1 is flat: {body}"
+    );
+
+    let (status, answer) = mcp_on(&router, credential, initialize()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["result"]["serverInfo"]["name"], "rill-actions");
+}
+
+/// The verification R8 demands, with the file-backed store and one signing secret: a credential
+/// issued once keeps working after the process that issued it is gone.
+#[tokio::test]
+async fn a_credential_keeps_working_across_a_restart() {
+    let dir = fresh_dir();
+    let credential = {
+        let before = agent_app_in(&dir);
+        let (status, body) = mint(&before, Some(OWNER_SECRET), "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["access_token"].as_str().unwrap().to_owned()
+    };
+
+    // A second router over the same files and the same secret: the process is new, and its
+    // in-memory state is whatever it read off disk.
+    let after = agent_app_in(&dir);
+    let (status, answer) = mcp_on(&after, &credential, initialize()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a deployed agent cannot re-authorize after every deploy: {answer}"
+    );
+}
+
+/// The defect this unit exists to fix. A stateless token would still work here, and the operator
+/// who read `{"revoked": true}` would have been told a lie.
+#[tokio::test]
+async fn revoking_a_credential_stops_the_very_next_call() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = body["access_token"].as_str().unwrap().to_owned();
+
+    let (before, _) = mcp_on(&router, &credential, initialize()).await;
+    assert_eq!(before, StatusCode::OK, "it worked before the revoke");
+
+    let (status, revoked) = revoke_on(&router, &credential).await;
+    assert_eq!(status, StatusCode::OK, "RFC 7009 answers 200: {revoked}");
+    assert_eq!(revoked["revoked"], true);
+
+    let (after, answer) = mcp_on(&router, &credential, initialize()).await;
+    assert_eq!(
+        after,
+        StatusCode::UNAUTHORIZED,
+        "the token is unchanged and unexpired, so only the store could have refused it: {answer}"
+    );
+    assert!(
+        answer["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("revoked"),
+        "and it must say why: {answer}"
+    );
+}
+
+/// Not only at issuance. The token never changes in this test: the same bytes are accepted, then
+/// refused, because the handle behind them is gone.
+#[tokio::test]
+async fn the_store_is_checked_on_every_request_not_only_at_issuance() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = body["access_token"].as_str().unwrap().to_owned();
+
+    for call in 1..=3 {
+        let (status, _) = mcp_on(&router, &credential, initialize()).await;
+        assert_eq!(status, StatusCode::OK, "call {call} before the revoke");
+    }
+    revoke_on(&router, &credential).await;
+    for call in 1..=3 {
+        let (status, _) = mcp_on(&router, &credential, initialize()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "call {call} after it");
+    }
+}
+
+/// A revocation has to outlive the process, or a deploy resurrects a credential somebody killed.
+#[tokio::test]
+async fn a_revoked_credential_stays_dead_across_a_restart() {
+    let dir = fresh_dir();
+    let credential = {
+        let router = agent_app_in(&dir);
+        let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+        let credential = body["access_token"].as_str().unwrap().to_owned();
+        revoke_on(&router, &credential).await;
+        credential
+    };
+    let after = agent_app_in(&dir);
+    let (status, _) = mcp_on(&after, &credential, initialize()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Issuing is owner-authenticated. A credential that could mint its own replacement would survive
+/// being revoked, which would make the revoke above decorative.
+#[tokio::test]
+async fn minting_requires_the_owner_secret_and_no_token_will_do() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+
+    let (anonymous, body) = mint(&router, None, "").await;
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "invalid_client");
+
+    let (wrong, _) = mint(&router, Some("not-the-owner-secret"), "").await;
+    assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+
+    let access = token(
+        TokenKind::Access,
+        "https://api.rill.test/mcp",
+        "mcp",
+        OWNER_ADDRESS,
+    );
+    let (with_access_token, named) = mint(&router, Some(&access), "").await;
+    assert_eq!(
+        with_access_token,
+        StatusCode::UNAUTHORIZED,
+        "holding a token must not be enough: {named}"
+    );
+    assert!(
+        named["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("owner"),
+        "the refusal names what is missing: {named}"
+    );
+
+    let (_, minted) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = minted["access_token"].as_str().unwrap().to_owned();
+    let (with_agent_credential, _) = mint(&router, Some(&credential), "").await;
+    assert_eq!(
+        with_agent_credential,
+        StatusCode::UNAUTHORIZED,
+        "an agent credential cannot mint a sibling that outlives its own revocation"
+    );
+}
+
+/// The scope constraint is a test, not a note: a leaked environment variable that can raise its own
+/// cap removes the bound the product is built on.
+#[tokio::test]
+async fn a_credential_cannot_be_minted_beyond_the_build_surface() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    for asked in [
+        "scope=offline_access",
+        "scope=mcp+offline_access",
+        "scope=owner",
+    ] {
+        let (status, body) = mint(&router, Some(OWNER_SECRET), &format!("&{asked}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{asked}: {body}");
+        assert_eq!(body["error"], "invalid_scope", "{asked}: {body}");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("build surface"),
+            "{asked}: the refusal must name what an agent credential may reach: {body}"
+        );
+    }
+}
+
+/// Defence in depth at the place every request passes through. A credential minted by some future
+/// path with a wider scope is refused where it is used, not only where it was issued.
+#[tokio::test]
+async fn an_agent_credential_carrying_a_wider_scope_is_refused_at_the_resource() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    let forged = token(
+        TokenKind::Agent,
+        "https://api.rill.test/mcp",
+        "mcp offline_access",
+        OWNER_ADDRESS,
+    );
+    let (status, body) = mcp_on(&router, &forged, initialize()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], "insufficient_scope");
+    assert!(
+        body["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("build surface"),
+        "{body}"
+    );
+}
+
+/// One owner. The subject comes from configuration, so even the owner secret cannot mint a
+/// credential that reads somebody else's catalogue.
+#[tokio::test]
+async fn a_credential_reaches_only_its_own_owners_actions() {
+    let dir = fresh_dir();
+    std::fs::write(
+        dir.join("skills.json"),
+        r#"[{"id":"skill_belongs_to_someone_else","name":"not yours","description":"x",
+             "flow":{"nodes":[],"edges":[]},
+             "owner":"0x1111111111111111111111111111111111111111111111111111111111111111",
+             "createdAt":"2026-09-01"}]"#,
+    )
+    .unwrap();
+    let router = agent_app_in(&dir);
+    let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = body["access_token"].as_str().unwrap().to_owned();
+
+    let (_, listed) = mcp_on(
+        &router,
+        &credential,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "rill_list_actions", "arguments": {} }
+        }),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["structuredContent"]["actions"],
+        serde_json::json!([]),
+        "another address's action must not appear: {listed}"
+    );
+
+    let (_, described) = mcp_on(
+        &router,
+        &credential,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "rill_describe_action",
+                        "arguments": { "actionId": "skill_belongs_to_someone_else" } }
+        }),
+    )
+    .await;
+    assert_eq!(described["result"]["isError"], true);
+    assert_eq!(
+        described["result"]["structuredContent"]["code"],
+        "action_unavailable"
+    );
+}
+
+/// Answering `{"revoked": true}` to an access token would tell an operator a leak was closed when
+/// nothing had happened. RFC 7009 section 2.2.1 has the error code for exactly this.
+#[tokio::test]
+async fn revoking_an_access_token_is_refused_rather_than_silently_succeeding() {
+    let access = token(
+        TokenKind::Access,
+        "https://api.rill.test/mcp",
+        "mcp",
+        OWNER_ADDRESS,
+    );
+    let router = app();
+    let (status, body) = revoke_on(&router, &access).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unsupported_token_type");
+    let description = body["error_description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("stateless") || description.contains("expiry"),
+        "it must say why this one cannot be revoked: {body}"
+    );
+    assert!(
+        description.contains("RILL_OAUTH_SECRET") || description.contains("agent credential"),
+        "and what to do instead: {body}"
+    );
+}
+
+/// RFC 7009 section 2.1 says this endpoint takes a form. It took JSON only, which is the same
+/// defect the token endpoint had.
+#[tokio::test]
+async fn the_revoke_endpoint_accepts_the_form_encoding_the_rfc_mandates() {
+    let dir = fresh_dir();
+    let router = agent_app_in(&dir);
+    let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = body["access_token"].as_str().unwrap().to_owned();
+
+    let (status, revoked) = revoke_on(&router, &credential).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (after, _) = mcp_on(&router, &credential, initialize()).await;
+    assert_eq!(after, StatusCode::UNAUTHORIZED, "and it actually revoked");
+}
+
+/// A deployment that cannot mint one says so, by name. Without this the operator reads a 400 and
+/// starts looking for a bug in their request.
+#[tokio::test]
+async fn a_deployment_with_no_owner_configured_refuses_the_grant_by_name() {
+    let router = app();
+    let (status, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "unsupported_grant_type");
+    let description = body["error_description"].as_str().unwrap_or_default();
+    assert!(description.contains("RILL_OWNER_SECRET"), "{body}");
+    assert!(description.contains("RILL_OWNER_ADDRESS"), "{body}");
+}
+
+/// Advertising a grant this deployment would refuse is the same failure as advertising an endpoint
+/// that 404s, which is what `/oauth/*` used to do.
+#[tokio::test]
+async fn the_agent_grant_is_advertised_only_where_it_is_configured() {
+    let grant = "urn:rill:params:oauth:grant-type:agent-token";
+
+    let (_, unconfigured, _) = get("/.well-known/oauth-authorization-server").await;
+    let grants = unconfigured["grant_types_supported"].as_array().unwrap();
+    assert!(
+        !grants.iter().any(|g| g == grant),
+        "this deployment issues none: {unconfigured}"
+    );
+
+    let dir = fresh_dir();
+    let response = agent_app_in(&dir)
+        .oneshot(
+            Request::get("/.well-known/oauth-authorization-server")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let configured: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        configured["grant_types_supported"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g == grant),
+        "and this one does: {configured}"
+    );
+}
+
+/// `/health` is where an operator looks first. It already answered whether tokens survive a
+/// restart; it now also answers whether this deployment can issue the credential a browserless
+/// agent needs.
+#[tokio::test]
+async fn health_says_whether_this_deployment_issues_agent_credentials() {
+    let (_, plain, _) = get("/health").await;
+    assert_eq!(plain["mcp"]["tokensDurable"], true, "unchanged: {plain}");
+    assert_eq!(plain["mcp"]["agentCredentials"], false);
+
+    let dir = fresh_dir();
+    let response = agent_app_in(&dir)
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let configured: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(configured["mcp"]["agentCredentials"], true);
+    assert_eq!(configured["mcp"]["tokensDurable"], true);
+}
+
+/// Half-configured is refused at boot. The alternative is a grant that answers 400 forever while
+/// `/health` says the deployment is fine.
+#[test]
+fn a_half_configured_owner_is_refused_at_boot_on_every_network() {
+    let dir = fresh_dir();
+
+    let mut secret_only = config_in(&dir);
+    secret_only.owner_secret = Some(OWNER_SECRET.into());
+    let err = secret_only.boot_check().unwrap_err();
+    assert!(err.contains("RILL_OWNER_ADDRESS"), "{err}");
+
+    let mut address_only = config_in(&dir);
+    address_only.owner_address = Some(OWNER_ADDRESS.into());
+    let err = address_only.boot_check().unwrap_err();
+    assert!(err.contains("RILL_OWNER_SECRET"), "{err}");
+
+    let mut short = config_in(&dir);
+    short.owner_secret = Some("too-short".into());
+    short.owner_address = Some(OWNER_ADDRESS.into());
+    let err = short.boot_check().unwrap_err();
+    assert!(err.contains("openssl rand"), "it says how to fix it: {err}");
+
+    let mut typo = config_in(&dir);
+    typo.owner_secret = Some(OWNER_SECRET.into());
+    typo.owner_address = Some("0xnot-an-address".into());
+    let err = typo.boot_check().unwrap_err();
+    assert!(err.contains("not a Sui address"), "{err}");
 }

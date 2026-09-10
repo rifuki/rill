@@ -116,6 +116,33 @@ pub struct RefreshHandle {
     pub expires_at: u64,
 }
 
+/// A live long-lived agent credential.
+///
+/// The token is signed and stateless like every other one here, so this record is the only thing
+/// that can stop it: the protected resource looks the `jti` up on **every** request, and a revoke
+/// deletes the record. Without it a leaked 90-day bearer would keep working for 90 days while
+/// `/oauth/revoke` answered `{"revoked": true}`, which RFC 7009 requires it to answer whether or
+/// not anything was revoked.
+///
+/// Read, never taken. A refresh handle is consumed on use because rotation is the point; consuming
+/// this one would revoke the credential on its first call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHandle {
+    pub jti: String,
+    /// The owner address this credential acts for. It decides which catalogue the agent sees.
+    pub sub: String,
+    pub client_id: String,
+    /// Narrowed at issuance to the build surface. Kept here so an operator reading the file can see
+    /// what a credential can reach without decoding a token.
+    pub scope: String,
+    pub resource: String,
+    /// Epoch milliseconds, so a file an operator opens says when each credential was minted.
+    pub issued_at: u64,
+    /// Epoch milliseconds.
+    pub expires_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     Io(String),
@@ -179,7 +206,23 @@ pub trait OAuthStore {
     fn save_refresh(&self, handle: RefreshHandle) -> StoreResult<()>;
     fn take_refresh(&self, jti: &str, now_ms: u64) -> Option<RefreshHandle>;
 
-    /// Revoke every live refresh handle for one address — "sign me out everywhere", and the thing
-    /// to reach for when an address reports a compromised agent. Returns how many died.
+    fn save_agent(&self, handle: AgentHandle) -> StoreResult<()>;
+    /// Read **without** consuming, and the one exception to this trait's take-everything rule.
+    ///
+    /// This runs on every request an agent credential makes. Taking the handle here would revoke
+    /// the credential on its first call, which is the same bug as not having a handle at all, only
+    /// harder to see.
+    fn get_agent(&self, jti: &str, now_ms: u64) -> Option<AgentHandle>;
+    /// Kill one agent credential. Returns whether a live handle actually died, so a caller can tell
+    /// a real revocation from a no-op even though RFC 7009 makes it answer 200 either way.
+    fn revoke_agent(&self, jti: &str) -> StoreResult<bool>;
+
+    /// Revoke every live handle for one address, refresh and agent alike: "sign me out
+    /// everywhere", and the thing to reach for when an address reports a compromised agent.
+    /// Returns how many died.
+    ///
+    /// Agent credentials are included deliberately. Leaving them would make this the one call an
+    /// operator reaches for in an incident and the one that leaves the longest-lived credential
+    /// alive.
     fn revoke_subject(&self, sub: &str) -> StoreResult<usize>;
 }

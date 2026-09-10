@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AuthorizationCode, AuthorizationRequest, OAuthClient, OAuthStore, PublishedSkill,
+    AgentHandle, AuthorizationCode, AuthorizationRequest, OAuthClient, OAuthStore, PublishedSkill,
     RefreshHandle, SkillStore, StoreError, StoreResult,
 };
 
@@ -151,7 +151,11 @@ impl SkillStore for FileSkillStore {
 
 // ── oauth ─────────────────────────────────────────────────────────────────────────────────────
 
-/// On disk: one object with exactly these four maps, matching the reference.
+/// On disk: one object whose first four maps match the reference deployment's file exactly.
+///
+/// `agents` is a fifth map and every field is `#[serde(default)]`, so a file written before
+/// long-lived credentials existed loads with no migration step, and one written after it is still
+/// readable by the reference.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OAuthState {
     #[serde(default)]
@@ -162,6 +166,8 @@ struct OAuthState {
     codes: HashMap<String, AuthorizationCode>,
     #[serde(default)]
     refresh: HashMap<String, RefreshHandle>,
+    #[serde(default)]
+    agents: HashMap<String, AgentHandle>,
 }
 
 impl OAuthState {
@@ -171,6 +177,7 @@ impl OAuthState {
         self.requests.retain(|_, r| r.expires_at > now_ms);
         self.codes.retain(|_, c| c.expires_at > now_ms);
         self.refresh.retain(|_, h| h.expires_at > now_ms);
+        self.agents.retain(|_, h| h.expires_at > now_ms);
     }
 }
 
@@ -279,11 +286,31 @@ impl OAuthStore for FileOAuthStore {
             .flatten()
     }
 
+    fn save_agent(&self, handle: AgentHandle) -> StoreResult<()> {
+        self.with_state(|s| {
+            s.agents.insert(handle.jti.clone(), handle);
+        })
+    }
+
+    fn get_agent(&self, jti: &str, now_ms: u64) -> Option<AgentHandle> {
+        let state = self.state.lock().ok()?;
+        state
+            .agents
+            .get(jti)
+            .filter(|h| h.expires_at > now_ms)
+            .cloned()
+    }
+
+    fn revoke_agent(&self, jti: &str) -> StoreResult<bool> {
+        self.with_state(|s| s.agents.remove(jti).is_some())
+    }
+
     fn revoke_subject(&self, sub: &str) -> StoreResult<usize> {
         self.with_state(|s| {
-            let before = s.refresh.len();
+            let before = s.refresh.len() + s.agents.len();
             s.refresh.retain(|_, h| h.sub != sub);
-            before - s.refresh.len()
+            s.agents.retain(|_, h| h.sub != sub);
+            before - s.refresh.len() - s.agents.len()
         })
     }
 }

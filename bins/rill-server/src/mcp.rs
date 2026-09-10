@@ -10,6 +10,14 @@
 //! when nothing is wrong, and "it says it can't connect" is a much worse first experience than
 //! "there's nothing here yet".
 //!
+//! # Two kinds of bearer, one of them stateful
+//!
+//! An hour-long access token from the interactive flow, or a 90-day agent credential for a
+//! deployment that has no browser. The second is checked against the store on every request, so
+//! revoking it stops the next call. Neither can reach anything the other cannot: the catalogue an
+//! owner sees is the same, and an agent credential is additionally refused if it ever carries a
+//! scope outside the build surface.
+//!
 //! # Why an unknown action and someone else's action look identical
 //!
 //! `tools/call` on an id belonging to another address answers exactly as it does for an id that
@@ -19,8 +27,9 @@
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rill_auth::tokens::{bearer_from_header, verify_token, Expectation, TokenKind};
-use rill_store::SkillStore;
+use rill_auth::oauth::is_build_surface_only;
+use rill_auth::tokens::{bearer_from_header, verify_bearer, TokenKind};
+use rill_store::{OAuthStore, SkillStore};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -60,22 +69,19 @@ fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String,
     let Some(token) = bearer_from_header(authorization) else {
         return Err(Box::new(unauthorized(
             state,
-            "An OAuth 2.1 access token is required.",
+            "An OAuth 2.1 access token, or an agent credential, is required.",
         )));
     };
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let claims = verify_token(
+    // Either bearer kind. A refresh token replayed here still fails on the signed `t` claim.
+    let claims = verify_bearer(
         token,
         &state.config.oauth_secret,
-        Expectation {
-            // Access only. A refresh token replayed here fails on the signed `t` claim.
-            kind: TokenKind::Access,
-            audience: &state.config.resource(),
-            now_secs,
-        },
+        &state.config.resource(),
+        now_secs,
     )
     .map_err(|e| Box::new(unauthorized(state, &e.to_string())))?;
 
@@ -91,6 +97,43 @@ fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String,
                 .into_response(),
         ));
     }
+
+    if claims.t == TokenKind::Agent {
+        // An agent credential is never wider than an access token with the same scope. Checked
+        // here and not only where it is minted, because a token is only as narrow as the narrowest
+        // check it passes through, and this is the one every request goes through.
+        if !is_build_surface_only(&claims.scope) {
+            return Err(Box::new(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "insufficient_scope",
+                        "error_description": "An agent credential reaches the build \
+                                              surface only. This one carries a scope outside it, \
+                                              so it is refused rather than honoured: a credential \
+                                              in an environment variable must not be able to \
+                                              raise its own limits."
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+        // The store check, on every request. This is the whole difference between a revocable
+        // credential and a 90-day signature nobody can take back: without it `/oauth/revoke`
+        // answers 200 and changes nothing until expiry.
+        if state
+            .oauth
+            .get_agent(&claims.jti, now_secs.saturating_mul(1000))
+            .is_none()
+        {
+            return Err(Box::new(unauthorized(
+                state,
+                "That agent credential has been revoked, or its handle is gone. Ask the owner \
+                 to mint another; nothing about this one can be restored.",
+            )));
+        }
+    }
+
     Ok(claims.sub)
 }
 

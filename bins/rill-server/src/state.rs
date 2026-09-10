@@ -30,6 +30,11 @@ impl Network {
     }
 }
 
+/// An owner secret shorter than this is refused at boot. It is the only thing standing between a
+/// stranger and a 90-day build credential, so it is held to the length of what `openssl rand -hex
+/// 16` produces rather than to whatever an operator typed.
+const MIN_OWNER_SECRET_CHARS: usize = 32;
+
 pub struct Config {
     pub port: u16,
     pub network: Network,
@@ -42,8 +47,31 @@ pub struct Config {
     /// True when the secret came from the environment, and therefore survives a restart.
     pub oauth_secret_from_env: bool,
     pub guard_package_id: Option<String>,
+    /// The operator credential that authorizes minting a long-lived agent credential.
+    ///
+    /// Not a token and not a key: it is the only owner identity this deployment has until
+    /// Sign-In With Sui is wired up here, and it is what keeps the agent-token grant from being
+    /// reachable by anything that merely holds a token. Unset means this deployment mints none.
+    pub owner_secret: Option<String>,
+    /// The one Sui address agent credentials are minted for.
+    ///
+    /// Taken from configuration, never from the request, so a caller who holds the owner secret
+    /// still cannot mint a credential that acts for somebody else's address.
+    pub owner_address: Option<String>,
     pub skills_store_path: String,
     pub oauth_store_path: String,
+}
+
+/// Read an environment variable, treating blank as unset.
+///
+/// A variable set to the empty string is how a deployment platform expresses "I have no value for
+/// this", and treating it as a configured value would mint credentials authenticated by an empty
+/// secret.
+fn trimmed_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
 }
 
 impl Config {
@@ -92,11 +120,23 @@ impl Config {
             guard_package_id: std::env::var("RILL_GUARD_PACKAGE_ID")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            owner_secret: trimmed_env("RILL_OWNER_SECRET"),
+            owner_address: trimmed_env("RILL_OWNER_ADDRESS"),
             skills_store_path: std::env::var("SKILLS_STORE_PATH")
                 .unwrap_or_else(|_| "./data/skills.json".into()),
             oauth_store_path: std::env::var("OAUTH_STORE_PATH")
                 .unwrap_or_else(|_| "./data/oauth.json".into()),
         }
+    }
+
+    /// Whether this deployment can mint a long-lived agent credential at all.
+    ///
+    /// Both halves or neither: without the secret there is nobody to authenticate, and without the
+    /// address there is no subject to mint for. [`Config::boot_check`] refuses a half-configured
+    /// deployment rather than letting the grant answer 400 forever, because an operator reads that
+    /// as a broken server.
+    pub fn issues_agent_credentials(&self) -> bool {
+        self.owner_secret.is_some() && self.owner_address.is_some()
     }
 
     /// The MCP endpoint tokens are audience-bound to — the one URL a user pastes into an agent.
@@ -106,6 +146,44 @@ impl Config {
 
     /// Refuse to start rather than run in a state whose failures are hard to attribute.
     pub fn boot_check(&self) -> Result<(), String> {
+        // The agent-credential settings are checked on every network, not only mainnet: a
+        // half-configured pair or a typo in the address produces a grant that refuses every
+        // request, and the operator has no way to tell that from a bug in the server.
+        match (&self.owner_secret, &self.owner_address) {
+            (Some(secret), Some(address)) => {
+                if secret.chars().count() < MIN_OWNER_SECRET_CHARS {
+                    return Err(format!(
+                        "Refusing to start: RILL_OWNER_SECRET is shorter than \
+                         {MIN_OWNER_SECRET_CHARS} characters. It authenticates the only caller \
+                         allowed to mint a 90-day build credential, so a guessable value hands \
+                         that out. Generate one with `openssl rand -hex 32`."
+                    ));
+                }
+                if address.parse::<sui_sdk_types::Address>().is_err() {
+                    return Err(format!(
+                        "Refusing to start: RILL_OWNER_ADDRESS is \"{address}\", which is not a \
+                         Sui address. Agent credentials are minted for that address and see only \
+                         the actions it published, so a typo produces a credential with an empty \
+                         catalogue and no error to explain it."
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err("Refusing to start: RILL_OWNER_SECRET is set but \
+                            RILL_OWNER_ADDRESS is not. Agent credentials need an owner address to \
+                            act for, and minting would refuse every request. Set both, or \
+                            neither to issue none."
+                    .into())
+            }
+            (None, Some(_)) => {
+                return Err("Refusing to start: RILL_OWNER_ADDRESS is set but \
+                            RILL_OWNER_SECRET is not. Without the secret there is nobody \
+                            authorized to mint an agent credential, so the address would have no \
+                            effect. Set both, or neither to issue none."
+                    .into())
+            }
+            (None, None) => {}
+        }
         if self.network != Network::Mainnet {
             return Ok(());
         }

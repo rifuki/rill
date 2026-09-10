@@ -96,8 +96,15 @@ async fn health(State(state): State<AppState>) -> Response {
             "endpoint": state.config.resource(),
             "auth": "oauth2.1+pkce+dcr",
             // Whether issued tokens survive a restart. An operator can see at a glance whether
-            // this deployment is running on an ephemeral secret.
+            // this deployment is running on an ephemeral secret. It still answers exactly that
+            // question and nothing more: an agent credential additionally needs the file at
+            // OAUTH_STORE_PATH to survive, because its revocation handle lives there, so a
+            // deployment issuing them must mount a volume.
             "tokensDurable": state.config.oauth_secret_from_env,
+            // Whether this deployment can mint the long-lived credential a browserless agent
+            // needs. Reported because the grant is otherwise invisible until someone calls it and
+            // reads the refusal.
+            "agentCredentials": state.config.issues_agent_credentials(),
         },
         "skills": state.skills.count(),
     }))
@@ -123,7 +130,9 @@ async fn authorization_server_metadata(State(state): State<AppState>) -> Respons
         "registration_endpoint": format!("{base}/oauth/register"),
         "revocation_endpoint": format!("{base}/oauth/revoke"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        // The agent-credential grant is named only where it is configured. Advertising a grant this
+        // deployment would refuse is the same failure as advertising an endpoint that 404s.
+        "grant_types_supported": grant_types(&state),
         // S256 only. OAuth 2.1 removes `plain`, which protects nothing against anyone who can
         // observe the authorization request.
         "code_challenge_methods_supported": [rill_auth::oauth::CODE_CHALLENGE_METHOD],
@@ -132,6 +141,15 @@ async fn authorization_server_metadata(State(state): State<AppState>) -> Respons
         "scopes_supported": rill_auth::oauth::SUPPORTED_SCOPES,
         "resource_indicators_supported": true,
     }))
+}
+
+/// The grants this deployment will actually honour.
+fn grant_types(state: &AppState) -> Vec<&'static str> {
+    let mut grants = vec!["authorization_code", "refresh_token"];
+    if state.config.issues_agent_credentials() {
+        grants.push(crate::oauth_routes::AGENT_TOKEN_GRANT);
+    }
+    grants
 }
 
 async fn mcp_get(State(state): State<AppState>) -> Response {

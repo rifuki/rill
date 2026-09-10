@@ -2,7 +2,7 @@
 
 use rill_store::file::{FileOAuthStore, FileSkillStore, MAX_STORED_SKILLS};
 use rill_store::{
-    AuthorizationCode, AuthorizationRequest, OAuthClient, OAuthStore, PublishedSkill,
+    AgentHandle, AuthorizationCode, AuthorizationRequest, OAuthClient, OAuthStore, PublishedSkill,
     RefreshHandle, RequestKind, SkillStore, StoreError,
 };
 
@@ -307,6 +307,148 @@ fn a_studio_request_and_an_agent_request_are_distinguishable() {
         store.get_request("s", NOW).unwrap().kind,
         RequestKind::Studio,
         "a signature collected for a studio login must never be redeemable as an agent's code"
+    );
+}
+
+// ── agent credentials (R8) ──
+//
+// A long-lived credential is only revocable because of these records. The token itself is a signed
+// blob nobody can take back, so a handle that vanishes, or one that a read consumes, is the whole
+// difference between `/oauth/revoke` working and `/oauth/revoke` answering 200 and doing nothing.
+
+fn agent(jti: &str, sub: &str, expires_at: u64) -> AgentHandle {
+    AgentHandle {
+        jti: jti.into(),
+        sub: sub.into(),
+        client_id: "rill-agent-credential".into(),
+        scope: "mcp".into(),
+        resource: "https://api.test/mcp".into(),
+        issued_at: NOW,
+        expires_at,
+    }
+}
+
+/// The property the whole unit turns on: reading the handle must not spend it, because this read
+/// happens on every request the credential makes.
+#[test]
+fn reading_an_agent_handle_does_not_consume_it() {
+    let path = tmp("agents-read.json");
+    let _ = std::fs::remove_file(&path);
+    let store = FileOAuthStore::load(&path, NOW);
+    store
+        .save_agent(agent("a", "0xalice", NOW + 60_000))
+        .unwrap();
+
+    for call in 1..=3 {
+        assert!(
+            store.get_agent("a", NOW).is_some(),
+            "call {call}: a credential that dies on first use is the same bug as no credential"
+        );
+    }
+}
+
+/// The verification R8 demands: a credential issued once keeps working after a restart. The process
+/// holds the handles in memory, so this is the only thing that carries them across one.
+#[test]
+fn an_agent_credential_survives_a_restart() {
+    let path = tmp("agents-restart.json");
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = FileOAuthStore::load(&path, NOW);
+        store
+            .save_agent(agent("live", "0xalice", NOW + 90 * 24 * 60 * 60 * 1000))
+            .unwrap();
+    }
+    let reloaded = FileOAuthStore::load(&path, NOW);
+    assert!(
+        reloaded.get_agent("live", NOW).is_some(),
+        "otherwise every deployed agent stops working on the next deploy, with a 401 and \
+         nothing to explain it"
+    );
+}
+
+#[test]
+fn revoking_an_agent_credential_says_whether_one_actually_died() {
+    let path = tmp("agents-revoke.json");
+    let _ = std::fs::remove_file(&path);
+    let store = FileOAuthStore::load(&path, NOW);
+    store
+        .save_agent(agent("a", "0xalice", NOW + 60_000))
+        .unwrap();
+
+    assert!(store.revoke_agent("a").unwrap(), "a live handle died");
+    assert!(store.get_agent("a", NOW).is_none(), "and stays dead");
+    assert!(
+        !store.revoke_agent("a").unwrap(),
+        "a second revoke reports that nothing was there, even though RFC 7009 makes the \
+         endpoint answer 200 either way"
+    );
+}
+
+/// A revocation has to outlive the process too, or a restart resurrects a credential somebody
+/// already killed.
+#[test]
+fn a_revoked_agent_credential_does_not_come_back_after_a_restart() {
+    let path = tmp("agents-revoke-restart.json");
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = FileOAuthStore::load(&path, NOW);
+        store
+            .save_agent(agent("gone", "0xalice", NOW + 60_000))
+            .unwrap();
+        assert!(store.revoke_agent("gone").unwrap());
+    }
+    let reloaded = FileOAuthStore::load(&path, NOW);
+    assert!(reloaded.get_agent("gone", NOW).is_none());
+}
+
+#[test]
+fn an_expired_agent_handle_is_neither_returned_nor_kept() {
+    let path = tmp("agents-expired.json");
+    let _ = std::fs::remove_file(&path);
+    {
+        let store = FileOAuthStore::load(&path, NOW);
+        store.save_agent(agent("old", "0xalice", NOW - 1)).unwrap();
+        assert!(store.get_agent("old", NOW).is_none(), "past its expiry");
+    }
+    // Pruned on load, so an abandoned credential cannot accumulate in the file forever.
+    let reloaded = FileOAuthStore::load(&path, NOW);
+    assert!(reloaded.get_agent("old", NOW - 10).is_none());
+}
+
+/// "Sign me out everywhere" must include the longest-lived credential, or it is the one call an
+/// operator reaches for in an incident and the one that leaves the leak open.
+#[test]
+fn revoking_a_subject_kills_its_agent_credentials_too() {
+    let path = tmp("agents-subject.json");
+    let _ = std::fs::remove_file(&path);
+    let store = FileOAuthStore::load(&path, NOW);
+    store
+        .save_agent(agent("a1", "0xalice", NOW + 60_000))
+        .unwrap();
+    store
+        .save_agent(agent("b1", "0xbob", NOW + 60_000))
+        .unwrap();
+    store
+        .save_refresh(RefreshHandle {
+            jti: "a2".into(),
+            sub: "0xalice".into(),
+            client_id: "c".into(),
+            scope: "mcp".into(),
+            resource: "r".into(),
+            expires_at: NOW + 60_000,
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.revoke_subject("0xalice").unwrap(),
+        2,
+        "one agent credential and one refresh handle"
+    );
+    assert!(store.get_agent("a1", NOW).is_none());
+    assert!(
+        store.get_agent("b1", NOW).is_some(),
+        "bob's credential is not collateral damage"
     );
 }
 

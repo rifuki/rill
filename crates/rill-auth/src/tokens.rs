@@ -14,6 +14,16 @@
 //! **Audience is signed.** A token minted for one deployment cannot be replayed against another
 //! that happens to share a secret. That is RFC 8707 resource binding, and the MCP authorization
 //! spec requires it.
+//!
+//! # One kind here is deliberately not self-sufficient
+//!
+//! [`TokenKind::Agent`] is the long-lived credential a deployed agent carries in an environment
+//! variable. Everything in this file verifies it exactly as it verifies an access token, and that
+//! is not enough on its own: a signature and an expiry cannot be taken back, so a leaked
+//! 90-day bearer would stay valid for 90 days. The caller must also find a live handle for its
+//! `jti` in the store on **every** request. [`verify_bearer`] says so at the call site, because the
+//! failure it prevents is silent: an operator revokes a credential, reads `{"revoked": true}`, and
+//! the agent keeps building until expiry.
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -30,7 +40,21 @@ const TOKEN_VERSION: &str = "v1";
 pub enum TokenKind {
     Access,
     Refresh,
+    /// The long-lived credential a deployed agent carries in an environment variable, because
+    /// seven of eleven agent frameworks accept only a static bearer and the Claude Agent SDK will
+    /// not open a browser.
+    ///
+    /// Stateful, unlike the other two: the store holds a handle for its `jti`, checked on every
+    /// request, so a revoke stops the next call instead of taking effect at expiry.
+    Agent,
 }
+
+/// The kinds that may be presented as a bearer at a protected resource.
+///
+/// A list rather than a pair of `||` comparisons at each call site: adding a kind must be one edit
+/// here, not a hunt for every endpoint that forgot to include it, and forgetting one the other way
+/// would quietly accept a refresh token as a bearer.
+pub const BEARER_KINDS: &[TokenKind] = &[TokenKind::Access, TokenKind::Agent];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenClaims {
@@ -62,6 +86,10 @@ pub enum TokenError {
         expected: TokenKind,
         found: TokenKind,
     },
+    /// The token is valid and is not a kind that may be presented as a bearer at all.
+    NotABearerToken {
+        found: TokenKind,
+    },
     /// The token was minted for a different resource.
     WrongAudience {
         expected: String,
@@ -81,6 +109,11 @@ impl std::fmt::Display for TokenError {
             Self::WrongKind { expected, found } => write!(
                 f,
                 "expected a {expected:?} token but this is a {found:?} one"
+            ),
+            Self::NotABearerToken { found } => write!(
+                f,
+                "a {found:?} token is not a bearer credential; exchange it at the token endpoint \
+                 for an access token, or ask the owner for an agent credential"
             ),
             Self::WrongAudience { expected, found } => {
                 write!(f, "this token was issued for {found}, not for {expected}")
@@ -145,6 +178,57 @@ pub fn verify_token(
     secret: &str,
     expected: Expectation<'_>,
 ) -> Result<TokenClaims, TokenError> {
+    verify_inner(
+        token,
+        secret,
+        expected.audience,
+        expected.now_secs,
+        |found| {
+            if found == expected.kind {
+                Ok(())
+            } else {
+                Err(TokenError::WrongKind {
+                    expected: expected.kind,
+                    found,
+                })
+            }
+        },
+    )
+}
+
+/// Verify a token presented as a bearer at a protected resource, accepting any of [`BEARER_KINDS`].
+///
+/// # This is half of the check for an agent credential
+///
+/// A [`TokenKind::Agent`] token that passes here is signed, audience-bound and unexpired, and may
+/// still have been revoked. The caller must look its `jti` up in the store and refuse when no live
+/// handle is found. Nothing in this module can do that: it has no store and, deliberately, no I/O.
+pub fn verify_bearer(
+    token: &str,
+    secret: &str,
+    audience: &str,
+    now_secs: u64,
+) -> Result<TokenClaims, TokenError> {
+    verify_inner(token, secret, audience, now_secs, |found| {
+        if BEARER_KINDS.contains(&found) {
+            Ok(())
+        } else {
+            Err(TokenError::NotABearerToken { found })
+        }
+    })
+}
+
+/// Everything both public verifiers share, with the kind decision left to the caller.
+///
+/// One body rather than two, so the signature, audience and expiry checks cannot drift apart, and
+/// `gate` runs in exactly the position the kind check always occupied.
+fn verify_inner(
+    token: &str,
+    secret: &str,
+    audience: &str,
+    now_secs: u64,
+    gate: impl FnOnce(TokenKind) -> Result<(), TokenError>,
+) -> Result<TokenClaims, TokenError> {
     if secret.is_empty() {
         return Err(TokenError::NoSecret);
     }
@@ -178,22 +262,27 @@ pub fn verify_token(
     {
         return Err(TokenError::Malformed);
     }
-    if claims.t != expected.kind {
-        return Err(TokenError::WrongKind {
-            expected: expected.kind,
-            found: claims.t,
-        });
-    }
-    if claims.aud != expected.audience {
+    gate(claims.t)?;
+    if claims.aud != audience {
         return Err(TokenError::WrongAudience {
-            expected: expected.audience.to_owned(),
+            expected: audience.to_owned(),
             found: claims.aud.clone(),
         });
     }
-    if claims.exp <= expected.now_secs {
+    if claims.exp <= now_secs {
         return Err(TokenError::Expired);
     }
     Ok(claims)
+}
+
+/// Compare a presented shared secret against a configured one, without an early exit.
+///
+/// Exposed because the agent-credential grant authenticates the deployment owner with a configured
+/// secret rather than with a token, and a plain `==` there hands the secret to anyone who can time
+/// the endpoint. An empty configured secret matches nothing, so an unconfigured deployment cannot
+/// be authenticated against by sending an empty header.
+pub fn secret_matches(presented: &str, configured: &str) -> bool {
+    !configured.is_empty() && constant_time_eq(presented.as_bytes(), configured.as_bytes())
 }
 
 /// Compare without an early exit. Length is compared first and folded into the result rather than

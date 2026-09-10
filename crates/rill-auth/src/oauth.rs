@@ -145,6 +145,68 @@ pub fn normalize_scope(requested: &str) -> Result<String, OAuthError> {
     Ok(granted.join(" "))
 }
 
+/// The scopes a long-lived agent credential may carry: the build surface, and nothing else.
+///
+/// `offline_access` is not here on purpose. It means "you may mint refresh tokens", and a
+/// credential that already lives for 90 days has no use for rotation; handing it one would create a
+/// second revocable thing an operator has to remember to kill.
+pub const AGENT_TOKEN_SCOPES: &[&str] = &["mcp"];
+
+/// Whether every scope in an already-granted string is inside the build surface.
+///
+/// Checked at the protected resource as well as at issuance. A token is only as narrow as the
+/// narrowest check it passes through, and the mint path is one future edit away from granting
+/// something wider than it meant to.
+pub fn is_build_surface_only(scope: &str) -> bool {
+    let mut any = false;
+    for token in scope.split_whitespace() {
+        if !AGENT_TOKEN_SCOPES.contains(&token) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Narrow a requested scope to what an agent credential is allowed to carry, refusing anything
+/// else by name.
+///
+/// Deliberately not [`normalize_scope`], which drops what it will not grant. Silence is the wrong
+/// answer here: an operator who asked for owner-side access and got a working token back would
+/// believe their deployed agent could raise its own cap, and would only find out when it could
+/// not. A leaked environment variable that can widen its own bound removes the bound the whole
+/// product rests on, so the refusal is the feature.
+pub fn narrow_to_build_surface(requested: &str) -> Result<String, OAuthError> {
+    let mut granted: Vec<&str> = Vec::new();
+    for token in requested.split_whitespace() {
+        if !AGENT_TOKEN_SCOPES.contains(&token) {
+            return Err(OAuthError::not_redirectable(
+                "invalid_scope",
+                format!(
+                    "an agent credential cannot carry \"{token}\": it reaches the build surface \
+                     only, and the scopes it may hold are: {}. Owner-side operations need an \
+                     interactive authorization, because a credential sitting in an environment \
+                     variable must not be able to raise its own limits.",
+                    AGENT_TOKEN_SCOPES.join(", ")
+                ),
+            ));
+        }
+        if !granted.contains(&token) {
+            granted.push(token);
+        }
+    }
+    if granted.is_empty() {
+        return Err(OAuthError::not_redirectable(
+            "invalid_scope",
+            format!(
+                "an agent credential needs a scope; the ones it may hold are: {}",
+                AGENT_TOKEN_SCOPES.join(", ")
+            ),
+        ));
+    }
+    Ok(granted.join(" "))
+}
+
 /// The only PKCE method OAuth 2.1 allows. `plain` offers no protection against anyone who can
 /// observe the authorization request, and is not accepted here at all.
 pub const CODE_CHALLENGE_METHOD: &str = "S256";
