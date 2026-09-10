@@ -28,19 +28,21 @@ use crate::book::BookError;
 use crate::shared::SharedObjects;
 
 /// Build the transaction whose simulation returns a wallet's attached rule types.
+///
+/// `gas_price` is the network's reference price, read by the caller: the node does not price a
+/// read itself, and refuses one priced below the reference before the function runs. See
+/// [`crate::book::mid_price_transaction`] for the run that established this.
 pub fn policy_rules_transaction(
     package_id: Address,
     wallet_id: Address,
     coin_type: &str,
     shared: &SharedObjects,
+    gas_price: u64,
 ) -> Result<sui_sdk_types::Transaction, BookError> {
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
     tx.set_gas_budget(10_000_000);
-    // A literal is correct here and only here: this transaction is never submitted, and its gas
-    // payment is emptied below so the node prices it itself. Reading the reference price for a
-    // read would be a round trip that changes nothing.
-    tx.set_gas_price(1_000);
+    tx.set_gas_price(gas_price);
 
     let wallet = tx.object(
         shared
@@ -217,7 +219,8 @@ mod tests {
             "0xca".parse().unwrap(),
             wallet,
             "0x2::sui::SUI",
-            &shared
+            &shared,
+            1_000
         )
         .is_ok());
     }

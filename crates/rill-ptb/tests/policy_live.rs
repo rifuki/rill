@@ -25,12 +25,18 @@ async fn a_live_wallet_reports_the_rules_it_actually_carries() {
 
     let mut shared = SharedObjects::new();
     shared.insert(WALLET.parse().unwrap(), initial);
+    // Read, as production does: the node refuses a read priced below its reference.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .expect("the node reports its reference gas price");
 
     let tx = policy_rules_transaction(
         PACKAGE.parse().unwrap(),
         WALLET.parse().unwrap(),
         "0x2::sui::SUI",
         &shared,
+        gas_price,
     )
     .expect("build the read");
 

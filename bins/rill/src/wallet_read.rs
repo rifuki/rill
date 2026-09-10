@@ -53,6 +53,14 @@ pub async fn read_limits(
     let mut shared = SharedObjects::new();
     shared.insert(wallet, initial);
 
+    // One more round trip than a read strictly needs, and the alternative is a literal: the node
+    // refuses a read priced below its reference, and the reference is not the same on every
+    // network.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .map_err(|e| format!("reading the reference gas price: {e}"))?;
+
     let tx = policy_rules_transaction(
         package_id
             .parse()
@@ -60,6 +68,7 @@ pub async fn read_limits(
         wallet,
         "0x2::sui::SUI",
         &shared,
+        gas_price,
     )
     .map_err(|e| e.to_string())?;
 

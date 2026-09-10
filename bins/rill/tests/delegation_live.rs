@@ -197,8 +197,16 @@ async fn shared_of(chain: &GrpcSui, ids: &[Address]) -> SharedObjects {
 }
 
 /// The rule modules a wallet carries, read from the chain the way `rill spend` reads them.
+///
+/// The price is read rather than named here for the same reason the command reads it: the node
+/// refuses a read priced below the reference exactly as it refuses a submission, and the reference
+/// differs by an order of magnitude between the two networks.
 async fn rules_of(chain: &GrpcSui, wallet_id: Address, shared: &SharedObjects) -> Vec<String> {
-    let read = policy_rules_transaction(address(PACKAGE), wallet_id, SUI, shared)
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .expect("the node answers with its reference gas price");
+    let read = policy_rules_transaction(address(PACKAGE), wallet_id, SUI, shared, gas_price)
         .expect("the policy read builds");
     let outcome = chain
         .simulate_read(&encode(&read))

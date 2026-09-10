@@ -19,6 +19,14 @@ use crate::{
 /// response small, and makes it obvious at the call site what the caller actually depends on.
 const OBJECT_MASK: &[&str] = &["object_id", "version", "digest", "object_type", "owner"];
 
+/// How many objects one `ListOwnedObjects` round trip asks for.
+///
+/// A round-trip size, never a cap: pages are followed until the node returns no token, so an
+/// address holding more than this yields every object it has. The number used to be a cap by
+/// accident, with the token never read, and an address busy enough to fill a page saw its gas
+/// coins silently cut off at fifty.
+pub const OWNED_OBJECTS_PAGE_SIZE: u32 = 50;
+
 pub struct GrpcSui {
     client: Client,
 }
@@ -36,21 +44,93 @@ impl GrpcSui {
             paths: paths.iter().map(|p| (*p).to_owned()).collect(),
         }
     }
+
+    /// Every object `owner` holds, walked `page_size` at a time.
+    ///
+    /// Public so a test can force a small page and prove the token path against a real node,
+    /// because an address with fewer objects than one page never exercises it and a bug there is
+    /// invisible until an address gets busy. Production goes through the trait, at
+    /// [`OWNED_OBJECTS_PAGE_SIZE`].
+    pub async fn list_owned_objects_paged(
+        &self,
+        owner: &str,
+        page_size: u32,
+    ) -> ChainResult<Vec<ObjectSummary>> {
+        walk_pages(|token| async move {
+            let mut request = ListOwnedObjectsRequest::default();
+            request.owner = Some(owner.to_owned());
+            request.page_size = Some(page_size);
+            request.page_token = token;
+            request.read_mask = Some(GrpcSui::mask(OBJECT_MASK));
+
+            let response = self
+                .client
+                .clone()
+                .state_client()
+                .list_owned_objects(request)
+                .await
+                .map_err(refusal_or_transport)?
+                .into_inner();
+
+            Ok(Page {
+                objects: response.objects.iter().map(to_summary).collect(),
+                next: response.next_page_token,
+            })
+        })
+        .await
+    }
 }
 
-/// A gRPC status from a simulation, sorted into what it means for the caller.
+/// One page of a listing, in this crate's terms.
+struct Page<T> {
+    objects: Vec<ObjectSummary>,
+    next: Option<T>,
+}
+
+/// Follow a listing's page tokens to the end.
 ///
-/// `InvalidArgument` is the node having read the transaction and refused it before execution: an
-/// input object the sender does not own, a gas budget the coin cannot cover, a malformed input.
-/// There are no effects to carry that answer, so it arrives as a status rather than as a failed
-/// outcome, and it is the earliest verdict Sui gives. An owner-signed spend presenting the agent's
-/// `AgentCap` is refused exactly here, before any Move code runs, and reporting that as "could not
-/// reach the node" told whoever read it that the network was down when the object model had just
-/// done its job. Every other code says nothing about the transaction: unreachable, timed out,
-/// broke.
-fn simulation_status(status: tonic::Status) -> ChainError {
+/// Separated from the transport so the walk itself can be tested without a node: the property
+/// that matters is that the token is carried into the next request until the node stops sending
+/// one, and that property does not need gRPC to be checked.
+async fn walk_pages<T, F, Fut>(mut fetch: F) -> ChainResult<Vec<ObjectSummary>>
+where
+    F: FnMut(Option<T>) -> Fut,
+    Fut: std::future::Future<Output = ChainResult<Page<T>>>,
+{
+    let mut all = Vec::new();
+    let mut token = None;
+    loop {
+        let page = fetch(token.take()).await?;
+        let empty = page.objects.is_empty();
+        all.extend(page.objects);
+        match page.next {
+            // A token on an empty page would be a node that never finishes. Stop with what was
+            // read rather than spin; a node that does this is broken in a way no loop can fix.
+            Some(next) if !empty => token = Some(next),
+            _ => return Ok(all),
+        }
+    }
+}
+
+/// What a gRPC status means at this boundary.
+///
+/// `InvalidArgument` and `FailedPrecondition` are answers: the node read the request and refused
+/// it. There are no effects to carry an answer of that kind, so it arrives as a status rather than
+/// as a failed outcome, and it is the earliest verdict Sui gives. Three refusals reach here and
+/// all three are verdicts. A stale gas reference (`Transaction needs to be rebuilt because object
+/// ... is unavailable for consumption`, verbatim from testnet). A price below the reference. And
+/// an owner-signed spend presenting the agent's `AgentCap`, refused while the node checks input
+/// objects, before any Move code runs, which is the object model doing its job and the first of
+/// the two lines this product is built on.
+///
+/// Reporting any of them as "could not reach the node" sends whoever reads it to check a network
+/// that is fine, while the transaction they hold will never work. Everything else is transport:
+/// nothing was learned, and the caller must not treat it as a verdict.
+fn refusal_or_transport(status: tonic::Status) -> ChainError {
     match status.code() {
-        tonic::Code::InvalidArgument => ChainError::Rejected(status.message().to_owned()),
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+            ChainError::Rejected(status.message().to_owned())
+        }
         _ => ChainError::Transport(status.message().to_owned()),
     }
 }
@@ -149,7 +229,7 @@ impl SuiRead for GrpcSui {
             .await
             .map_err(|s| match s.code() {
                 tonic::Code::NotFound => ChainError::NotFound(format!("object {id}")),
-                _ => ChainError::Transport(s.message().to_owned()),
+                _ => refusal_or_transport(s),
             })?
             .into_inner();
 
@@ -161,21 +241,8 @@ impl SuiRead for GrpcSui {
     }
 
     async fn list_owned_objects(&self, owner: &str) -> ChainResult<Vec<ObjectSummary>> {
-        let mut request = ListOwnedObjectsRequest::default();
-        request.owner = Some(owner.to_owned());
-        request.page_size = Some(50);
-        request.read_mask = Some(GrpcSui::mask(OBJECT_MASK));
-
-        let response = self
-            .client
-            .clone()
-            .state_client()
-            .list_owned_objects(request)
+        self.list_owned_objects_paged(owner, OWNED_OBJECTS_PAGE_SIZE)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
-            .into_inner();
-
-        Ok(response.objects.iter().map(to_summary).collect())
     }
 
     async fn get_balance(&self, owner: &str, coin_type: &str) -> ChainResult<u64> {
@@ -190,7 +257,7 @@ impl SuiRead for GrpcSui {
             .state_client()
             .get_balance(request)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         Ok(response
@@ -212,14 +279,14 @@ impl SuiRead for GrpcSui {
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
         // simulation, so a dropped connection can never read as "the transaction would fail" —
         // or, worse, be smoothed into something a caller treats as a checked result. A refusal
-        // before execution IS a verdict, and is told apart from it: see `simulation_status`.
+        // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
         let response = self
             .client
             .clone()
             .execution_client()
             .simulate_transaction(request)
             .await
-            .map_err(simulation_status)?
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         let executed = response.transaction.as_ref();
@@ -272,7 +339,7 @@ impl SuiRead for GrpcSui {
             .ledger_client()
             .get_epoch(request)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         response
@@ -302,14 +369,14 @@ impl SuiRead for GrpcSui {
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
         // simulation, so a dropped connection can never read as "the transaction would fail" —
         // or, worse, be smoothed into something a caller treats as a checked result. A refusal
-        // before execution IS a verdict, and is told apart from it: see `simulation_status`.
+        // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
         let response = self
             .client
             .clone()
             .execution_client()
             .simulate_transaction(request)
             .await
-            .map_err(simulation_status)?
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         let executed = response.transaction.as_ref();
@@ -428,7 +495,7 @@ impl SuiWrite for GrpcSui {
             .ledger_client()
             .get_transaction(request)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         let executed = response.transaction.as_ref();
@@ -462,8 +529,139 @@ fn decode_transaction(b64: &str) -> ChainResult<sui_rpc::proto::sui::rpc::v2::Tr
 }
 
 #[cfg(test)]
-mod status_tests {
+mod tests {
     use super::*;
+    use crate::ObjectRef;
+
+    fn object(n: usize) -> ObjectSummary {
+        ObjectSummary {
+            reference: ObjectRef {
+                id: format!("0x{n:064x}"),
+                version: 1,
+                digest: String::new(),
+            },
+            object_type: None,
+            fields: None,
+            shared_initial_version: None,
+        }
+    }
+
+    /// A node holding `total` objects that hands out `page_size` per request and a token for the
+    /// rest. The token is the index of the next object, which is all a token is.
+    fn node(total: usize, page_size: usize) -> impl FnMut(Option<usize>) -> PageFuture {
+        move |token| {
+            let start = token.unwrap_or(0);
+            let end = (start + page_size).min(total);
+            let objects = (start..end).map(object).collect();
+            let next = (end < total).then_some(end);
+            Box::pin(async move { Ok(Page { objects, next }) })
+        }
+    }
+
+    type PageFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = ChainResult<Page<usize>>>>>;
+
+    /// The bug this guards: fifty-one objects on a fifty-object page, and the fifty-first is the
+    /// gas coin.
+    #[tokio::test]
+    async fn every_page_is_followed_until_the_node_stops_sending_a_token() {
+        let all = walk_pages(node(123, 50)).await.expect("walk");
+        assert_eq!(all.len(), 123, "three pages, the last one short");
+        let ids: Vec<&str> = all.iter().map(|o| o.reference.id.as_str()).collect();
+        assert_eq!(ids[0], object(0).reference.id, "order is the node's order");
+        assert_eq!(ids[122], object(122).reference.id);
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            123,
+            "no object is read twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_short_page_needs_no_second_request() {
+        let mut requests = 0;
+        let mut fetch = node(7, 50);
+        let all = walk_pages(|token| {
+            requests += 1;
+            fetch(token)
+        })
+        .await
+        .expect("walk");
+        assert_eq!(all.len(), 7);
+        assert_eq!(requests, 1);
+    }
+
+    /// A node that keeps sending a token with nothing behind it would otherwise be followed
+    /// forever.
+    #[tokio::test]
+    async fn an_empty_page_that_still_carries_a_token_ends_the_walk() {
+        let mut requests = 0;
+        let all = walk_pages(|_token: Option<usize>| {
+            requests += 1;
+            Box::pin(async {
+                Ok(Page {
+                    objects: Vec::new(),
+                    next: Some(1usize),
+                })
+            }) as PageFuture
+        })
+        .await
+        .expect("walk");
+        assert!(all.is_empty());
+        assert_eq!(requests, 1, "stopped rather than spun");
+    }
+
+    /// A failure on the third page must not come back as the first two pages' worth of objects,
+    /// because a caller would read that as the whole set.
+    #[tokio::test]
+    async fn a_transport_failure_mid_walk_is_an_error_not_a_partial_set() {
+        let mut requests = 0;
+        let result = walk_pages(|token: Option<usize>| {
+            requests += 1;
+            let page = token.unwrap_or(0);
+            Box::pin(async move {
+                if page >= 2 {
+                    Err(ChainError::Transport("dropped".into()))
+                } else {
+                    Ok(Page {
+                        objects: vec![object(page)],
+                        next: Some(page + 1),
+                    })
+                }
+            }) as PageFuture
+        })
+        .await;
+        assert_eq!(result, Err(ChainError::Transport("dropped".into())));
+        assert_eq!(requests, 3);
+    }
+
+    /// The node's own words for a stale gas coin, and what this boundary makes of them.
+    #[test]
+    fn a_refused_input_is_a_rejection_and_a_dropped_connection_is_transport() {
+        let stale = tonic::Status::invalid_argument(
+            "Error checking transaction input objects: Transaction needs to be rebuilt because \
+             object 0xe863 version 0x3bb012c3 (8GLu) is unavailable for consumption, current \
+             version: 0x3bb012c4",
+        );
+        assert!(matches!(
+            refusal_or_transport(stale),
+            ChainError::Rejected(m) if m.contains("unavailable for consumption")
+        ));
+        assert!(matches!(
+            refusal_or_transport(tonic::Status::invalid_argument(
+                "Gas price 999 under reference gas price (RGP) 1000"
+            )),
+            ChainError::Rejected(_)
+        ));
+        assert!(matches!(
+            refusal_or_transport(tonic::Status::unavailable("connection reset")),
+            ChainError::Transport(_)
+        ));
+        assert!(matches!(
+            refusal_or_transport(tonic::Status::deadline_exceeded("timed out")),
+            ChainError::Transport(_)
+        ));
+    }
 
     /// The text a testnet node returned for an owner-signed spend presenting the agent's cap, with
     /// `InvalidArgument`. It is the earliest refusal Sui gives, and it is a refusal.
@@ -474,7 +672,7 @@ mod status_tests {
     #[test]
     fn a_refusal_before_execution_is_a_verdict_not_an_outage() {
         assert_eq!(
-            simulation_status(tonic::Status::invalid_argument(OWNERSHIP)),
+            refusal_or_transport(tonic::Status::invalid_argument(OWNERSHIP)),
             ChainError::Rejected(OWNERSHIP.to_owned()),
             "the node read the transaction and said no; that is an answer"
         );
@@ -490,7 +688,7 @@ mod status_tests {
             tonic::Status::internal("node error"),
         ] {
             assert!(
-                matches!(simulation_status(status), ChainError::Transport(_)),
+                matches!(refusal_or_transport(status), ChainError::Transport(_)),
                 "only a refusal the node actually made may be reported as one"
             );
         }

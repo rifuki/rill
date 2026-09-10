@@ -410,7 +410,17 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(Ok(pair)) => pair,
         Ok(Err(reason)) | Err(reason) => {
             context.last_rejection = Some(reason.clone());
-            return tool_error(id, "chain_unavailable", &reason);
+            // A node that answered "this object moved" was reached. Calling that unavailable
+            // sends an agent to retry against a network that is fine, holding an envelope that
+            // will never work; what it needs is a fresh build.
+            return match rill_chain::stale::classify_stale_object(&reason) {
+                Some(stale) => tool_error(
+                    id,
+                    "object_changed",
+                    &format!("{stale}. Build the action again so every object is read afresh."),
+                ),
+                None => tool_error(id, "chain_unavailable", &reason),
+            };
         }
     };
     let (chain, simulated) = simulated;
@@ -799,9 +809,13 @@ mod execution_tests {
     ///
     /// The assertion is on WHICH step failed, not that nothing did. Every local check — freshness,
     /// network, identity, ceilings, the byte pin, the decoded target sequence and object scope —
-    /// happens before a node is contacted, so a failure code of `chain_unavailable` proves all of
-    /// them passed. A test that only asserted `isError == true` would pass just as happily if the
-    /// envelope had been rejected on its first field.
+    /// happens before a node is contacted, so a failure code from the chain step proves all of
+    /// them passed. Two codes come from that step and nothing earlier: with a node reachable it
+    /// answers that the fixture's objects do not exist, which is `object_changed`; without one it
+    /// is `chain_unavailable`. (The first used to be reported as the second, because a definite
+    /// refusal from the node was mapped as a transport failure.) A test that only asserted
+    /// `isError == true` would pass just as happily if the envelope had been rejected on its
+    /// first field.
     #[test]
     fn a_good_envelope_passes_every_local_check_and_reaches_the_chain() {
         let mut ctx = context_with_run_set();
@@ -809,8 +823,8 @@ mod execution_tests {
         let code = out["result"]["structuredContent"]["code"]
             .as_str()
             .unwrap_or("(none)");
-        assert_eq!(
-            code, "chain_unavailable",
+        assert!(
+            matches!(code, "chain_unavailable" | "object_changed"),
             "a good envelope must get past every local check; it stopped at {code}: {out}"
         );
     }

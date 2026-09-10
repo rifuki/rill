@@ -147,6 +147,9 @@ pub type ChainResult<T> = Result<T, ChainError>;
 #[allow(async_fn_in_trait)]
 pub trait SuiRead {
     async fn get_object(&self, id: &str) -> ChainResult<ObjectSummary>;
+    /// Every object `owner` holds. The whole set, not the first page of it: a caller picking gas
+    /// coins out of this list cannot tell a short list from a truncated one, so the truncation
+    /// must never happen here.
     async fn list_owned_objects(&self, owner: &str) -> ChainResult<Vec<ObjectSummary>>;
     async fn get_balance(&self, owner: &str, coin_type: &str) -> ChainResult<u64>;
     /// Evaluate an unsigned transaction. Takes base64 BCS so this trait stays independent of the
@@ -467,6 +470,184 @@ pub mod aborts {
                 ),
                 None,
                 "an abort in someone else's module is not this wallet's policy"
+            );
+        }
+    }
+}
+
+/// An object reference the node would not accept because the object has moved on.
+///
+/// # The node does not repair it, so it has to be named
+///
+/// Gas coins are read, then a transaction is built, simulated, signed and submitted. Anything
+/// that touches a coin in between leaves the transaction naming a version that no longer exists,
+/// and the node refuses it before execution. Two things were checked against testnet before this
+/// module was written, because either would have made it unnecessary:
+///
+/// - `do_gas_selection` on the simulation request does **not** repair a stale reference. With
+///   it on or off, the node answers the same `InvalidArgument`.
+/// - It does not correct a price either: a price below the reference is refused with
+///   `Gas price 999 under reference gas price (RGP) 1000`, and a price above it is echoed back.
+///
+/// So the fix is to read again, and the refusal has to say so. The verbatim text, from a testnet
+/// node: `Error checking transaction input objects: Transaction needs to be rebuilt because
+/// object 0xe863...e06e version 0x3bb012c3 (8GLu...1x2) is unavailable for consumption, current
+/// version: 0x3bb012c4`. Left as it is, that reads like a bug in the builder. It is not: it is
+/// the node saying "read this object again", and this module turns it into those words.
+pub mod stale {
+    /// Why an object reference was refused.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Staleness {
+        /// The object exists at a newer version than the transaction named.
+        VersionMoved {
+            named: Option<u64>,
+            current: Option<u64>,
+        },
+        /// The node could not find the object at all: consumed, merged away, or deleted.
+        Gone,
+    }
+
+    /// One object the node would not take as an input.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StaleObject {
+        pub id: String,
+        pub staleness: Staleness,
+    }
+
+    impl std::fmt::Display for StaleObject {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match &self.staleness {
+                Staleness::VersionMoved {
+                    named: Some(named),
+                    current: Some(current),
+                } => write!(
+                    f,
+                    "object {} changed since it was read: the transaction names version {named} \
+                     and the chain is at version {current}, so another transaction spent or \
+                     touched it in between",
+                    self.id
+                ),
+                Staleness::VersionMoved { .. } => write!(
+                    f,
+                    "object {} changed since it was read: the transaction names a version the \
+                     chain has moved past, so another transaction spent or touched it in between",
+                    self.id
+                ),
+                Staleness::Gone => write!(
+                    f,
+                    "object {} could not be found at any version the node knows: it was consumed \
+                     since it was read (a gas coin merged into another, an object deleted), or it \
+                     never existed on this network",
+                    self.id
+                ),
+            }
+        }
+    }
+
+    /// Recognise a stale-reference refusal in a node's error text.
+    ///
+    /// Returns `None` for anything else, so a caller never dresses an unrelated refusal up as
+    /// "read it again".
+    pub fn classify_stale_object(error: &str) -> Option<StaleObject> {
+        if let Some(after) = error.split_once("because object ").map(|(_, tail)| tail) {
+            if error.contains("unavailable for consumption") {
+                let (id, rest) = after.split_once(' ')?;
+                let named = rest
+                    .strip_prefix("version ")
+                    .and_then(|r| r.split_whitespace().next())
+                    .and_then(parse_version);
+                let current = error
+                    .rsplit_once("current version: ")
+                    .and_then(|(_, tail)| tail.split_whitespace().next())
+                    .and_then(parse_version);
+                return Some(StaleObject {
+                    id: id.to_owned(),
+                    staleness: Staleness::VersionMoved { named, current },
+                });
+            }
+        }
+        if let Some(after) = error
+            .split_once("Could not find the referenced object ")
+            .map(|(_, tail)| tail)
+        {
+            let id = after.split_whitespace().next()?;
+            return Some(StaleObject {
+                id: id.to_owned(),
+                staleness: Staleness::Gone,
+            });
+        }
+        None
+    }
+
+    /// The node prints versions in hex (`0x3bb012c3`); a person expects decimal.
+    fn parse_version(text: &str) -> Option<u64> {
+        let cleaned = text.trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+        match cleaned.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16).ok(),
+            None => cleaned.parse().ok(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Verbatim from a testnet node, answering a simulation whose gas coin was one version
+        /// behind. The same text came back with `do_gas_selection` on and off.
+        const MOVED: &str = "Error checking transaction input objects: Transaction needs to be \
+             rebuilt because object \
+             0xe863baa3e00fceb19cfc1752118a61670f1a531fee3e42a10959e02bb317e06e version \
+             0x3bb012c3 (8GLuzu8jr6WZZ45bwnGbA8euwEHabLtHgUR516uZ1x2) is unavailable for \
+             consumption, current version: 0x3bb012c4";
+
+        #[test]
+        fn a_moved_version_is_named_with_both_versions_in_decimal() {
+            let stale = classify_stale_object(MOVED).expect("this is a stale reference");
+            assert_eq!(
+                stale.id,
+                "0xe863baa3e00fceb19cfc1752118a61670f1a531fee3e42a10959e02bb317e06e"
+            );
+            assert_eq!(
+                stale.staleness,
+                Staleness::VersionMoved {
+                    named: Some(0x3bb0_12c3),
+                    current: Some(0x3bb0_12c4),
+                }
+            );
+            let text = stale.to_string();
+            assert!(text.contains("1001394883"), "{text}");
+            assert!(text.contains("1001394884"), "{text}");
+            assert!(text.contains("changed since it was read"), "{text}");
+        }
+
+        #[test]
+        fn a_missing_object_is_named_as_gone() {
+            let stale =
+                classify_stale_object("Could not find the referenced object 0x20 at version None")
+                    .expect("a missing input is stale too");
+            assert_eq!(stale.id, "0x20");
+            assert_eq!(stale.staleness, Staleness::Gone);
+            assert!(stale.to_string().contains("could not be found"));
+        }
+
+        /// A rule abort, a gas shortfall, or a price below the reference is not "read it again",
+        /// and telling someone to re-run would send them in a loop.
+        #[test]
+        fn an_unrelated_refusal_is_not_dressed_up_as_stale() {
+            assert_eq!(classify_stale_object("InsufficientGas"), None);
+            assert_eq!(
+                classify_stale_object(
+                    "Error checking transaction input objects: Gas price 999 under reference \
+                     gas price (RGP) 1000"
+                ),
+                None
+            );
+            assert_eq!(
+                classify_stale_object(
+                    "MoveAbort(MoveLocation { module: ModuleId { name: Identifier(\"per_tx\") } \
+                     }, 1) in command 2"
+                ),
+                None
             );
         }
     }

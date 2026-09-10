@@ -19,6 +19,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
+use crate::verdict::{no_verdict, submit_failed};
 
 /// Fully-expanded SUI, the way the chain writes it in an object type.
 const SUI_COIN_TYPE: &str =
@@ -86,7 +87,7 @@ pub async fn create(
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
     // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
-    // on one network is ten times the price on the other — and a price below the reference is
+    // on one network is ten times the price on the other, and a price below the reference is
     // rejected outright rather than merely running slow.
     tx.set_gas_price(
         chain
@@ -140,10 +141,7 @@ pub async fn create(
     println!("rules   : {}", describe(&args.manifest));
 
     // The gate. Nothing below runs unless the chain has already agreed this would execute.
-    let outcome = chain
-        .simulate(&b64)
-        .await
-        .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
+    let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
     println!(
         "\nsimulation: ok={} verification={:?} gas={}",
         outcome.ok, outcome.verification, outcome.gas_used_mist
@@ -165,7 +163,7 @@ pub async fn create(
     let outcome = chain
         .execute(&b64, &[signature.to_base64()])
         .await
-        .map_err(|e| format!("submitting: {e}"))?;
+        .map_err(submit_failed)?;
 
     println!("\ndigest  : {}", outcome.digest);
     println!("success : {}", outcome.success);

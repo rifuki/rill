@@ -41,12 +41,19 @@ async fn read_mid_price(endpoint: &str, package: &str, network: DeepBookNetwork,
 
     let chain = GrpcSui::new(endpoint).expect("connect");
     let shared = resolve_shared(&chain, pool.pool_id).await;
+    // Read, as production does: the node refuses a read priced below its reference.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .expect("the node reports its reference gas price");
+    println!("reference gas price: {gas_price}");
 
     let tx = mid_price_transaction(
         package.parse().unwrap(),
         &pool,
         "0x6".parse().unwrap(),
         &shared,
+        gas_price,
     )
     .expect("build the read");
 

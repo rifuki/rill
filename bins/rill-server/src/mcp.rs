@@ -343,7 +343,6 @@ async fn build_action(
         state.config.network.into(),
         deepbook_package_id,
         DEFAULT_GAS_BUDGET,
-        DEFAULT_GAS_PRICE,
     ) {
         Ok(r) => r,
         Err(e) => return tool_error(id, "invalid_arguments", &e.to_string()),
@@ -365,5 +364,8 @@ async fn build_action(
 
 /// Deliberately generous; the signer enforces its own ceiling and refuses anything above it, so
 /// the binding limit is the one held by whoever owns the key rather than one chosen here.
+///
+/// A budget and not a price. The price is read from the chain by the build itself: it differs by
+/// network, and the literal that used to sit beside this one was testnet's, which is ten times
+/// mainnet's.
 const DEFAULT_GAS_BUDGET: u64 = 50_000_000;
-const DEFAULT_GAS_PRICE: u64 = 1_000;

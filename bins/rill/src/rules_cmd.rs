@@ -13,6 +13,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
+use crate::verdict::{no_verdict, submit_failed};
 
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
@@ -67,6 +68,15 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
         return Err(format!("{sender} holds no SUI to pay for this"));
     }
 
+    // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
+    // on one network is ten times the price on the other, and a price below the reference is
+    // rejected outright rather than merely running slow. Read once and used twice: the node
+    // refuses a read priced below the reference exactly as it refuses a submission.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .map_err(|e| format!("reading the reference gas price: {e}"))?;
+
     // What the wallet actually carries. Attaching is not idempotent — add_rule aborts
     // E_RULE_ALREADY_SET — so this must be a reconciliation against the live set, not an attach.
     let read_tx = policy_rules_transaction(
@@ -76,6 +86,7 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
         wallet_id,
         "0x2::sui::SUI",
         &shared,
+        gas_price,
     )
     .map_err(|e| e.to_string())?;
     let read_b64 = {
@@ -102,15 +113,7 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
-    // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
-    // on one network is ten times the price on the other — and a price below the reference is
-    // rejected outright rather than merely running slow.
-    tx.set_gas_price(
-        chain
-            .reference_gas_price()
-            .await
-            .map_err(|e| format!("reading the reference gas price: {e}"))?,
-    );
+    tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(
             c.reference.id.parse().expect("an id from the chain"),
@@ -159,10 +162,7 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    let outcome = chain
-        .simulate(&b64)
-        .await
-        .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
+    let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
     println!(
         "\nsimulation: ok={} verification={:?} gas={}",
         outcome.ok, outcome.verification, outcome.gas_used_mist
@@ -183,7 +183,7 @@ pub async fn attach(endpoint: &str, keystore: &Keystore, args: &RulesArgs) -> Re
     let outcome = chain
         .execute(&b64, &[signature.to_base64()])
         .await
-        .map_err(|e| format!("submitting: {e}"))?;
+        .map_err(submit_failed)?;
 
     println!("\ndigest  : {}", outcome.digest);
     println!("success : {}", outcome.success);

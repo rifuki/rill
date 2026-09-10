@@ -23,6 +23,10 @@ pub enum SimulationBehavior {
     Succeeds { gas_used_mist: u64 },
     /// Fails with this error, classified the way the real classifier would classify it.
     Fails { error: String },
+    /// The node read the transaction and refused to run it: a gas coin at a version that has
+    /// moved, a price below the reference. Distinct from `Fails`, where it ran and did not
+    /// succeed, and from `Unreachable`, where nothing was learned.
+    Rejected { message: String },
     /// The node could not be reached. Distinct from a failure — a caller must not read this as a
     /// verdict about the transaction.
     Unreachable,
@@ -45,7 +49,8 @@ struct State {
     next_digest: usize,
     /// What `simulate_read` hands back, command by command.
     read_returns: Vec<Vec<Vec<u8>>>,
-    reference_gas_price: u64,
+    /// What the fake network answers when asked its price, or why it cannot.
+    reference_gas_price: ChainResult<u64>,
 }
 
 impl Default for State {
@@ -58,8 +63,9 @@ impl Default for State {
             executions: Vec::new(),
             next_digest: 0,
             read_returns: Vec::new(),
-            // Testnet's, at the time of writing. Real, and different from mainnet's 100.
-            reference_gas_price: 1_000,
+            // Testnet's, at the time of writing. Real, and different from mainnet's 100. This is
+            // the network's answer, which a caller reads; it is not a price a caller assumed.
+            reference_gas_price: Ok(1_000),
         }
     }
 }
@@ -104,6 +110,20 @@ impl FakeSui {
 
     pub fn with_simulation(self, behavior: SimulationBehavior) -> Self {
         self.state.borrow_mut().simulation = behavior;
+        self
+    }
+
+    /// Make the fake network answer a different price. A test that builds against a value the
+    /// default does not use is the one that proves the price was read rather than remembered.
+    pub fn with_reference_gas_price(self, price: u64) -> Self {
+        self.state.borrow_mut().reference_gas_price = Ok(price);
+        self
+    }
+
+    /// Make the price unreadable, so a build path can be shown to refuse rather than guess.
+    pub fn with_reference_gas_price_unavailable(self) -> Self {
+        self.state.borrow_mut().reference_gas_price =
+            Err(ChainError::Transport("fake node is unreachable".into()));
         self
     }
 
@@ -166,19 +186,21 @@ impl SuiRead for FakeSui {
                 command_output_count: 0,
                 command_returns: Vec::new(),
             }),
+            SimulationBehavior::Rejected { message } => Err(ChainError::Rejected(message)),
             SimulationBehavior::Unreachable => {
                 Err(ChainError::Transport("fake node is unreachable".into()))
             }
         }
     }
 
-    /// A read returns whatever `command_returns` was staged with, so a caller reading a price can
-    /// be tested without a node.
-    /// Testnet's value, so a test that forgets to stage one is not silently building at mainnet's.
+    /// Testnet's value unless a test staged another, so a test that forgets is not silently
+    /// building at mainnet's.
     async fn reference_gas_price(&self) -> ChainResult<u64> {
-        Ok(self.state.borrow().reference_gas_price)
+        self.state.borrow().reference_gas_price.clone()
     }
 
+    /// A read returns whatever `command_returns` was staged with, so a caller reading a price can
+    /// be tested without a node.
     async fn simulate_read(&self, _unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
         let returns = self.state.borrow().read_returns.clone();
         Ok(SimulationOutcome {

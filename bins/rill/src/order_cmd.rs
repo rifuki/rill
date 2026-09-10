@@ -16,6 +16,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
+use crate::verdict::{no_verdict, submit_failed};
 
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
@@ -61,11 +62,16 @@ async fn owned_input(chain: &GrpcSui, id: &str, label: &str) -> Result<ObjectInp
 }
 
 /// Ask the pool for its tick, lot and minimum.
+///
+/// `gas_price` is the reference price the command already read for its own transaction. A read
+/// needs it too: the node refuses one priced below the reference before the function runs, and
+/// does not price the read itself.
 async fn read_book_params(
     chain: &GrpcSui,
     deepbook_package: &str,
     pool: &rill_ptb::deepbook::PoolSpec,
     shared: &SharedObjects,
+    gas_price: u64,
 ) -> Result<BookParams, String> {
     use sui_sdk_types::Identifier;
     use sui_transaction_builder::Function;
@@ -73,7 +79,7 @@ async fn read_book_params(
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
     tx.set_gas_budget(10_000_000);
-    tx.set_gas_price(1_000);
+    tx.set_gas_price(gas_price);
     let pool_arg = tx.object(
         shared
             .input(pool.pool_id, false)
@@ -179,12 +185,20 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
             .ok_or("the pool is not shared")?,
     );
 
+    // Read, not assumed: testnet answers 1000 and mainnet answers 100, and a price below the
+    // reference is refused outright. Read once, used by both reads and by the transaction.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .map_err(|e| format!("reading the reference gas price: {e}"))?;
+
     // The prove list, read from the wallet rather than assumed.
     let read_tx = policy_rules_transaction(
         args.package_id.parse().map_err(|_| "bad package id")?,
         wallet_id,
         "0x2::sui::SUI",
         &shared,
+        gas_price,
     )
     .map_err(|e| e.to_string())?;
     let read_b64 = {
@@ -222,12 +236,7 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
-    tx.set_gas_price(
-        chain
-            .reference_gas_price()
-            .await
-            .map_err(|e| format!("reading the reference gas price: {e}"))?,
-    );
+    tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(
             c.reference.id.parse().expect("an id from the chain"),
@@ -257,7 +266,8 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
     // What the pool will accept, read from the pool. Checked before anything is built: a miss
     // aborts in order_info::validate_inputs with a bare code that names neither the number that was
     // wrong nor the one it should have been.
-    let params = read_book_params(&chain, &args.deepbook_package, &pool, &shared).await?;
+    let params =
+        read_book_params(&chain, &args.deepbook_package, &pool, &shared, gas_price).await?;
     let price_scaled = rill_core::amounts::deepbook_price_to_base_units(
         &args.price,
         FLOAT_SCALAR,
@@ -318,10 +328,7 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    let outcome = chain
-        .simulate(&b64)
-        .await
-        .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
+    let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
     println!(
         "\nsimulation: ok={} verification={:?} gas={}",
         outcome.ok, outcome.verification, outcome.gas_used_mist
@@ -347,7 +354,7 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
     let outcome = chain
         .execute(&b64, &[signature.to_base64()])
         .await
-        .map_err(|e| format!("submitting: {e}"))?;
+        .map_err(submit_failed)?;
     if let Some(error) = &outcome.error {
         return Err(format!("the transaction failed on chain: {error}"));
     }

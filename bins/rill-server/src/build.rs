@@ -57,7 +57,9 @@ pub struct BuildRequest {
     pub pay_with_deep: bool,
     pub spend_base_units: u64,
     pub gas_budget: u64,
-    pub gas_price: u64,
+    /// There is deliberately no gas price here. A price supplied by a caller is a price somebody
+    /// assumed; the build reads the network's reference price itself, per build, from the chain
+    /// the transaction is going to.
     pub gas_objects: Vec<ObjectInput>,
 }
 
@@ -132,6 +134,20 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
         Err(refusal) => return refusal,
     };
 
+    // Read, per build, from the chain this transaction is going to. Testnet answers 1000 and
+    // mainnet answers 100, and a transaction priced below the reference is refused before it runs.
+    // A node that cannot say is a refusal, not a fallback: the one number that would be guessed
+    // here is exactly the one that differs by network.
+    let gas_price = match chain.reference_gas_price().await {
+        Ok(price) => price,
+        Err(e) => {
+            return BuildOutcome::refuse(
+                "chain_unavailable",
+                format!("could not read the reference gas price, so nothing can be priced: {e}"),
+            )
+        }
+    };
+
     let binding = WalletBinding {
         package_id: request.wallet_package_id,
         wallet_id: request.wallet_id,
@@ -144,7 +160,7 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
     let mut tx = TransactionBuilder::new();
     tx.set_sender(request.sender);
     tx.set_gas_budget(request.gas_budget);
-    tx.set_gas_price(request.gas_price);
+    tx.set_gas_price(gas_price);
     tx.add_gas_objects(request.gas_objects.clone());
 
     // Funding first: request_spend, one prove per attached rule, confirm_spend. The released coin
@@ -193,6 +209,20 @@ pub async fn build(request: &BuildRequest, chain: &impl SuiRead, now_ms: u64) ->
                 "simulation_unavailable",
                 format!("could not reach a fullnode to simulate: {m}"),
             )
+        }
+        // An input the node would not take because it has moved on since the caller read it.
+        // Named, because the node's own words for it read like a builder bug, and the fix is a
+        // fresh read rather than a different transaction.
+        Err(ChainError::Rejected(m)) => {
+            return match rill_chain::stale::classify_stale_object(&m) {
+                Some(stale) => BuildOutcome::refuse(
+                    "object_changed",
+                    format!("{stale}; read it again and build again"),
+                ),
+                None => {
+                    BuildOutcome::refuse("simulation_failed", ChainError::Rejected(m).to_string())
+                }
+            }
         }
         Err(e) => return BuildOutcome::refuse("simulation_failed", e.to_string()),
     };

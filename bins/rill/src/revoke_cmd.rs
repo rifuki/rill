@@ -15,6 +15,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
+use crate::verdict::{no_verdict, submit_failed};
 
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
@@ -104,10 +105,7 @@ pub async fn revoke(endpoint: &str, keystore: &Keystore, args: &RevokeArgs) -> R
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    let outcome = chain
-        .simulate(&b64)
-        .await
-        .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
+    let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
     println!(
         "\nsimulation: ok={} gas={}",
         outcome.ok, outcome.gas_used_mist
@@ -128,7 +126,7 @@ pub async fn revoke(endpoint: &str, keystore: &Keystore, args: &RevokeArgs) -> R
     let outcome = chain
         .execute(&b64, &[signature.to_base64()])
         .await
-        .map_err(|e| format!("submitting: {e}"))?;
+        .map_err(submit_failed)?;
     if let Some(error) = &outcome.error {
         return Err(format!("the transaction failed on chain: {error}"));
     }

@@ -84,9 +84,82 @@ fn request() -> rill_server::build::BuildRequest {
         pay_with_deep: false,
         spend_base_units: 1_000_000_000,
         gas_budget: 50_000_000,
-        gas_price: 1_000,
         gas_objects: vec![gas_object(addr(0x0a), 1, Digest::ZERO)],
     }
+}
+
+/// The transaction an envelope carries, decoded from the bytes a signer would sign.
+fn transaction_in(envelope: &rill_core::envelope::ExecutionEnvelope) -> sui_sdk_types::Transaction {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&envelope.unsigned_ptb)
+        .expect("an envelope carries base64");
+    bcs::from_bytes(&bytes).expect("and the base64 is a BCS Transaction")
+}
+
+/// Gas that is read, not assumed. The fake answers a price nothing else in this file uses, so a
+/// build that remembered testnet's 1000 instead of asking would put the wrong number in the bytes.
+#[tokio::test]
+async fn the_price_in_the_built_transaction_is_the_one_the_chain_reported() {
+    let chain = chain_with_shared_objects().with_reference_gas_price(123_456);
+    let BuildOutcome::Built(envelope) = build(&request(), &chain, NOW).await else {
+        panic!("this build should succeed");
+    };
+    assert_eq!(
+        transaction_in(&envelope).gas_payment.price,
+        123_456,
+        "the price on the wire must be the one the chain reported, not one assumed here"
+    );
+}
+
+/// The price differs by network, so the one number that must never be guessed is this one. A node
+/// that cannot report it produces a refusal that says so, never an envelope priced by a fallback.
+#[tokio::test]
+async fn an_unreadable_reference_price_is_a_named_refusal_not_a_guess() {
+    let chain = chain_with_shared_objects().with_reference_gas_price_unavailable();
+    let BuildOutcome::Refused { code, reason } = build(&request(), &chain, NOW).await else {
+        panic!("a build that could not read the price must not produce an envelope");
+    };
+    assert_eq!(code, "chain_unavailable");
+    assert!(
+        reason.contains("reference gas price"),
+        "the refusal must say what could not be read: {reason}"
+    );
+}
+
+/// A gas coin the caller read before something else spent it. The node's own words for this read
+/// like a builder bug; the refusal names the object and says to read again.
+#[tokio::test]
+async fn a_gas_object_that_moved_since_it_was_read_is_refused_by_name() {
+    let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Rejected {
+        message: format!(
+            "Error checking transaction input objects: Transaction needs to be rebuilt because \
+             object {} version 0x3bb012c3 (8GLuzu8jr6WZZ45bwnGbA8euwEHabLtHgUR516uZ1x2) is \
+             unavailable for consumption, current version: 0x3bb012c4",
+            addr(0x0a)
+        ),
+    });
+    let BuildOutcome::Refused { code, reason } = build(&request(), &chain, NOW).await else {
+        panic!("a stale input must not produce an envelope");
+    };
+    assert_eq!(code, "object_changed");
+    assert!(
+        reason.contains(&addr(0x0a).to_string()) && reason.contains("read it again"),
+        "the refusal must name the object and the remedy: {reason}"
+    );
+}
+
+/// Any other refusal the node makes before running keeps its own words under the general code.
+#[tokio::test]
+async fn a_refusal_that_is_not_staleness_is_not_dressed_up_as_one() {
+    let chain = chain_with_shared_objects().with_simulation(SimulationBehavior::Rejected {
+        message: "Gas price 999 under reference gas price (RGP) 1000".into(),
+    });
+    let BuildOutcome::Refused { code, reason } = build(&request(), &chain, NOW).await else {
+        panic!("should refuse");
+    };
+    assert_eq!(code, "simulation_failed");
+    assert!(reason.contains("RGP"), "{reason}");
 }
 
 #[tokio::test]

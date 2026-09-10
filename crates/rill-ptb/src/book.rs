@@ -118,20 +118,30 @@ pub const PLACEHOLDER_GAS_OBJECT: &str =
 ///
 /// Nothing here needs a sender with funds — it is never submitted. A zero sender is used so the
 /// call cannot be mistaken for something meant to execute.
+///
+/// # The price is a parameter, even for a read
+///
+/// An earlier version set a literal here on the reasoning that a read is never submitted and the
+/// node prices it itself. Checked against testnet, the second half is false: with gas selection
+/// on, the node fills the empty payment but leaves the price exactly as sent, and a price below
+/// the reference is refused before the function runs (`Gas price 999 under reference gas price
+/// (RGP) 1000`). So a read priced by a literal fails on any network whose reference is above it,
+/// which mainnet's may one day be and testnet's already once was. The caller reads the reference
+/// price once per command and passes it here, the same number it puts on the transaction it
+/// submits.
 pub fn mid_price_transaction(
     deepbook_package: Address,
     pool: &PoolSpec,
     clock_id: Address,
     // Initial shared versions read from the chain; a missing one refuses the build.
     shared: &SharedObjects,
+    // The network's reference gas price, read by the caller. See the note above.
+    gas_price: u64,
 ) -> Result<sui_sdk_types::Transaction, BookError> {
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
     tx.set_gas_budget(10_000_000);
-    // A literal is correct here and only here: this transaction is never submitted, and its gas
-    // payment is emptied below so the node prices it itself. Reading the reference price for a
-    // read would be a round trip that changes nothing.
-    tx.set_gas_price(1_000);
+    tx.set_gas_price(gas_price);
 
     let pool_object = tx.object(shared.input(pool.pool_id, false)?);
     let clock = tx.object(shared.input(clock_id, false)?);
@@ -301,7 +311,7 @@ mod tests {
             .unwrap();
         let mut shared = SharedObjects::new();
         shared.insert(pool.pool_id, 419_123);
-        assert!(mid_price_transaction(pkg, &pool, clock, &shared).is_ok());
+        assert!(mid_price_transaction(pkg, &pool, clock, &shared, 1_000).is_ok());
     }
 
     /// The bug this module was written against: a pool entered at version zero is not a pool the
@@ -318,7 +328,7 @@ mod tests {
             .unwrap();
         let shared = SharedObjects::new();
         assert!(matches!(
-            mid_price_transaction(pkg, &pool, clock, &shared),
+            mid_price_transaction(pkg, &pool, clock, &shared, 1_000),
             Err(BookError::UnknownShared(_))
         ));
     }

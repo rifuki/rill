@@ -101,14 +101,15 @@ fn amount_at(value: &Value, path: &str) -> Result<String, RequestError> {
 }
 
 /// Parse a `rill_build_action` argument object.
-#[allow(clippy::too_many_arguments)]
+///
+/// No gas price is taken, from the caller or from anywhere else: the build reads the network's
+/// reference price itself. See [`BuildRequest`].
 pub fn parse_build_request(
     arguments: &Value,
     action_id: &str,
     network: Network,
     deepbook_package_id: Address,
     gas_budget: u64,
-    gas_price: u64,
 ) -> Result<BuildRequest, RequestError> {
     let sender = address_at(arguments, "sender")?;
 
@@ -215,7 +216,6 @@ pub fn parse_build_request(
                 .map_err(|e| RequestError::at("params.spendAmountMist", e.to_string()))?
         },
         gas_budget,
-        gas_price,
         gas_objects: vec![gas_object(
             gas_id,
             u64_at(arguments, "params.gasObjectVersion")?,
@@ -291,7 +291,6 @@ mod tests {
             Network::Testnet,
             addr(0xde).parse().unwrap(),
             50_000_000,
-            1_000,
         )
     }
 

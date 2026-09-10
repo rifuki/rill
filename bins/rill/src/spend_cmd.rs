@@ -19,6 +19,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
+use crate::verdict::{no_verdict, submit_failed};
 
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
@@ -136,6 +137,15 @@ pub async fn spend_json(
         return Err(format!("{sender} holds no SUI to pay for this"));
     }
 
+    // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
+    // on one network is ten times the price on the other, and a price below the reference is
+    // rejected outright rather than merely running slow. Read once and used twice: the node
+    // refuses a read priced below the reference exactly as it refuses a submission.
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .map_err(|e| format!("reading the reference gas price: {e}"))?;
+
     // The prove list must name exactly the rules this wallet carries — not what a flag says. Too
     // many aborts inside df::borrow_mut with no code of its own; too few aborts at the last
     // command, after everything else has passed.
@@ -146,6 +156,7 @@ pub async fn spend_json(
         wallet_id,
         "0x2::sui::SUI",
         &shared,
+        gas_price,
     )
     .map_err(|e| e.to_string())?;
     let read_b64 = {
@@ -183,15 +194,7 @@ pub async fn spend_json(
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
     tx.set_gas_budget(args.gas_budget);
-    // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
-    // on one network is ten times the price on the other — and a price below the reference is
-    // rejected outright rather than merely running slow.
-    tx.set_gas_price(
-        chain
-            .reference_gas_price()
-            .await
-            .map_err(|e| format!("reading the reference gas price: {e}"))?,
-    );
+    tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(
             c.reference.id.parse().expect("an id from the chain"),
@@ -254,15 +257,7 @@ pub async fn spend_json(
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    let outcome = chain.simulate(&b64).await.map_err(|e| match e {
-        // The node read it and said no before execution: an input the sender does not own, most
-        // often the AgentCap when the owner signs the agent's spend. That is the earliest verdict
-        // there is, and calling it "no answer" would send the reader to check the network.
-        rill_chain::ChainError::Rejected(why) => {
-            format!("the chain refused it before execution: {why}")
-        }
-        other => format!("the node did not answer, so there is no verdict: {other}"),
-    })?;
+    let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
 
     if !outcome.ok {
         let error = outcome.error.unwrap_or_else(|| "no reason given".into());
@@ -302,7 +297,7 @@ pub async fn spend_json(
     let outcome = chain
         .execute(&b64, &[signature.to_base64()])
         .await
-        .map_err(|e| format!("submitting: {e}"))?;
+        .map_err(submit_failed)?;
 
     if let Some(error) = &outcome.error {
         return Err(format!("the transaction failed on chain: {error}"));
