@@ -1,4 +1,4 @@
-//! `rill` — one binary, every local job.
+//! `rill`: one binary, every local job.
 //!
 //! It holds the key, trusts no bytes from the server without independent inspection, and signs only
 //! an envelope that has passed every state transition in `rill-policy`.
@@ -11,7 +11,7 @@
 //! corrupts the protocol wire with nothing to indicate where the corruption came from.
 //!
 //! So the bare command prints status and the command list, and exits. It does not fall through to
-//! the MCP loop and it does not sit waiting for input — a binary that appears to hang when run
+//! the MCP loop and it does not sit waiting for input, and a binary that appears to hang when run
 //! without arguments is one nobody trusts enough to run again.
 
 use std::io::{stdin, stdout, BufReader};
@@ -29,7 +29,7 @@ const DEFAULT_VERSION_ID: &str =
 /// The positional arguments, with `--as <address>` removed.
 ///
 /// Written once because every subcommand that reads a position would otherwise be shifted by two
-/// the moment somebody signs as a different key — and the failure is a usage message for a command
+/// the moment somebody signs as a different key, and the failure is a usage message for a command
 /// that was typed correctly.
 fn positional() -> Vec<String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -51,8 +51,8 @@ struct Loaded {
     keystore: Option<Keystore>,
     /// Why there is no key, kept rather than printed on load.
     ///
-    /// Several commands need no key at all — `describe` reads a public package, `help` reads
-    /// nothing — and a warning they cannot act on trains the reader to skip warnings. So the reason
+    /// Several commands need no key at all (`describe` reads a public package, `help` reads
+    /// nothing), and a warning they cannot act on trains the reader to skip warnings. So the reason
     /// is carried and reported by the commands that are actually blocked by it. Kept typed, because
     /// one of the reasons is a refusal rather than an absence and `mcp` has to tell them apart.
     keystore_error: Option<KeystoreError>,
@@ -72,7 +72,7 @@ impl Loaded {
 
 fn load() -> Loaded {
     // `--as <address>` selects which key signs. Owner-only calls and agent-only calls are different
-    // keys by design — `add_rule` asserts the owner, `request_spend` asserts the agent — so a tool
+    // keys by design (`add_rule` asserts the owner, `request_spend` asserts the agent), so a tool
     // that can only sign as one of them can exercise only half the contract.
     //
     // `RILL_SIGN_AS` is the same choice for a launch that has nowhere to put a flag: an MCP config
@@ -143,7 +143,7 @@ fn load() -> Loaded {
 }
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("mcp", "speak MCP over stdio — this is what an agent runs"),
+    ("mcp", "speak MCP over stdio: this is what an agent runs"),
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
     ("capabilities", "show what the loaded run-set permits"),
@@ -161,7 +161,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "wallet rules",
-        "attach the manifest's rules to a wallet — without this it has no limits",
+        "attach the manifest's rules to a wallet; without this it has no limits",
     ),
     (
         "deepbook provision",
@@ -199,7 +199,7 @@ fn status(loaded: &Loaded) -> i32 {
             println!("  address: {}", store.address());
         }
         None => {
-            println!("  status : not ready — no key loaded");
+            println!("  status : not ready, no key loaded");
             if let Some(reason) = &loaded.keystore_error {
                 println!("  reason : {reason}");
             }
@@ -229,7 +229,7 @@ fn status(loaded: &Loaded) -> i32 {
                 );
             }
         }
-        None => println!("  run-set: none — execution will refuse. Set RILL_RUN_SET_PATH."),
+        None => println!("  run-set: none, so execution will refuse. Set RILL_RUN_SET_PATH."),
     }
     i32::from(loaded.keystore.is_none())
 }
@@ -255,7 +255,7 @@ fn main() {
         }
         Some("status") => std::process::exit(status(&loaded)),
         Some("help") | Some("--help") | Some("-h") => {
-            println!("rill — the local half of Rill: holds the key, checks the work, signs.");
+            println!("rill: the local half of Rill. Holds the key, checks the work, signs.");
             print_commands();
         }
         Some("address") => match &loaded.keystore {
@@ -596,7 +596,7 @@ fn main() {
                 eprintln!("rill: no run-set configured; execution will refuse.");
             }
             match &loaded.keystore {
-                Some(store) => eprintln!("rill ready — {} ({})", loaded.network, store.address()),
+                Some(store) => eprintln!("rill ready: {} ({})", loaded.network, store.address()),
                 // No key at all is a degraded server: the read-only tools still answer, and the
                 // agent is told why the rest will not. Several keys and none named is different.
                 // There is a key that could sign; the launch config just did not say which, and a
