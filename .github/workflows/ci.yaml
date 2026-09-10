@@ -57,7 +57,7 @@ jobs:
   move:
     runs-on: ubuntu-latest
     env:
-      SUI_CLI_VERSION: testnet-v1.55.0
+      SUI_CLI_VERSION: testnet-v1.78.0
     steps:
       - uses: actions/checkout@v4
       - name: Install the Sui CLI
