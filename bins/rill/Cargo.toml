@@ -3,6 +3,8 @@ name = "rill"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+# Two binaries build from one `main.rs`, so a bare `cargo run -p rill` needs telling which.
+default-run = "rill"
 
 [lib]
 name = "rill_cli"
@@ -10,6 +12,14 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "rill"
+path = "src/main.rs"
+
+# The same program under the name the release ships. The workflow builds `--bin rill-wallet`, the
+# smoke step runs it, and the README curls `rill-wallet-<platform>`; `rill` stays for this
+# repository's own use (`cargo run -p rill`, the docs, the run-set tooling). Both must resolve or
+# one of those paths breaks.
+[[bin]]
+name = "rill-wallet"
 path = "src/main.rs"
 
 [dependencies]

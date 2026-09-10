@@ -1,8 +1,17 @@
 name: Release
 
-# The asset names are a contract, not a convention. The reference deployment hands users a curl
-# command pointing at these exact filenames, and its own tests assert them — so a rename here
-# silently breaks every install instruction already in the wild.
+# The asset names are a contract, not a convention. README.md's Install section hands users a curl
+# command pointing at these exact filenames, and bins/rill/tests/release_contract.rs asserts that
+# the names here, the names in the README, and the name the binary prints are one and the same.
+# A rename in any one of those places fails the build rather than a stranger's install.
+#
+# One origin publishes the release: github.com/rifuki/rill, the repository this workflow lives in.
+# A tag pushed here produces assets here and nowhere else (plan KTD-5, U5).
+#
+# Two ways to run it:
+#   - a `v*` tag: builds all three, checks each one starts, and attaches everything to the release.
+#   - workflow_dispatch: builds and checks, then stops. `publish` is gated on the ref being a tag,
+#     so a manual run is a dry run and cannot attach assets to anything.
 on:
   push:
     tags: ["v*"]
@@ -22,15 +31,19 @@ jobs:
           # Native runners rather than cross-compilation: the signer links a TLS stack and a
           # crypto library, and a binary that builds under cross but fails at runtime on a user's
           # machine is the worst of both.
-          - runner: macos-14
+          #
+          # macos-13 was the Intel runner until GitHub retired it, and a job that names a retired
+          # label never schedules; macos-15-intel is the label that replaced it. Two of three
+          # assets is not a release.
+          - runner: macos-15
             target: aarch64-apple-darwin
-            asset: rill-darwin-arm64
-          - runner: macos-13
+            asset: rill-wallet-darwin-arm64
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
-            asset: rill-darwin-x64
+            asset: rill-wallet-darwin-x64
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: rill-linux-x64
+            asset: rill-wallet-linux-x64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,17 +58,29 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # `--locked`: a release built from a lockfile cargo had to rewrite is a release built from
+      # dependencies nobody reviewed.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin rill-wallet
 
-      # The binary must actually run on the machine it was built for. A cross-compiled artifact
-      # that cannot start is indistinguishable from a working one until a user downloads it.
+      # The binary must actually run on the machine it was built for. An artifact that cannot
+      # start is indistinguishable from a working one until a user downloads it.
+      #
+      # A runner has no key, so `--status` exits 1 and says "not ready": that is the expected
+      # answer, not a failure. Anything above 1 is one: 126 for a file the OS cannot execute, 127
+      # for a loader that cannot find a library, 134 for an abort, 139 for a segfault. The earlier
+      # form of this step swallowed every exit code with `|| true` and grepped a second run, which
+      # passed a binary that identified itself and then crashed.
       - name: The binary must start and report itself
         run: |
           BIN=target/${{ matrix.target }}/release/rill-wallet
-          "$BIN" --status || true          # exits 1 with no key, which is correct
-          "$BIN" --status 2>&1 | grep -q "rill-wallet" || {
-            echo "::error::the binary did not identify itself"; exit 1; }
+          code=0
+          out=$("$BIN" --status) || code=$?
+          printf '%s\n' "$out"
+          [ "$code" -le 1 ] || {
+            echo "::error::rill-wallet --status exited $code, so the binary cannot start"; exit 1; }
+          head -n 1 <<<"$out" | grep -qx "rill-wallet" || {
+            echo "::error::the binary did not identify itself as rill-wallet"; exit 1; }
 
       - name: Name it exactly what users already curl
         run: |
@@ -72,7 +97,8 @@ jobs:
   publish:
     needs: wallet
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    # A tag, and only a tag. This is what makes a workflow_dispatch run a dry run.
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -83,10 +109,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            rill-darwin-arm64
-            rill-darwin-arm64.sha256
-            rill-darwin-x64
-            rill-darwin-x64.sha256
-            rill-linux-x64
-            rill-linux-x64.sha256
+            rill-wallet-darwin-arm64
+            rill-wallet-darwin-arm64.sha256
+            rill-wallet-darwin-x64
+            rill-wallet-darwin-x64.sha256
+            rill-wallet-linux-x64
+            rill-wallet-linux-x64.sha256
           fail_on_unmatched_files: true

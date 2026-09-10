@@ -116,7 +116,7 @@ pub fn handle(context: &mut WalletContext, message: &Value) -> Option<Value> {
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": {
-                        "name": "rill",
+                        "name": crate::BINARY_NAME,
                         "version": env!("CARGO_PKG_VERSION"),
                         "description": "Local signer. Holds the key, validates independently, and is the only thing here that can submit."
                     }
@@ -522,7 +522,9 @@ mod tests {
     fn the_handshake_completes() {
         let out = drive(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0]["result"]["serverInfo"]["name"], "rill");
+        // The literal, not the constant: this is the name an MCP client sees, and it must match
+        // what the client downloaded.
+        assert_eq!(out[0]["result"]["serverInfo"]["name"], "rill-wallet");
     }
 
     #[test]

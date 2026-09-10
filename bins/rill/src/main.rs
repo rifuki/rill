@@ -166,7 +166,9 @@ fn print_commands() {
 /// Returns the exit code: not-ready is a failure, because a connector that cannot sign should not
 /// report success to whatever is checking on it.
 fn status(loaded: &Loaded) -> i32 {
-    println!("rill");
+    // The released name, not argv[0]: the release smoke step and a stranger's first run both
+    // check this line, and it should not depend on what the file was renamed to locally.
+    println!("{}", rill_cli::BINARY_NAME);
     match &loaded.keystore {
         Some(store) => {
             println!("  status : ready");

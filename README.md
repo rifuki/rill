@@ -34,6 +34,44 @@ The Bun/TypeScript implementation this replaces is the **specification**. Its be
 re-expressed here, with conformance fixtures in `fixtures/` checked against it by
 `ts/verify-reference.ts`.
 
+## Install
+
+The release is produced by a tag on `github.com/rifuki/rill`, and that is the one origin that
+publishes this binary. Pushing a `v*` tag there runs `.github/workflows/release.yaml`, which builds
+one asset per platform, checks that each one starts, and attaches it with a checksum beside it.
+Nothing else publishes `rill-wallet`; an install line that names any other repository is wrong.
+
+```sh
+# macOS, Apple silicon
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-arm64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-arm64.sha256
+shasum -a 256 -c rill-wallet-darwin-arm64.sha256
+chmod +x rill-wallet-darwin-arm64 && mv rill-wallet-darwin-arm64 rill-wallet
+
+# macOS, Intel
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64.sha256
+shasum -a 256 -c rill-wallet-darwin-x64.sha256
+chmod +x rill-wallet-darwin-x64 && mv rill-wallet-darwin-x64 rill-wallet
+
+# Linux, x86_64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64.sha256
+shasum -a 256 -c rill-wallet-linux-x64.sha256
+chmod +x rill-wallet-linux-x64 && mv rill-wallet-linux-x64 rill-wallet
+
+./rill-wallet --status
+```
+
+The `.sha256` file is exactly what `shasum -a 256 <asset>` printed on the build runner, one line of
+`<hex>  <asset>`, so `shasum -a 256 -c` checks it against the file of that name in the current
+directory: run the two downloads and the check from the same place. On a Linux box without
+`shasum`, `sha256sum -c rill-wallet-linux-x64.sha256` reads the same format.
+
+`--status` prints `rill-wallet` on its first line and then whether it can sign. With no key it says
+`not ready` and exits 1: that is the expected answer on a fresh machine, not a broken download. The
+key comes from `RILL_SUI_PRIVATE_KEY` or the `sui` CLI's own keystore, never from an argument.
+
 ## Why a rebuild rather than a port
 
 Three problems in the TypeScript version are one problem: invariants the code documents but the
