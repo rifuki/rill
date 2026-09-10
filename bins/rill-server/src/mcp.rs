@@ -36,8 +36,9 @@ use crate::state::AppState;
 
 /// Protocol versions this server speaks. A client's version is echoed when recognised; otherwise
 /// the newest is offered, which is what the transport expects.
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
+// The list and the negotiation live in rill-mcp, so the two transports cannot drift apart on
+// which revisions of the protocol they speak. See its module note.
+use rill_mcp::negotiate_protocol_version;
 
 /// The `WWW-Authenticate` value every 401 must carry, so a client can discover where to
 /// authenticate instead of reporting a dead connector.
@@ -170,9 +171,7 @@ async fn handle_one(state: &AppState, owner: &str, message: &Value) -> Option<Va
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(Value::as_str);
-            let version = requested
-                .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
-                .unwrap_or(LATEST_PROTOCOL_VERSION);
+            let version = negotiate_protocol_version(requested);
             Some(rpc_result(
                 id,
                 json!({

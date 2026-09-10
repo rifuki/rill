@@ -64,6 +64,29 @@ jobs:
       # The money-path invariant. The reference implementation stated this in a comment and
       # still let a float reach a DeepBook order price, and a comment cannot stop `Number(v)`.
       # Here no float type may appear in the crate at all, so there is nothing to slip through.
+      # The keyless claim, as a fact about the build rather than a promise in prose. rill-server
+      # builds and simulates and never signs, and the strongest form of that is a binary with no
+      # signing library linked into it at all. This was nearly untrue by accident: rill-chain and
+      # rill-auth both declared sui-crypto and neither used it outside a live test, so the library
+      # sat in the server's graph and the claim rested on no code path reaching for it.
+      - name: rill-server must have no signing library in its graph
+        run: |
+          if cargo tree --locked -p rill-server --edges normal | grep -E '\bsui-crypto\b'; then
+            echo "::error::rill-server gained a signing library. It builds and simulates; the \
+          signer holds the key. See R11 and KTD-3."
+            exit 1
+          fi
+          echo "rill-server cannot sign: no signing library is linked."
+
+      # And the other half, because an asymmetry nobody checks in both directions is one claim, not
+      # two: the signer must still be able to sign.
+      - name: the signer must have one
+        run: |
+          cargo tree --locked -p rill --edges normal | grep -qE '\bsui-crypto\b' || {
+            echo "::error::the signer lost its signing library, so nothing can complete a spend"
+            exit 1; }
+          echo "the signer can sign."
+
       - name: rill-core must contain no floating-point type
         run: |
           # Strip doc comments first: this file's own prose explains why floats are banned,

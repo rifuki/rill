@@ -24,8 +24,9 @@ use crate::runset::{RunSet, RUN_SET_VAR};
 use crate::verdict::Failure;
 
 /// Protocol versions this signer speaks.
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
-const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
+// The list and the negotiation live in rill-mcp, so the two transports cannot drift apart on
+// which revisions of the protocol they speak. See its module note.
+use rill_mcp::negotiate_protocol_version;
 
 /// What the signer knows about itself. Everything here is public.
 pub struct WalletContext {
@@ -193,9 +194,7 @@ pub fn handle(context: &mut WalletContext, message: &Value) -> Option<Value> {
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(Value::as_str);
-            let version = requested
-                .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
-                .unwrap_or(LATEST_PROTOCOL_VERSION);
+            let version = negotiate_protocol_version(requested);
             Some(rpc_result(
                 id,
                 json!({

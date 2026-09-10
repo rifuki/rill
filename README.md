@@ -229,6 +229,30 @@ signable at all — `request_spend` asserts the sender is the *agent*, and a PTB
 
 ## What an agent sees
 
+### Two surfaces, and only one of them can finish a spend
+
+There are two MCP endpoints and they are deliberately not the same. Which one an agent is talking to
+decides what it can do, so it is worth being blunt about it.
+
+| | `rill mcp`, over stdio | the hosted endpoint, over HTTP |
+|---|---|---|
+| holds the key | yes | **no, and it is not linked against a signing library at all** |
+| tools | `rill_status`, `rill_wallet`, `rill_create_wallet`, `rill_attach_rules`, `rill_spend`, `rill_execute` | `rill_list_actions`, `rill_describe_action`, `rill_build_action` |
+| can complete a spend | yes | no |
+| what it returns instead | a submitted transaction and its digest | an unsigned `ExecutionEnvelope`, inert until a local signer validates and signs it |
+
+The two share no tool name: the builder speaks a catalogue vocabulary and the signer speaks a wallet
+one. So an agent on the hosted endpoint alone can plan a transaction and prove by simulation that it
+would execute, and then it stops. Finishing needs the local binary, which re-reads the bytes, checks
+them against its own pinned run-set, re-simulates against live state, and only then signs.
+
+That asymmetry is checked rather than asserted. `cargo tree -p rill-server` must contain no signing
+library and `cargo tree -p rill` must contain one, both in CI, and
+`crates/rill-mcp/tests/surface_split.rs` holds the tool split and the protocol negotiation from the
+one producer that emits both surfaces.
+
+### Over stdio
+
 `rill mcp` speaks MCP over stdio. An agent reads the wallet's limits from the chain that enforces
 them, spends within them, and is refused by the contract when it exceeds them — all in one session:
 

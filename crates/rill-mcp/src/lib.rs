@@ -82,6 +82,36 @@ fn destructive(
 }
 
 /// Every tool a surface exposes.
+/// The protocol revisions this implementation speaks, newest first.
+///
+/// One list, because there are two transports and a client cannot tell them apart by anything it
+/// should have to care about. Both once carried their own copy of this and of the negotiation
+/// beside it, so the stdio signer and the HTTP builder could have come to advertise different
+/// revisions of the same protocol without a single test noticing. KTD-3 asks for one producer per
+/// claim, and a protocol version is a claim.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The newest revision either transport will offer when a client names none, or names one this
+/// implementation does not speak.
+pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+
+/// The revision to answer an `initialize` with, given whatever the client asked for.
+///
+/// A client that names a revision this implementation speaks gets that one back, which is what lets
+/// an older client keep working. Anything else, including no request at all and a revision from the
+/// future, gets the newest: the handshake then states plainly what the client is actually talking
+/// to, rather than echoing a version nothing here implements.
+pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    requested
+        .and_then(|asked| {
+            SUPPORTED_PROTOCOL_VERSIONS
+                .iter()
+                .find(|supported| **supported == asked)
+        })
+        .copied()
+        .unwrap_or(LATEST_PROTOCOL_VERSION)
+}
+
 pub fn tools(surface: Surface) -> Vec<Tool> {
     match surface {
         Surface::Actions => vec![

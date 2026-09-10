@@ -1253,7 +1253,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sui-crypto",
  "thiserror 2.0.20",
 ]
 
