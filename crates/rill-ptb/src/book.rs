@@ -430,20 +430,51 @@ mod tests {
 
     /// The pool reports three bare numbers and labels none of them, so the order they are read in is
     /// the whole of the meaning. Swapping two is a silent change: every value still parses.
+    ///
+    /// Three distinct magnitudes, and each field asserted on its own. An earlier version of this
+    /// fixture used the same number for the tick and the minimum, which made it blind to a
+    /// transposition of the first and third return values: with the decode swapped, this test, the
+    /// whole of `cargo test --workspace`, and every CI gate stayed green, and the defect reached
+    /// the chain as an order aborting in `order_info::validate_inputs` with a bare code. Equal
+    /// values in a fixture for an order-dependent decode assert nothing about order.
     #[test]
     fn the_three_returned_numbers_keep_the_order_the_move_function_declares() {
-        let tick = 10_000_000u64.to_le_bytes();
+        let tick = 7u64.to_le_bytes();
         let lot = 1_000_000u64.to_le_bytes();
         let min = 10_000_000u64.to_le_bytes();
         let params = parse_book_params(&[&tick, &lot, &min]).expect("three u64s");
+        assert_eq!(params.tick_size, 7, "the first return is the tick");
+        assert_eq!(params.lot_size, 1_000_000, "the second return is the lot");
         assert_eq!(
-            params,
-            BookParams {
-                tick_size: 10_000_000,
-                lot_size: 1_000_000,
-                min_size: 10_000_000,
-            }
+            params.min_size, 10_000_000,
+            "the third return is the minimum"
         );
+    }
+
+    /// Every one of the three transpositions, spelled out.
+    ///
+    /// The assertion above catches all of them only while the three magnitudes stay distinct, and
+    /// a later edit that makes two of them equal would quietly reopen the hole. This names the
+    /// pairs instead, so the protection does not depend on a reader noticing why the numbers
+    /// differ.
+    #[test]
+    fn no_two_of_the_three_returns_can_be_swapped_without_changing_the_answer() {
+        let a = 7u64.to_le_bytes();
+        let b = 1_000_000u64.to_le_bytes();
+        let c = 10_000_000u64.to_le_bytes();
+        let right = parse_book_params(&[&a, &b, &c]).expect("three u64s");
+        let returns: [&[u8]; 3] = [&a, &b, &c];
+        for (label, wrong) in [
+            ("tick and lot", [returns[1], returns[0], returns[2]]),
+            ("tick and minimum", [returns[2], returns[1], returns[0]]),
+            ("lot and minimum", [returns[0], returns[2], returns[1]]),
+        ] {
+            let swapped = parse_book_params(&wrong).expect("three u64s");
+            assert_ne!(
+                swapped, right,
+                "swapping {label} left the same answer, so the fixture cannot see that swap"
+            );
+        }
     }
 
     #[test]

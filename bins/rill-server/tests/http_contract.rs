@@ -1358,15 +1358,76 @@ async fn an_agent_credential_carrying_a_wider_scope_is_refused_at_the_resource()
 
 /// One owner. The subject comes from configuration, so even the owner secret cannot mint a
 /// credential that reads somebody else's catalogue.
+/// The build half of the plan's Verification sentence for this credential: "A headless agent with
+/// only an environment variable builds and simulates, and cannot change its own limits."
+///
+/// Nothing exercised it. Across the whole suite the only tools an agent credential ever called
+/// were rill_list_actions and rill_describe_action, and the live run recorded rill_build_action
+/// only as a name in a tools/list listing. So the claim that a credential reaches the build
+/// surface rested on the surface being shared, never on a call.
+///
+/// The assertion that matters is WHICH refusal comes back. A builder-level `action_unavailable`
+/// means the credential was accepted, carried its scope, and was turned away by the catalogue; a
+/// 401 or a 403 would mean it never reached the builder at all. This needs no funds and no node,
+/// exactly as `building_without_a_configured_deepbook_package_is_refused_by_name` does not.
+#[tokio::test]
+async fn an_agent_credential_reaches_the_build_surface_and_is_refused_there() {
+    let dir = fresh_dir();
+    std::fs::write(dir.join("skills.json"), "[]").unwrap();
+    let router = agent_app_in(&dir);
+    let (_, body) = mint(&router, Some(OWNER_SECRET), "").await;
+    let credential = body["access_token"].as_str().unwrap().to_owned();
+
+    let (status, built) = mcp_on(
+        &router,
+        &credential,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {
+                "name": "rill_build_action",
+                "arguments": { "actionId": "skill_anything" }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the credential must be accepted at the transport, not rejected: {built}"
+    );
+    assert_eq!(
+        built["result"]["isError"], true,
+        "an action this owner does not have must be refused: {built}"
+    );
+    assert_eq!(
+        built["result"]["structuredContent"]["code"], "action_unavailable",
+        "the refusal must come from the builder's catalogue check, which is what proves the \
+         credential got that far, rather than from the bearer check: {built}"
+    );
+}
+
 #[tokio::test]
 async fn a_credential_reaches_only_its_own_owners_actions() {
+    // Two owners, and this is the point. An earlier version of this test seeded only the other
+    // owner's action and asserted the catalogue came back empty, which is also exactly what a
+    // credential scoped to nobody returns: changing the mint path to stamp an address that owns
+    // nothing left this test and the entire workspace green. The owner's own action is seeded too,
+    // so the empty answer for the stranger is read against a non-empty one for the owner, and a
+    // credential scoped to the wrong subject fails here.
     let dir = fresh_dir();
     std::fs::write(
         dir.join("skills.json"),
-        r#"[{"id":"skill_belongs_to_someone_else","name":"not yours","description":"x",
-             "flow":{"nodes":[],"edges":[]},
-             "owner":"0x1111111111111111111111111111111111111111111111111111111111111111",
-             "createdAt":"2026-09-01"}]"#,
+        format!(
+            r#"[{{"id":"skill_belongs_to_someone_else","name":"not yours","description":"x",
+                  "flow":{{"nodes":[],"edges":[]}},
+                  "owner":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                  "createdAt":"2026-09-01"}},
+                {{"id":"skill_belongs_to_this_owner","name":"yours","description":"x",
+                  "flow":{{"nodes":[],"edges":[]}},
+                  "owner":"{OWNER_ADDRESS}",
+                  "createdAt":"2026-09-02"}}]"#
+        ),
     )
     .unwrap();
     let router = agent_app_in(&dir);
@@ -1382,10 +1443,17 @@ async fn a_credential_reaches_only_its_own_owners_actions() {
         }),
     )
     .await;
+    let actions = listed["result"]["structuredContent"]["actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the catalogue must be a list: {listed}"));
+    let ids: Vec<&str> = actions
+        .iter()
+        .map(|a| a["actionId"].as_str().unwrap_or_default())
+        .collect();
     assert_eq!(
-        listed["result"]["structuredContent"]["actions"],
-        serde_json::json!([]),
-        "another address's action must not appear: {listed}"
+        ids,
+        vec!["skill_belongs_to_this_owner"],
+        "the credential must see exactly its own owner's action and no other: {listed}"
     );
 
     let (_, described) = mcp_on(

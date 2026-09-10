@@ -44,6 +44,13 @@ publishes this binary. Pushing a `v*` tag there runs `.github/workflows/release.
 one asset per platform, checks that each one starts, and attaches it with a checksum beside it.
 Nothing else publishes `rill-wallet`; an install line that names any other repository is wrong.
 
+> **No release is published yet, so these two `curl` lines return 404 today.** The workflow that
+> produces them is written and its dry run is green across all three platforms, but publishing needs
+> a `rill-wallet-v*` tag pushed to `github.com/rifuki/rill`, which nobody has done. Until then the
+> only way to get the binary is `cargo build --release --locked -p rill`, and the one claim this
+> section cannot yet support is that a published checksum matches a published asset: that is
+> deferred until the first tag, not covered.
+
 One block per platform. Paste the whole of yours: the checksum is verified first and the rest is
 chained to it, so a file that does not match is never made executable and never run. What the check
 prints, and what to do when it fails, is under [Verifying the download](#verifying-the-download).
