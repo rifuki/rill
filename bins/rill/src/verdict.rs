@@ -28,11 +28,18 @@ pub fn no_verdict(error: ChainError) -> String {
     }
 }
 
-/// A submission the node did not take.
+/// A submission the node did not take, or may have taken without saying so.
+///
+/// The transport case is not a refusal and must not read like one. A submission whose response was
+/// lost may already be on chain, so the advice is to look before sending it again: a blind retry is
+/// how one intended spend becomes two.
 pub fn submit_failed(error: ChainError) -> String {
     match error {
         ChainError::Rejected(message) => refused(&message, "at submission"),
-        other => format!("submitting: {other}"),
+        other => format!(
+            "the node did not answer the submission, so whether it landed is unknown: {other}. \
+             Look for the transaction on chain before sending it again."
+        ),
     }
 }
 

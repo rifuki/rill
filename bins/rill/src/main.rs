@@ -516,7 +516,14 @@ fn main() {
                 deepbook_package: flag("--package")
                     .unwrap_or_else(|| network.package_id().to_string()),
                 agent: flag("--agent"),
-                gas_budget: 200_000_000,
+                // Same flag and same default as `wallet` and `spend`. These two were pinned at
+                // 200_000_000, which is not a fee but a ceiling the gas coin has to cover, so a
+                // testnet account holding less than 0.2 SUI could not run the hero path at all
+                // and was told its balance was "lower than the needed amount" for a transaction
+                // that costs a fortieth of it.
+                gas_budget: flag("--gas-budget")
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(100_000_000),
                 dry_run: !argv.iter().any(|a| a == "--submit"),
             };
             let endpoint = std::env::var("SUI_RPC_URL")
@@ -576,7 +583,14 @@ fn main() {
                 price: need("--price"),
                 quantity: need("--quantity"),
                 is_bid: argv.iter().any(|a| a == "--bid"),
-                gas_budget: 200_000_000,
+                // Same flag and same default as `wallet` and `spend`. These two were pinned at
+                // 200_000_000, which is not a fee but a ceiling the gas coin has to cover, so a
+                // testnet account holding less than 0.2 SUI could not run the hero path at all
+                // and was told its balance was "lower than the needed amount" for a transaction
+                // that costs a fortieth of it.
+                gas_budget: flag("--gas-budget")
+                    .and_then(|g| g.parse().ok())
+                    .unwrap_or(100_000_000),
                 dry_run: !argv.iter().any(|a| a == "--submit"),
             };
             let endpoint = std::env::var("SUI_RPC_URL")

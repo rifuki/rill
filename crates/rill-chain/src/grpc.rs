@@ -462,7 +462,14 @@ impl SuiWrite for GrpcSui {
             .execution_client()
             .execute_transaction(request)
             .await
-            .map_err(|s| ChainError::Rejected(s.message().to_owned()))?
+            // The same classifier as every read, and it matters more here than anywhere. Mapping
+            // every status to a refusal told the caller the node had rejected a submission when
+            // the connection had in fact dropped, and those call for opposite actions: a refusal
+            // means this transaction will never land, while an unreachable node means the
+            // outcome is unknown and the transaction may already be on chain. "Refused" invites
+            // a retry, and retrying a submission whose fate you do not know is how one intended
+            // spend becomes two attempts.
+            .map_err(refusal_or_transport)?
             .into_inner();
 
         let executed = response.transaction.as_ref();

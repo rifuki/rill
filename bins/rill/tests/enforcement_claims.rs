@@ -117,3 +117,56 @@ fn balanced_arguments(call: &str) -> &str {
     }
     panic!("the call to read_limits is never closed");
 }
+
+/// `rill_execute` does all of its chain work inside one runtime.
+///
+/// `block_on` builds a current-thread runtime per call and drops it on return, taking the tonic
+/// channel's connection task with it. A version of this tool created the client in one `block_on`
+/// to simulate, returned it, and handed it to a second `block_on` to submit, where the channel was
+/// already closed. It simulated, it signed, and it could never submit: every call ended in
+/// `Service was not ready: transport error, Closed`, while every CLI command on the same code
+/// worked because each does its work inside one runtime.
+///
+/// Nothing caught it. The offline test for this path stops at the chain step by design, and the
+/// commit whose message says this tool submits is the one that introduced the second runtime, so
+/// the claim shipped untrue and was cited in the README as proof. A structural check is crude, but
+/// the property it guards is structural: the channel may not outlive the runtime it was built in.
+///
+/// Proved again by hand after the fix, on testnet:
+/// `dxzyeAfW5eRdGUobBNUGeu2mnmaN4xyzY7J8dZxL5fZ`.
+#[test]
+fn the_execute_tool_keeps_its_chain_client_inside_one_runtime() {
+    let shipped = shipped(STDIO);
+    let start = shipped
+        .find("fn execute(")
+        .expect("stdio.rs must define the execute tool");
+    let body = &shipped[start..];
+    // To the next item at column zero, which is where this function ends. Anchored on the item
+    // rather than on a comment, because a comment is the thing most likely to be reworded.
+    let end = body
+        .find("\nfn decode_for_signing(")
+        .expect("execute is followed by decode_for_signing; re-anchor this if that moves");
+    let body = &body[..end];
+
+    // Calls, not mentions: the comment above this path explains the bug and names `block_on`
+    // three times, and counting the word made the guard fail on the fixed code.
+    let runtimes = body
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with("//"))
+        .filter(|line| line.contains("block_on("))
+        .count();
+    assert_eq!(
+        runtimes, 1,
+        "the execute path uses {runtimes} runtimes; a tonic channel built in one and used in \
+         another is already closed, so the submission can never land"
+    );
+    assert!(
+        body.contains("SuiWrite::execute"),
+        "the guard is worthless if the submission has moved elsewhere"
+    );
+    assert!(
+        body.contains("GrpcSui::new"),
+        "the client must be built in this path, inside that one runtime"
+    );
+}

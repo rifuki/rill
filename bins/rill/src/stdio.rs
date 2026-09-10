@@ -391,59 +391,87 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let digest = pinned.pinned_digest().to_string();
     let targets = pinned.decoded().targets.clone();
 
-    // The client is built inside the runtime: its transport registers with the reactor, and
-    // constructing it outside panics rather than returning an error.
+    // The client is built inside the runtime, and everything that uses it stays inside the same
+    // one. That is not a style choice.
+    //
+    // `block_on` builds a fresh current-thread runtime per call and drops it on return, taking
+    // the tonic channel's connection task with it. An earlier version created the client in one
+    // `block_on` for the simulation, returned it, and then handed it to a second `block_on` for
+    // the submission, where the channel was already dead: every `rill_execute` ended in
+    // `Service was not ready: transport error, Closed`. It simulated, it signed, and it could
+    // never submit, while every CLI command on the same code worked because each does its work
+    // inside one runtime. The two-runtime shape dates from the commit whose message says this
+    // tool submits, so the claim was never true.
     let endpoint = endpoint(context);
     let Some(keystore) = context.keystore.as_ref() else {
         return tool_error(id, "no_key", "No signing key is configured.");
     };
 
-    // Our own simulation, against live state. The server's proves only that the server thought so.
-    let simulated = match block_on(async {
-        let chain = rill_chain::grpc::GrpcSui::new(&endpoint).map_err(|e| e.to_string())?;
+    /// Which refusal to report, decided inside the runtime and rendered outside it.
+    enum Failed {
+        Chain(String),
+        Malformed(String),
+        Signing(String),
+        Submit(String),
+    }
+
+    let outcome = block_on(async {
+        let chain =
+            rill_chain::grpc::GrpcSui::new(&endpoint).map_err(|e| Failed::Chain(e.to_string()))?;
+
+        // Our own simulation, against live state. The server's proves only that the server
+        // thought so.
         let simulated = pinned
             .simulate(&chain, &policy)
             .await
-            .map_err(|r| r.to_string())?;
-        Ok::<_, String>((chain, simulated))
-    }) {
+            .map_err(|r| Failed::Chain(r.to_string()))?;
+
+        let transaction =
+            decode_for_signing(simulated.signable_bytes()).map_err(Failed::Malformed)?;
+        let signature = keystore
+            .sign(&transaction)
+            .map_err(|e| Failed::Signing(e.to_string()))?;
+
+        let outcome = rill_chain::SuiWrite::execute(
+            &chain,
+            simulated.signable_bytes(),
+            &[signature.to_base64()],
+        )
+        .await
+        .map_err(|e| Failed::Submit(e.to_string()))?;
+
+        Ok::<_, Failed>((outcome, simulated.spend_base_units().to_string()))
+    });
+
+    let (outcome, spend_base_units) = match outcome {
         Ok(Ok(pair)) => pair,
-        Ok(Err(reason)) | Err(reason) => {
-            context.last_rejection = Some(reason.clone());
-            // A node that answered "this object moved" was reached. Calling that unavailable
-            // sends an agent to retry against a network that is fine, holding an envelope that
-            // will never work; what it needs is a fresh build.
-            return match rill_chain::stale::classify_stale_object(&reason) {
-                Some(stale) => tool_error(
-                    id,
-                    "object_changed",
-                    &format!("{stale}. Build the action again so every object is read afresh."),
-                ),
-                None => tool_error(id, "chain_unavailable", &reason),
+        Ok(Err(failed)) => {
+            return match failed {
+                Failed::Chain(reason) => {
+                    context.last_rejection = Some(reason.clone());
+                    // A node that answered "this object moved" was reached. Calling that
+                    // unavailable sends an agent to retry against a network that is fine,
+                    // holding an envelope that will never work; what it needs is a fresh build.
+                    match rill_chain::stale::classify_stale_object(&reason) {
+                        Some(stale) => tool_error(
+                            id,
+                            "object_changed",
+                            &format!(
+                                "{stale}. Build the action again so every object is read afresh."
+                            ),
+                        ),
+                        None => tool_error(id, "chain_unavailable", &reason),
+                    }
+                }
+                Failed::Malformed(reason) => {
+                    context.last_rejection = Some(reason.clone());
+                    tool_error(id, "malformed_envelope", &reason)
+                }
+                Failed::Signing(reason) => tool_error(id, "signing_failed", &reason),
+                Failed::Submit(reason) => tool_error(id, "submit_failed", &reason),
             };
         }
-    };
-    let (chain, simulated) = simulated;
-    let transaction = match decode_for_signing(simulated.signable_bytes()) {
-        Ok(t) => t,
-        Err(reason) => {
-            context.last_rejection = Some(reason.clone());
-            return tool_error(id, "malformed_envelope", &reason);
-        }
-    };
-    let signature = match keystore.sign(&transaction) {
-        Ok(s) => s,
-        Err(e) => return tool_error(id, "signing_failed", &e.to_string()),
-    };
-
-    let outcome = match block_on(rill_chain::SuiWrite::execute(
-        &chain,
-        simulated.signable_bytes(),
-        &[signature.to_base64()],
-    )) {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => return tool_error(id, "submit_failed", &e.to_string()),
-        Err(e) => return tool_error(id, "submit_failed", &e),
+        Err(reason) => return tool_error(id, "chain_unavailable", &reason),
     };
 
     if let Some(error) = &outcome.error {
@@ -459,7 +487,7 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
             "pinnedDigest": digest,
             "callSequence": targets,
             "gasUsed": outcome.gas_used_mist,
-            "spendBaseUnits": simulated.spend_base_units().to_string(),
+            "spendBaseUnits": spend_base_units,
             "note": "Submitted and confirmed. This cannot be undone, and calling again with the \
                      same envelope submits a second transaction."
         }),
