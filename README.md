@@ -72,6 +72,21 @@ directory: run the two downloads and the check from the same place. On a Linux b
 `not ready` and exits 1: that is the expected answer on a fresh machine, not a broken download. The
 key comes from `RILL_SUI_PRIVATE_KEY` or the `sui` CLI's own keystore, never from an argument.
 
+### Which tag produces a release, and the series it continues
+
+Tags are `rill-wallet-v<version>`. The series did not start here: `rill-wallet-v0.2.0` was published
+on 2026-07-19 from the TypeScript repository, carrying these same three asset names, so the next
+release from this repository is `rill-wallet-v0.3.0` rather than a restart. The workflow's tag
+filter accepts that spelling and a bare `v*`, and its publish job is gated on the same two, because
+a tag that builds the assets and attaches them to nothing is the failure that looks most like
+success.
+
+One thing is still inconsistent, and saying so is cheaper than a stranger finding it. The
+instruction generators in the TypeScript repository still hand agents a download URL on the old
+origin, which will not carry releases built from this source. Moving them is owed by U13 of
+`docs/plans/2026-09-10-001-feat-rill-operational-mcp-plan.md`; until that lands, the install lines
+above are the ones that resolve.
+
 ## Why a rebuild rather than a port
 
 Three problems in the TypeScript version are one problem: invariants the code documents but the

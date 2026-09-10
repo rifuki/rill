@@ -299,12 +299,139 @@ fn the_smoke_step_greps_for_the_name_the_binary_prints() {
 #[test]
 fn the_publish_job_runs_only_for_a_tag() {
     assert!(
-        RELEASE_WORKFLOW.contains("if: startsWith(github.ref, 'refs/tags/v')"),
+        !publish_gate_prefixes().is_empty(),
         "publish must be gated on a tag, which is what makes workflow_dispatch a dry run"
+    );
+    assert!(
+        !gate_accepts("refs/heads/main"),
+        "a branch push must not publish"
     );
     assert!(
         RELEASE_WORKFLOW.contains("  workflow_dispatch:"),
         "a manual dry run must be possible without a tag"
+    );
+}
+
+/// The tag series that is already published, and the one this workflow has to keep producing.
+///
+/// `naisu-one/rill` shipped `rill-wallet-v0.2.0` with these asset names, so the next release is
+/// `rill-wallet-v0.3.0`. A trigger of `v*` alone does not match that spelling: the tag would be
+/// pushed, nothing would run, and the only symptom would be a release that never appeared.
+const ESTABLISHED_SERIES: &str = "rill-wallet-v0.3.0";
+
+/// A bare `v` tag, which the workflow also accepts so an ordinary `v1.0.0` is not a silent no-op.
+const PLAIN_SERIES: &str = "v1.0.0";
+
+/// The tag globs in the `on: push:` trigger.
+fn trigger_tag_globs() -> Vec<String> {
+    let line = RELEASE_WORKFLOW
+        .lines()
+        .find(|line| line.trim().starts_with("tags:"))
+        .expect("release.yaml has no tag trigger");
+    line.trim()
+        .trim_start_matches("tags:")
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"').to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// The prefixes the publish job's `if:` accepts, read out of its `startsWith` calls.
+fn publish_gate_prefixes() -> Vec<String> {
+    let line = RELEASE_WORKFLOW
+        .lines()
+        .find(|line| line.trim().starts_with("if: startsWith(github.ref"))
+        .expect("release.yaml has no publish gate");
+    line.split("startsWith(github.ref, '")
+        .skip(1)
+        .filter_map(|rest| rest.split('\'').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// These globs are all `prefix*`, so matching is a prefix test. Anything fancier in the yaml
+/// should fail loudly here rather than be half-understood.
+fn glob_matches(glob: &str, candidate: &str) -> bool {
+    let prefix = glob.strip_suffix('*').unwrap_or_else(|| {
+        panic!("tag glob {glob:?} is not the `prefix*` shape this check understands")
+    });
+    assert!(
+        !prefix.contains('*'),
+        "tag glob {glob:?} is not the `prefix*` shape this check understands"
+    );
+    candidate.starts_with(prefix)
+}
+
+fn trigger_accepts(tag: &str) -> bool {
+    trigger_tag_globs().iter().any(|g| glob_matches(g, tag))
+}
+
+fn gate_accepts(git_ref: &str) -> bool {
+    publish_gate_prefixes()
+        .iter()
+        .any(|prefix| git_ref.starts_with(prefix.as_str()))
+}
+
+/// A tag that builds but never publishes is worse than one that does neither: the assets exist in
+/// the run's artifacts and nowhere a user can reach. So the gate must accept everything the
+/// trigger does.
+#[test]
+fn every_tag_the_trigger_accepts_is_also_publishable() {
+    for tag in [ESTABLISHED_SERIES, PLAIN_SERIES] {
+        assert!(
+            trigger_accepts(tag),
+            "the trigger must fire for {tag}, or pushing it produces nothing at all"
+        );
+        assert!(
+            gate_accepts(&format!("refs/tags/{tag}")),
+            "publish must attach the assets for {tag}, not build them and drop them"
+        );
+    }
+}
+
+/// The published series is `rill-wallet-vN`, and it started on another origin. Losing that here
+/// means the version number restarts and `releases/latest` points at an older binary.
+#[test]
+fn the_trigger_matches_the_series_that_is_already_published() {
+    assert!(
+        trigger_accepts(ESTABLISHED_SERIES),
+        "the tag globs {:?} do not match {ESTABLISHED_SERIES}, the convention already in use",
+        trigger_tag_globs()
+    );
+}
+
+/// One cargo target from `src/main.rs`, so cargo has nothing to warn about.
+///
+/// Two `[[bin]]` sections once shared this path. Cargo answered every build, test and clippy run
+/// with "found to be present in multiple build targets" and compiled the file twice, and because
+/// it is a cargo warning rather than a rustc lint, `-D warnings` did not catch it.
+#[test]
+fn main_rs_belongs_to_exactly_one_binary_target() {
+    let targets: Vec<&str> = MANIFEST
+        .lines()
+        .filter(|line| line.trim() == "[[bin]]")
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "bins/rill/Cargo.toml declares {} binary targets; a second one sharing src/main.rs makes \
+         cargo warn on every command",
+        targets.len()
+    );
+    assert!(
+        MANIFEST.contains(&format!("name = \"{BINARY_NAME}\"")),
+        "the one binary must be named {BINARY_NAME}, the name it ships and answers to"
+    );
+    // The key, not the word: the comment above the target explains why the key is absent, and a
+    // substring check would fail on the explanation.
+    assert!(
+        !MANIFEST
+            .lines()
+            .any(|line| line.trim_start().starts_with("default-run")),
+        "one binary needs no default-run; the key is only meaningful with two"
     );
 }
 
@@ -362,11 +489,18 @@ fn the_readme_names_no_other_origin() {
             "a download line names an origin other than rifuki/rill: {line}"
         );
     }
+    // Named in prose is fine and in fact owed: `naisu-one/rill` published the series this one
+    // continues, and instructions already in the wild still point at it. What must never happen is
+    // a line a reader can act on sending them there, so the ban is on URLs rather than on the
+    // word. An earlier form of this check forbade the string outright, which would have made the
+    // honest explanation of the discrepancy fail the build.
     for other in ["naisu-one/rill", "eseslabs/rill"] {
-        assert!(
-            !README.contains(other),
-            "{other} is the TypeScript specification, not a place this binary is published"
-        );
+        for line in README.lines().filter(|line| line.contains(other)) {
+            assert!(
+                !line.contains("releases/"),
+                "a line points a reader at {other}, which does not publish this binary: {line}"
+            );
+        }
     }
 }
 

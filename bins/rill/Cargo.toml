@@ -3,21 +3,20 @@ name = "rill"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-# Two binaries build from one `main.rs`, so a bare `cargo run -p rill` needs telling which.
-default-run = "rill"
 
 [lib]
 name = "rill_cli"
 path = "src/lib.rs"
 
-[[bin]]
-name = "rill"
-path = "src/main.rs"
-
-# The same program under the name the release ships. The workflow builds `--bin rill-wallet`, the
-# smoke step runs it, and the README curls `rill-wallet-<platform>`; `rill` stays for this
-# repository's own use (`cargo run -p rill`, the docs, the run-set tooling). Both must resolve or
-# one of those paths breaks.
+# One binary, under the name it ships as. The workflow builds `--bin rill-wallet`, the smoke step
+# runs it, the README curls `rill-wallet-<platform>`, `status()` prints it and `serverInfo.name`
+# answers with it: a second cargo target called `rill` would be a fifth spelling of the same
+# program, which is the drift this unit exists to remove. `cargo run -p rill` still resolves,
+# because a package with one bin needs no `default-run`.
+#
+# The two names briefly both existed, sharing `path = "src/main.rs"`, and cargo answered every
+# build, test and clippy run with "found to be present in multiple build targets" while compiling
+# the file twice. A warning on every command is not a naming scheme.
 [[bin]]
 name = "rill-wallet"
 path = "src/main.rs"

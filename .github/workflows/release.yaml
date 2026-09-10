@@ -6,15 +6,26 @@ name: Release
 # A rename in any one of those places fails the build rather than a stranger's install.
 #
 # One origin publishes the release: github.com/rifuki/rill, the repository this workflow lives in.
-# A tag pushed here produces assets here and nowhere else (plan KTD-5, U5).
+# A tag pushed here produces assets here and nowhere else (plan KTD-5, U5). The binary is published
+# from the repository whose source builds it, which is the only arrangement under which a tag names
+# the commit that produced the asset.
+#
+# The series it continues was started elsewhere. github.com/naisu-one/rill (the TypeScript
+# specification, formerly eseslabs/rill) published `rill-wallet-v0.2.0` on 2026-07-19 carrying these
+# same three asset names, and the instruction generators in that repository still hand agents its
+# download URL. So the next release here is `rill-wallet-v0.3.0`, not a restart, and the tag filter
+# accepts that spelling: a filter of `v*` alone would never have matched the convention already in
+# use, and every tag pushed under it would have produced nothing at all. Moving the published
+# instructions to this origin is owed by U13 and is tracked in the plan's Open Questions.
 #
 # Two ways to run it:
-#   - a `v*` tag: builds all three, checks each one starts, and attaches everything to the release.
+#   - a `rill-wallet-v*` or `v*` tag: builds all three, checks each one starts, and attaches
+#     everything to the release.
 #   - workflow_dispatch: builds and checks, then stops. `publish` is gated on the ref being a tag,
 #     so a manual run is a dry run and cannot attach assets to anything.
 on:
   push:
-    tags: ["v*"]
+    tags: ["rill-wallet-v*", "v*"]
   workflow_dispatch:
 
 permissions:
@@ -97,8 +108,10 @@ jobs:
   publish:
     needs: wallet
     runs-on: ubuntu-latest
-    # A tag, and only a tag. This is what makes a workflow_dispatch run a dry run.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # A tag, and only a tag. This is what makes a workflow_dispatch run a dry run. Both spellings
+    # the trigger accepts are listed, because a gate narrower than the trigger builds the assets
+    # and then silently attaches them to nothing.
+    if: startsWith(github.ref, 'refs/tags/rill-wallet-v') || startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4
         with:
