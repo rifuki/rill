@@ -43,9 +43,14 @@ const ASSETS: [&str; 3] = [
     "rill-wallet-linux-x64",
 ];
 
-/// Runner labels GitHub has retired. A matrix entry naming one never schedules, and the release
-/// quietly comes out one asset short.
-const RETIRED_RUNNERS: [&str; 4] = ["macos-11", "macos-12", "macos-13", "ubuntu-20.04"];
+/// The runner labels this release is built on, pinned.
+///
+/// A denylist of retired images was the first shape of this and it rots: it listed `macos-13`, the
+/// label whose retirement broke the matrix, but GitHub has since marked `macos-14` deprecated too
+/// and the check would still have passed. Pinning what is actually used inverts it. Any change to
+/// a runner becomes a deliberate edit here, reviewed next to the reason, and the only thing that
+/// can prove a label still schedules is a run (see the dry run named in the README).
+const RUNNERS: [&str; 3] = ["macos-15", "macos-15-intel", "ubuntu-latest"];
 
 const SMOKE_STEP: &str = "The binary must start and report itself";
 
@@ -436,15 +441,13 @@ fn main_rs_belongs_to_exactly_one_binary_target() {
 }
 
 #[test]
-fn no_matrix_runner_is_a_retired_image() {
-    let runners = matrix_runners();
-    assert_eq!(runners.len(), 3, "one runner per asset:\n{runners:?}");
-    for runner in runners {
-        assert!(
-            !RETIRED_RUNNERS.contains(&runner),
-            "{runner} has been retired by GitHub; a job on it never schedules"
-        );
-    }
+fn the_matrix_runs_on_the_pinned_runners_and_nothing_else() {
+    assert_eq!(
+        matrix_runners(),
+        RUNNERS,
+        "the runner labels changed; a label GitHub has retired never schedules, and the release \
+         then comes out an asset short with every job that did run reporting success"
+    );
 }
 
 // The README.

@@ -82,7 +82,13 @@ jobs:
       # for a loader that cannot find a library, 134 for an abort, 139 for a segfault. The earlier
       # form of this step swallowed every exit code with `|| true` and grepped a second run, which
       # passed a binary that identified itself and then crashed.
+      # `shell: bash` on purpose. Without it the runner uses `bash -e {0}`, and the harness in
+      # release_contract.rs runs this script under `bash --noprofile --norc -eo pipefail -c`, the
+      # invocation this key selects. The two agreed on every case tried, but a test that runs the
+      # step under different semantics than CI is a test of something else, and pipefail is exactly
+      # the semantics this script's `$(...)` capture depends on.
       - name: The binary must start and report itself
+        shell: bash
         run: |
           BIN=target/${{ matrix.target }}/release/rill-wallet
           code=0

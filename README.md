@@ -9,8 +9,8 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds and 359 Rust tests pass. Another 32, which need a live fullnode, are
-`#[ignore]` and run explicitly (see [Build](#build)). The two Move packages pass their own 36
+The workspace builds and 409 Rust tests pass. Another 39, which need a live fullnode, are
+`#[ignore]` and run explicitly (see [Build](#build)). The two Move packages pass their own 37
 and 2.
 
 What is proven, on testnet, each with its digest recorded in this repository:
@@ -27,8 +27,11 @@ What is proven, on testnet, each with its digest recorded in this repository:
 | owner revokes; the agent's next spend, same key, same capability, is refused | `7b6xSFWQuJW3fRpZ77een1KuuwEnmzSfKspzFeUWdr15` |
 | a gated spend flowing into a DeepBook order, in one agent-signed transaction | `GiL7unaYVnx7TF9QDtpUgc3nFSdWxVgkLb6sMDQfCm77` |
 
-The addresses and objects behind these are in `docs/OVERNIGHT.md`, and the sequence that produced
-each digest is in the commit that records it.
+The sequence that produced each digest is in the commit that records it. The first three are no
+longer a record to be trusted, either: `cargo test -p rill --test delegation_live -- --ignored`
+builds a fresh wallet, its rules, the spend the agent makes and the owner cannot, and a revoke, on
+every run. `docs/OVERNIGHT.md` holds the addresses and objects, including what that test last
+produced.
 
 The Bun/TypeScript implementation this replaces is the **specification**. Its behaviour is
 re-expressed here, with conformance fixtures in `fixtures/` checked against it by

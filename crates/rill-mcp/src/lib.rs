@@ -167,9 +167,12 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                  per-transaction cap, rate limit and time window are on-chain rules: read live \
                  from the Move contract that proves them, so this is the answer rather than a \
                  local copy, and nothing in this process can widen them. Protocol scope, asset \
-                 scope, recipient allowlist and slippage floor are pre-flight rules: this signer \
-                 enforces them by refusing to sign, and they are listed from the loaded run-set, \
-                 if one is loaded. A rule labelled pre-flight is one the chain does not hold.",
+                 scope and recipient allowlist are pre-flight rules: this signer enforces them by \
+                 refusing to sign, and they are listed from the loaded run-set, if one is loaded. \
+                 Nothing on the chain checks a destination, a protocol, an asset or a recipient. \
+                 The slippage floor is pre-flight too, and enforced twice: this signer refuses to \
+                 sign an envelope whose guard call does not match, and the chain aborts if the \
+                 floor is breached once it runs.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -388,14 +391,37 @@ mod tests {
         );
         for sentence in sentences {
             assert!(
-                !sentence.contains("on chain") && !sentence.contains("on-chain"),
+                !claims_the_chain(&sentence),
                 "a scoping rule is placed on chain: {sentence:?}"
             );
             assert!(
-                sentence.contains("pre-flight") || sentence.contains("signer"),
+                attributes_the_rule(&sentence),
                 "a scoping rule is named without saying who holds it: {sentence:?}"
             );
         }
+    }
+
+    /// Words that put a rule on the chain. Checked case-insensitively and with "the" optional,
+    /// because "on chain", "on-chain" and "on the chain" are the same claim.
+    const CHAIN_WORDS: [&str; 4] = ["on chain", "on-chain", "on the chain", "move contract"];
+
+    /// Whether a sentence hands a rule to the chain.
+    ///
+    /// A sentence that names the chain in order to deny it holds the rule ("nothing on the chain
+    /// checks a recipient") is the opposite claim and the strongest form of the correction this
+    /// whole unit is about, so it is not a violation. Anything else naming the chain is.
+    fn claims_the_chain(sentence: &str) -> bool {
+        let lower = sentence.to_lowercase();
+        if lower.contains("nothing on") {
+            return false;
+        }
+        CHAIN_WORDS.iter().any(|word| lower.contains(word))
+    }
+
+    /// Whether a sentence says who does hold the rule, or says plainly that the chain does not.
+    fn attributes_the_rule(sentence: &str) -> bool {
+        let lower = sentence.to_lowercase();
+        lower.contains("pre-flight") || lower.contains("signer") || lower.contains("nothing on")
     }
 
     /// The same rule for every tool on both surfaces, so the claim cannot move to another
@@ -408,9 +434,13 @@ mod tests {
         {
             let description = tool.description.as_deref().unwrap_or_default();
             for sentence in scoping_sentences(description) {
+                // Every way a sentence can put a rule on the chain, not only the two phrasings
+                // that were in the text when this was written. "the Move contract enforces the
+                // recipient allowlist" names neither "on chain" nor "on-chain" and would have
+                // passed the narrower check while making exactly the claim it exists to stop.
                 assert!(
-                    !sentence.contains("on chain") && !sentence.contains("on-chain"),
-                    "{} places a scoping rule on chain: {sentence:?}",
+                    !claims_the_chain(&sentence),
+                    "{} puts a scoping rule on the chain: {sentence:?}",
                     tool.name
                 );
             }

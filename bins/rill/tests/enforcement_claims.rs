@@ -62,3 +62,58 @@ fn the_detector_recognises_a_constant_label_however_it_is_spaced() {
     ));
     assert!(!is_constant_label(r#"// nothing about enforcement here"#));
 }
+
+/// The wallet tool hands the loaded run-set's manifest to the read.
+///
+/// This is the one line that decides whether an agent is ever shown a pre-flight rule, and it is
+/// not reachable from an offline test: `wallet()` builds its own client from an endpoint, so a
+/// version of it that passes `None` answers every offline test exactly as the correct one does,
+/// and only a live testnet read tells them apart. Verified by making the edit: `None` in place of
+/// the mapping leaves `cargo test -p rill` fully green.
+///
+/// The assembly itself is covered offline against a fake node in `wallet_read::assembly_tests`.
+/// What is left over, and what this holds, is the wiring between them.
+#[test]
+fn the_wallet_tool_passes_the_run_sets_manifest_to_the_read() {
+    let shipped = shipped(STDIO);
+    let call = shipped
+        .find("read_limits(")
+        .map(|at| &shipped[at..])
+        .expect("stdio.rs must call read_limits; the wallet tool is what it is for");
+    let args = balanced_arguments(call);
+    assert!(
+        args.contains("local"),
+        "the read must be given the run-set's manifest, not a literal: {args}"
+    );
+    assert!(
+        shipped.contains("capability_manifest"),
+        "stdio.rs must map the loaded run-set to its manifest; without it `local` is always None"
+    );
+    assert!(
+        !shipped.contains("let local: Option<&rill_core::manifest::CapabilityManifest> = None"),
+        "the manifest was stubbed out; a run-set's pre-flight rules would be invisible"
+    );
+}
+
+/// The argument list of a call, from its opening parenthesis to the parenthesis that closes it.
+///
+/// Depth-counted rather than cut at the first `)`, because the first argument here is itself a
+/// call: stopping there reads `&endpoint(context` as the whole list and the check fails on
+/// correct code.
+fn balanced_arguments(call: &str) -> &str {
+    let open = call.find('(').expect("a call has an opening parenthesis");
+    let mut depth = 0usize;
+    for (offset, ch) in call[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &call[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("the call to read_limits is never closed");
+}

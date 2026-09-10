@@ -308,12 +308,36 @@ fn the_enforcement_and_module_lookups_have_no_wildcard_arm_so_a_new_kind_cannot_
             body.contains("match "),
             "{function} is expected to decide by matching on the kind"
         );
+        // Any catch-all arm, not only the one spelled `_`. A bare identifier binds every
+        // remaining kind exactly as `_` does and defeats the compile-time guarantee just as
+        // completely, so `other => ...` or `kind => ...` has to fail this too. Every arm here
+        // names a variant, so a pattern with no `::` in it and no literal is a catch-all.
+        let catch_alls = catch_all_arms(body);
         assert!(
-            !body.contains("_ =>"),
-            "{function} has a wildcard arm, so a new kind would default instead of failing to \
-             compile"
+            catch_alls.is_empty(),
+            "{function} has catch-all arms {catch_alls:?}, so a kind added without an arm would \
+             default instead of failing to compile"
         );
     }
+}
+
+/// The patterns in `body` that match anything: `_`, or a bare binding like `other`.
+///
+/// An arm naming a variant carries `::`, and one matching a literal is not an identifier. What is
+/// left over is a binding, and a binding is a wildcard wearing a name.
+fn catch_all_arms(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| line.split_once("=>").map(|(pattern, _)| pattern.trim()))
+        .filter(|pattern| {
+            !pattern.contains("::")
+                && !pattern.is_empty()
+                && (*pattern == "_"
+                    || pattern
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A coin the registry does not know degrades to raw base units rather than guessing decimals.

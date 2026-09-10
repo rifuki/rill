@@ -38,6 +38,23 @@ pub async fn read_limits(
     local: Option<&CapabilityManifest>,
 ) -> Result<Value, String> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
+    read_limits_from(&chain, package_id, wallet_id, local).await
+}
+
+/// The read itself, against any [`SuiRead`].
+///
+/// Split out so the assembly can be driven offline. What it assembles is not obvious: two round
+/// trips, a shared version that has to be present or the object is not a wallet, a gas price that
+/// has to be read because a read priced below the reference is refused, and only then the
+/// labelling. Every one of those steps was reachable only through a live testnet node, so a test
+/// that a later edit passing `None` for the manifest would fail had to spend real SUI to run, and
+/// therefore did not run in CI at all.
+pub async fn read_limits_from(
+    chain: &impl SuiRead,
+    package_id: &str,
+    wallet_id: &str,
+    local: Option<&CapabilityManifest>,
+) -> Result<Value, String> {
     let wallet: Address = wallet_id
         .parse()
         .map_err(|_| format!("{wallet_id} is not an address"))?;
@@ -167,6 +184,123 @@ const NOTE: &str = "Two layers hold this wallet's limits, and each rule above sa
     loaded, not that there are none). The slippage floor is enforced by the signer refusing to \
     sign an envelope whose guard call does not match, and by the chain aborting when the floor is \
     breached. Read again after any change: the on-chain list is a live read, not a cached copy.";
+
+#[cfg(test)]
+mod assembly_tests {
+    //! The whole read, offline.
+    //!
+    //! `label_rules` is pure and well covered below, but the step that decides whether an agent
+    //! ever sees a pre-flight rule is not in it: it is `stdio` mapping the loaded run-set to a
+    //! manifest and this function carrying it through. That was reachable only through a live
+    //! testnet node, so passing `None` by mistake left every offline test green.
+
+    use super::*;
+    use rill_chain::fake::FakeSui;
+    use rill_chain::{ObjectRef, ObjectSummary};
+
+    const WALLET: &str = "0x0000000000000000000000000000000000000000000000000000000000000abc";
+    const PACKAGE: &str = "0x0000000000000000000000000000000000000000000000000000000000000caf";
+
+    /// A `vector<TypeName>` the way the node returns one: a ULEB count, then each name as a ULEB
+    /// length and its bytes.
+    fn type_names(names: &[&str]) -> Vec<u8> {
+        let mut out = vec![names.len() as u8];
+        for name in names {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+        out
+    }
+
+    fn wallet_object(shared: Option<u64>) -> ObjectSummary {
+        ObjectSummary {
+            reference: ObjectRef {
+                id: WALLET.to_owned(),
+                version: 7,
+                digest: String::new(),
+            },
+            object_type: Some(format!("{PACKAGE}::agent_wallet::AgentWallet")),
+            fields: None,
+            shared_initial_version: shared,
+        }
+    }
+
+    fn node(shared: Option<u64>, rules: &[&str]) -> FakeSui {
+        FakeSui::new()
+            .with_object(None, wallet_object(shared))
+            .with_read_return(type_names(
+                &rules
+                    .iter()
+                    .map(|m| format!("{}::{m}::Rule", &PACKAGE[2..]))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ))
+            .with_reference_gas_price(1000)
+    }
+
+    fn run(chain: &FakeSui, local: Option<&CapabilityManifest>) -> Result<Value, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(read_limits_from(chain, PACKAGE, WALLET, local))
+    }
+
+    /// The regression this module exists for: the manifest reaches the output, or a run-set's
+    /// pre-flight rules are invisible to the agent that has to respect them.
+    #[test]
+    fn a_loaded_run_sets_pre_flight_rules_reach_the_output() {
+        let local = CapabilityManifest {
+            wallet_coin_type: "0x2::sui::SUI".into(),
+            rules: vec![
+                CapabilityRule::Budget {
+                    total_mist: "1".into(),
+                },
+                CapabilityRule::RecipientAllowlist {
+                    addresses: vec!["0x1".into()],
+                },
+            ],
+        };
+        let out = run(&node(Some(3), &["budget"]), Some(&local)).expect("the read assembles");
+        assert_eq!(out["wallet"], WALLET);
+        assert_eq!(out["sharedInitialVersion"], 3);
+        assert_eq!(out["rules"][0]["module"], "budget");
+        assert_eq!(out["rules"][0]["enforcement"], "on-chain");
+        assert_eq!(
+            out["preFlightRules"][0]["module"], "recipient_allowlist",
+            "the run-set's manifest must survive the trip, or passing None reads as no limits"
+        );
+    }
+
+    #[test]
+    fn without_a_run_set_the_read_still_answers_and_says_it_has_nothing_to_refuse_against() {
+        let out = run(&node(Some(3), &["budget", "per_tx"]), None).expect("the read assembles");
+        assert_eq!(out["rules"].as_array().unwrap().len(), 2);
+        assert!(out["preFlightRules"].is_null());
+    }
+
+    /// An object that is not shared is not an AgentWallet, and saying so beats reporting empty
+    /// rules for something that never had any.
+    #[test]
+    fn an_object_that_is_not_shared_is_refused_by_name() {
+        let error = run(&node(None, &["budget"]), None).expect_err("not a wallet");
+        assert!(error.contains("is not a shared object"), "{error}");
+    }
+
+    /// The gas price is read because the node refuses a read priced below its reference. A node
+    /// that cannot answer that question has not answered the read either.
+    #[test]
+    fn a_node_that_cannot_price_the_read_fails_it_rather_than_guessing() {
+        let chain = FakeSui::new()
+            .with_object(None, wallet_object(Some(3)))
+            .with_read_return(type_names(&["0xcaf::budget::Rule"]))
+            .with_reference_gas_price_unavailable();
+        let error = run(&chain, None).expect_err("no price, no read");
+        assert!(error.contains("reference gas price"), "{error}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
