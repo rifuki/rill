@@ -28,6 +28,19 @@
 //! Never an MCP tool argument — `rill-mcp`'s keyless guard refuses those by name — never a config
 //! file the agent can read, and never a command-line argument, which is visible in `ps` to every
 //! user on the machine.
+//!
+//! # Which key, when there is more than one
+//!
+//! Owner and agent are different keys by design: `add_rule` asserts the owner, `request_spend`
+//! asserts the agent, and the delegation is only proved when the two are not the same address. So
+//! a machine that runs both halves holds two keys, and `--as <address>` (or `RILL_SIGN_AS`, which
+//! is the same thing for a launch config that cannot pass a flag) says which one signs.
+//!
+//! When neither is given and the keystore holds more than one key, this refuses rather than taking
+//! the first entry. "Whichever key comes first" is not a choice anybody made: `wallet create` mints
+//! a wallet's ownership from the key that signs it, and a key picked by file order can be the agent
+//! as easily as the owner. The refusal lists the candidates, because the fix is to name one.
+//! Exactly one key needs no naming and loads as it always has.
 
 use sui_crypto::simple::SimpleKeypair;
 use sui_crypto::SuiSigner;
@@ -35,6 +48,9 @@ use sui_sdk_types::{Address, Transaction, UserSignature};
 
 /// The environment variable the launching shell or secret manager sets.
 pub const PRIVATE_KEY_VAR: &str = "RILL_SUI_PRIVATE_KEY";
+
+/// The address to sign as, for a launch that cannot pass `--as`. Holds an address, never a key.
+pub const SIGN_AS_VAR: &str = "RILL_SIGN_AS";
 
 /// The `sui` CLI's keystore, relative to the home directory.
 pub const SUI_KEYSTORE_PATH: &str = ".sui/sui_config/sui.keystore";
@@ -80,11 +96,36 @@ pub enum KeystoreError {
     Malformed,
     /// A specific address was asked for and the keystore does not hold its key.
     NoSuchAddress(Address),
+    /// The keystore holds more than one key and nothing said which should sign. Carries every
+    /// candidate's address, because naming one is the fix.
+    Ambiguous(Vec<Address>),
+    /// `--as` or `RILL_SIGN_AS` was given something that is not an address. The value is echoed:
+    /// it is a public address attempt, not a secret, and seeing it is how a typo gets found.
+    NotAnAddress { via: String, value: String },
 }
 
 impl std::fmt::Display for KeystoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Ambiguous(candidates) => {
+                write!(
+                    f,
+                    "~/{SUI_KEYSTORE_PATH} holds {} keys and none was named, so there is no way \
+                     to know which one should sign. Signing with whichever comes first would \
+                     mint a wallet's ownership, or a spend, from a key nobody chose. Pass \
+                     `--as <address>` or set {SIGN_AS_VAR}=<address>. The keys there:",
+                    candidates.len()
+                )?;
+                for address in candidates {
+                    write!(f, "\n  {address}")?;
+                }
+                Ok(())
+            }
+            Self::NotAnAddress { via, value } => write!(
+                f,
+                "{via}{value} is not a Sui address. Both --as and {SIGN_AS_VAR} take the 0x \
+                 address of a key in ~/{SUI_KEYSTORE_PATH}; `sui client addresses` lists them."
+            ),
             Self::NotConfigured => write!(
                 f,
                 "no signing key is configured. Set {PRIVATE_KEY_VAR} in the shell or secret \
@@ -130,20 +171,48 @@ impl Keystore {
         })
     }
 
-    /// Read the first key from the `sui` CLI's keystore.
+    /// Every key the `sui` CLI's keystore holds, decoded.
     ///
     /// The file is a JSON array of base64 `flag || secret` strings, which `sui-crypto` already
-    /// parses — `from_base64` is documented as being for exactly this file. Decoding it by hand
+    /// parses: `from_base64` is documented as being for exactly this file. Decoding it by hand
     /// would mean re-deciding which schemes are valid, and getting that wrong produces an address
     /// that is not the user's, which is worse than refusing: funds sent to it are gone.
-    pub fn from_sui_keystore(path: &std::path::Path) -> Result<Self, KeystoreError> {
+    ///
+    /// An entry that does not decode is skipped rather than aborting the read, since one unreadable
+    /// key should not hide the others. A file with entries and no readable key is `Malformed`; an
+    /// empty or missing file is `NotConfigured`, because the fixes differ.
+    fn keys_in_sui_keystore(path: &std::path::Path) -> Result<Vec<SimpleKeypair>, KeystoreError> {
         let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
         let entries: Vec<String> =
             serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
-        let first = entries.first().ok_or(KeystoreError::NotConfigured)?;
+        if entries.is_empty() {
+            return Err(KeystoreError::NotConfigured);
+        }
+        let keys: Vec<SimpleKeypair> = entries
+            .iter()
+            .filter_map(|e| SimpleKeypair::from_base64(e.trim()).ok())
+            .collect();
+        if keys.is_empty() {
+            return Err(KeystoreError::Malformed);
+        }
+        Ok(keys)
+    }
 
-        let keypair =
-            SimpleKeypair::from_base64(first.trim()).map_err(|_| KeystoreError::Malformed)?;
+    /// Read the one key in the `sui` CLI's keystore.
+    ///
+    /// One, not the first. With two or more keys and nothing to say which, this refuses and names
+    /// them all: see the module note on why taking the first entry is a choice nobody made. The
+    /// caller that has an address to name goes through [`Keystore::for_address`] instead.
+    pub fn from_sui_keystore(path: &std::path::Path) -> Result<Self, KeystoreError> {
+        let mut keys = Self::keys_in_sui_keystore(path)?;
+        if keys.len() > 1 {
+            return Err(KeystoreError::Ambiguous(
+                keys.iter()
+                    .map(|k| k.verifying_key().derive_address())
+                    .collect(),
+            ));
+        }
+        let keypair = keys.pop().expect("exactly one key");
         let address = keypair.verifying_key().derive_address();
         Ok(Self {
             keypair,
@@ -161,12 +230,8 @@ impl Keystore {
     pub fn addresses_in_sui_keystore(
         path: &std::path::Path,
     ) -> Result<Vec<Address>, KeystoreError> {
-        let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
-        let entries: Vec<String> =
-            serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
-        Ok(entries
+        Ok(Self::keys_in_sui_keystore(path)?
             .iter()
-            .filter_map(|e| SimpleKeypair::from_base64(e.trim()).ok())
             .map(|k| k.verifying_key().derive_address())
             .collect())
     }
@@ -174,18 +239,9 @@ impl Keystore {
     /// Select the key for one specific address.
     ///
     /// Each entry is decoded and its address derived, then compared. There is no index to trust and
-    /// no name to trust — the address a key produces is the only thing that identifies it, and an
-    /// entry that does not decode is skipped rather than aborting the search, since one unreadable
-    /// key should not hide the others.
+    /// no name to trust: the address a key produces is the only thing that identifies it.
     pub fn for_address(path: &std::path::Path, wanted: Address) -> Result<Self, KeystoreError> {
-        let contents = std::fs::read_to_string(path).map_err(|_| KeystoreError::NotConfigured)?;
-        let entries: Vec<String> =
-            serde_json::from_str(&contents).map_err(|_| KeystoreError::Malformed)?;
-
-        for entry in &entries {
-            let Ok(keypair) = SimpleKeypair::from_base64(entry.trim()) else {
-                continue;
-            };
+        for keypair in Self::keys_in_sui_keystore(path)? {
             let address = keypair.verifying_key().derive_address();
             if address == wanted {
                 return Ok(Self {
@@ -222,11 +278,12 @@ impl Keystore {
         result
     }
 
-    /// The environment first, then the `sui` CLI's keystore.
+    /// The environment first, then the `sui` CLI's keystore, when nothing named an address.
     ///
     /// A malformed environment variable is an error rather than a reason to fall through: someone
     /// who set it meant to use that key, and quietly signing with a different one is the worst
-    /// possible recovery.
+    /// possible recovery. A keystore with more than one key is an error for the same reason, and
+    /// the error names them: see [`Keystore::from_sui_keystore`].
     pub fn load() -> Result<Self, KeystoreError> {
         match Self::from_env() {
             Ok(store) => Ok(store),
@@ -356,6 +413,141 @@ mod tests {
             "the key must not be renderable: {rendered}"
         );
         assert!(!rendered.contains(&encoded[10..30]));
+    }
+}
+
+/// Selecting among keys in a `sui.keystore` file.
+///
+/// Every file here is a throwaway written to the temp directory from generated keys, and removed
+/// when the test ends. The real keystore is never read: a test that read it would pass or fail on
+/// what happens to be on the machine, and a test that wrote it would be a disaster.
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use sui_crypto::ed25519::Ed25519PrivateKey;
+
+    /// A keystore entry the way the `sui` CLI writes one: base64 `flag || secret`.
+    fn entry(seed: u8) -> String {
+        Ed25519PrivateKey::new([seed; 32]).to_base64()
+    }
+
+    fn address_of(seed: u8) -> Address {
+        Ed25519PrivateKey::new([seed; 32])
+            .public_key()
+            .derive_address()
+    }
+
+    /// A temp keystore file, deleted on drop so a failing assertion does not leave key-shaped
+    /// material lying in the temp directory.
+    ///
+    /// Named by a counter, not by its contents: tests run in parallel in one process, and two
+    /// tests holding the same seeds would otherwise share a path and delete it from under each
+    /// other.
+    struct TempKeystore(std::path::PathBuf);
+
+    impl TempKeystore {
+        fn holding(seeds: &[u8]) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let name = format!(
+                "rill-keystore-test-{}-{}.json",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(name);
+            let entries: Vec<String> = seeds.iter().copied().map(entry).collect();
+            std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempKeystore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn one_key_and_no_address_named_loads_as_before() {
+        let file = TempKeystore::holding(&[11]);
+        let store = Keystore::from_sui_keystore(&file.0).expect("one key is not ambiguous");
+        assert_eq!(store.address(), address_of(11));
+        assert_eq!(store.source(), KeySource::SuiKeystore);
+    }
+
+    /// The pattern the design disowns: with two keys and nothing to choose between them, taking
+    /// the first would sign as whichever key happened to be written first.
+    #[test]
+    fn two_keys_and_no_address_named_is_refused_naming_both() {
+        let file = TempKeystore::holding(&[11, 12]);
+        match Keystore::from_sui_keystore(&file.0) {
+            Err(KeystoreError::Ambiguous(candidates)) => {
+                assert_eq!(candidates, vec![address_of(11), address_of(12)]);
+            }
+            other => panic!("two keys must be refused, not chosen from: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_refusal_says_both_ways_to_choose_and_lists_every_candidate() {
+        let file = TempKeystore::holding(&[11, 12, 13]);
+        let message = Keystore::from_sui_keystore(&file.0)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("--as <address>"), "{message}");
+        assert!(message.contains("RILL_SIGN_AS=<address>"), "{message}");
+        assert!(message.contains("3 keys"), "{message}");
+        for seed in [11, 12, 13] {
+            assert!(
+                message.contains(&address_of(seed).to_string()),
+                "every candidate must be named, so the fix is a copy-paste: {message}"
+            );
+        }
+    }
+
+    /// The refusal lists addresses. It must not list what derived them.
+    #[test]
+    fn the_refusal_carries_no_key_material() {
+        let file = TempKeystore::holding(&[11, 12]);
+        let message = Keystore::from_sui_keystore(&file.0)
+            .unwrap_err()
+            .to_string();
+        for seed in [11, 12] {
+            let secret = entry(seed);
+            assert!(!message.contains(&secret[..16]), "{message}");
+        }
+    }
+
+    /// Selection is by address, not by position: asking for the second key gets the second key.
+    #[test]
+    fn naming_an_address_selects_it_from_a_two_key_keystore() {
+        let file = TempKeystore::holding(&[11, 12]);
+        let store = Keystore::for_address(&file.0, address_of(12)).expect("the second key");
+        assert_eq!(store.address(), address_of(12));
+        assert_ne!(
+            store.address(),
+            address_of(11),
+            "the first entry must not win by being first"
+        );
+    }
+
+    #[test]
+    fn naming_an_address_that_is_not_there_is_refused_by_name() {
+        let file = TempKeystore::holding(&[11, 12]);
+        let wanted = address_of(99);
+        assert_eq!(
+            Keystore::for_address(&file.0, wanted).unwrap_err(),
+            KeystoreError::NoSuchAddress(wanted)
+        );
+    }
+
+    #[test]
+    fn every_address_is_listed_without_a_key() {
+        let file = TempKeystore::holding(&[11, 12]);
+        assert_eq!(
+            Keystore::addresses_in_sui_keystore(&file.0).unwrap(),
+            vec![address_of(11), address_of(12)]
+        );
     }
 }
 

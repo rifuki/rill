@@ -38,6 +38,23 @@ impl GrpcSui {
     }
 }
 
+/// A gRPC status from a simulation, sorted into what it means for the caller.
+///
+/// `InvalidArgument` is the node having read the transaction and refused it before execution: an
+/// input object the sender does not own, a gas budget the coin cannot cover, a malformed input.
+/// There are no effects to carry that answer, so it arrives as a status rather than as a failed
+/// outcome, and it is the earliest verdict Sui gives. An owner-signed spend presenting the agent's
+/// `AgentCap` is refused exactly here, before any Move code runs, and reporting that as "could not
+/// reach the node" told whoever read it that the network was down when the object model had just
+/// done its job. Every other code says nothing about the transaction: unreachable, timed out,
+/// broke.
+fn simulation_status(status: tonic::Status) -> ChainError {
+    match status.code() {
+        tonic::Code::InvalidArgument => ChainError::Rejected(status.message().to_owned()),
+        _ => ChainError::Transport(status.message().to_owned()),
+    }
+}
+
 fn to_summary(o: &sui_rpc::proto::sui::rpc::v2::Object) -> ObjectSummary {
     ObjectSummary {
         reference: ObjectRef {
@@ -194,14 +211,15 @@ impl SuiRead for GrpcSui {
 
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
         // simulation, so a dropped connection can never read as "the transaction would fail" —
-        // or, worse, be smoothed into something a caller treats as a checked result.
+        // or, worse, be smoothed into something a caller treats as a checked result. A refusal
+        // before execution IS a verdict, and is told apart from it: see `simulation_status`.
         let response = self
             .client
             .clone()
             .execution_client()
             .simulate_transaction(request)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .map_err(simulation_status)?
             .into_inner();
 
         let executed = response.transaction.as_ref();
@@ -283,14 +301,15 @@ impl SuiRead for GrpcSui {
 
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
         // simulation, so a dropped connection can never read as "the transaction would fail" —
-        // or, worse, be smoothed into something a caller treats as a checked result.
+        // or, worse, be smoothed into something a caller treats as a checked result. A refusal
+        // before execution IS a verdict, and is told apart from it: see `simulation_status`.
         let response = self
             .client
             .clone()
             .execution_client()
             .simulate_transaction(request)
             .await
-            .map_err(|s| ChainError::Transport(s.message().to_owned()))?
+            .map_err(simulation_status)?
             .into_inner();
 
         let executed = response.transaction.as_ref();
@@ -440,4 +459,40 @@ fn decode_transaction(b64: &str) -> ChainResult<sui_rpc::proto::sui::rpc::v2::Tr
     let mut transaction = sui_rpc::proto::sui::rpc::v2::Transaction::default();
     transaction.bcs = Some(bytes.into());
     Ok(transaction)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// The text a testnet node returned for an owner-signed spend presenting the agent's cap, with
+    /// `InvalidArgument`. It is the earliest refusal Sui gives, and it is a refusal.
+    const OWNERSHIP: &str = "Error checking transaction input objects: Transaction was not signed \
+         by the correct sender: Object 0xea3f is owned by account address 0xb93c, but given \
+         owner/signer address is 0xb649";
+
+    #[test]
+    fn a_refusal_before_execution_is_a_verdict_not_an_outage() {
+        assert_eq!(
+            simulation_status(tonic::Status::invalid_argument(OWNERSHIP)),
+            ChainError::Rejected(OWNERSHIP.to_owned()),
+            "the node read the transaction and said no; that is an answer"
+        );
+    }
+
+    /// The gate must fail closed on a node that did not answer, and it must say so: a dropped
+    /// connection dressed up as a refusal sends someone to fix a transaction that was fine.
+    #[test]
+    fn an_unreachable_node_is_still_an_outage() {
+        for status in [
+            tonic::Status::unavailable("connection refused"),
+            tonic::Status::deadline_exceeded("timed out"),
+            tonic::Status::internal("node error"),
+        ] {
+            assert!(
+                matches!(simulation_status(status), ChainError::Transport(_)),
+                "only a refusal the node actually made may be reported as one"
+            );
+        }
+    }
 }

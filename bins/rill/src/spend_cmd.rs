@@ -254,10 +254,15 @@ pub async fn spend_json(
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    let outcome = chain
-        .simulate(&b64)
-        .await
-        .map_err(|e| format!("the node did not answer, so there is no verdict: {e}"))?;
+    let outcome = chain.simulate(&b64).await.map_err(|e| match e {
+        // The node read it and said no before execution: an input the sender does not own, most
+        // often the AgentCap when the owner signs the agent's spend. That is the earliest verdict
+        // there is, and calling it "no answer" would send the reader to check the network.
+        rill_chain::ChainError::Rejected(why) => {
+            format!("the chain refused it before execution: {why}")
+        }
+        other => format!("the node did not answer, so there is no verdict: {other}"),
+    })?;
 
     if !outcome.ok {
         let error = outcome.error.unwrap_or_else(|| "no reason given".into());

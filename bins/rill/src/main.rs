@@ -17,7 +17,7 @@
 use std::io::{stdin, stdout, BufReader};
 
 use rill_chain::describe::describe_function;
-use rill_cli::keystore::Keystore;
+use rill_cli::keystore::{Keystore, KeystoreError, SIGN_AS_VAR};
 use rill_cli::runset::RunSet;
 use rill_cli::stdio::{serve, WalletContext};
 use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
@@ -53,25 +53,47 @@ struct Loaded {
     ///
     /// Several commands need no key at all — `describe` reads a public package, `help` reads
     /// nothing — and a warning they cannot act on trains the reader to skip warnings. So the reason
-    /// is carried and reported by the commands that are actually blocked by it.
-    keystore_error: Option<String>,
+    /// is carried and reported by the commands that are actually blocked by it. Kept typed, because
+    /// one of the reasons is a refusal rather than an absence and `mcp` has to tell them apart.
+    keystore_error: Option<KeystoreError>,
     run_set: Option<RunSet>,
     network: String,
     mainnet_allowed: bool,
+}
+
+impl Loaded {
+    /// The reason there is no key, for the commands that need one.
+    fn no_key_reason(&self) -> String {
+        self.keystore_error
+            .as_ref()
+            .map_or_else(|| "no key loaded".to_owned(), ToString::to_string)
+    }
 }
 
 fn load() -> Loaded {
     // `--as <address>` selects which key signs. Owner-only calls and agent-only calls are different
     // keys by design — `add_rule` asserts the owner, `request_spend` asserts the agent — so a tool
     // that can only sign as one of them can exercise only half the contract.
+    //
+    // `RILL_SIGN_AS` is the same choice for a launch that has nowhere to put a flag: an MCP config
+    // names a command and an environment, and pinning the key there means the agent's server can
+    // never start as the owner by accident. The flag wins when both are present, since a flag is
+    // typed for this run and the variable was set for every run.
     let argv: Vec<String> = std::env::args().collect();
     let requested = argv
         .iter()
         .position(|a| a == "--as")
         .and_then(|i| argv.get(i + 1))
-        .map(|a| {
-            a.parse::<sui_sdk_types::Address>()
-                .map_err(|_| format!("--as {a} is not an address"))
+        .map(|a| ("--as ".to_owned(), a.clone()))
+        .or_else(|| {
+            std::env::var(SIGN_AS_VAR)
+                .ok()
+                .map(|a| (format!("{SIGN_AS_VAR}="), a))
+        })
+        .map(|(via, value)| {
+            value
+                .parse::<sui_sdk_types::Address>()
+                .map_err(|_| KeystoreError::NotAnAddress { via, value })
         });
 
     let (keystore, keystore_error) = match requested {
@@ -80,11 +102,13 @@ fn load() -> Loaded {
         Some(Err(why)) => (None, Some(why)),
         Some(Ok(address)) => match Keystore::load_for(address) {
             Ok(store) => (Some(store), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => (None, Some(e)),
         },
+        // Nothing named. With one key this is that key; with several it is a refusal that lists
+        // them, never the first one.
         None => match Keystore::load() {
             Ok(store) => (Some(store), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => (None, Some(e)),
         },
     };
 
@@ -238,13 +262,7 @@ fn main() {
             // Bare, so it composes: `export SENDER=$(rill address)`.
             Some(store) => println!("{}", store.address()),
             None => {
-                eprintln!(
-                    "rill: {}",
-                    loaded
-                        .keystore_error
-                        .as_deref()
-                        .unwrap_or("no key loaded, so there is no address to print")
-                );
+                eprintln!("rill: {}", loaded.no_key_reason());
                 std::process::exit(1);
             }
         },
@@ -325,10 +343,7 @@ fn main() {
                 std::process::exit(1);
             }
             let Some(keystore) = &loaded.keystore else {
-                eprintln!(
-                    "rill: {}",
-                    loaded.keystore_error.as_deref().unwrap_or("no key loaded")
-                );
+                eprintln!("rill: {}", loaded.no_key_reason());
                 std::process::exit(1);
             };
             let argv: Vec<String> = std::env::args().collect();
@@ -430,10 +445,7 @@ fn main() {
         }
         Some("spend") => {
             let Some(keystore) = &loaded.keystore else {
-                eprintln!(
-                    "rill: {}",
-                    loaded.keystore_error.as_deref().unwrap_or("no key loaded")
-                );
+                eprintln!("rill: {}", loaded.no_key_reason());
                 std::process::exit(1);
             };
             let argv: Vec<String> = std::env::args().collect();
@@ -585,7 +597,20 @@ fn main() {
             }
             match &loaded.keystore {
                 Some(store) => eprintln!("rill ready — {} ({})", loaded.network, store.address()),
+                // No key at all is a degraded server: the read-only tools still answer, and the
+                // agent is told why the rest will not. Several keys and none named is different.
+                // There is a key that could sign; the launch config just did not say which, and a
+                // server that stays up in that state is one whose first fix is somebody picking
+                // one. It stops here, where the operator is reading stderr, with the candidates.
                 None => {
+                    if let Some(refusal @ KeystoreError::Ambiguous(_)) = &loaded.keystore_error {
+                        eprintln!("rill: {refusal}");
+                        eprintln!(
+                            "rill: not serving. Set {SIGN_AS_VAR}=<address> in the launch \
+                             environment, or pass --as <address>."
+                        );
+                        std::process::exit(1);
+                    }
                     eprintln!("rill started with no key; only read-only tools will answer");
                     if let Some(reason) = &loaded.keystore_error {
                         eprintln!("rill: {reason}");

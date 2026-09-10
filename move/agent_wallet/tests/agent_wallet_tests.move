@@ -14,6 +14,8 @@ module agent_wallet::agent_wallet_tests {
 
     const OWNER: address = @0xA;
     const AGENT: address = @0xB;
+    /// Holds a cap it was handed, and was never named as the wallet's agent.
+    const CAP_HOLDER: address = @0xC;
     const NEW_AGENT: address = @0xD;
 
     // Mirror agent_wallet::agent_wallet's abort codes (constants are module-private).
@@ -23,6 +25,7 @@ module agent_wallet::agent_wallet_tests {
     const E_INSUFFICIENT_FUNDS: u64 = 4;
     const E_BAD_CAP: u64 = 5;
     const E_ZERO_AMOUNT: u64 = 6;
+    const E_NOT_AGENT: u64 = 7;
     const E_EXPIRY_NOT_FORWARD: u64 = 8;
     const E_WRONG_WALLET: u64 = 9;
     const E_RULE_NOT_SATISFIED: u64 = 10;
@@ -672,6 +675,39 @@ module agent_wallet::agent_wallet_tests {
 
         ts::next_tx(&mut sc, AGENT);
         let (v, mut wallet, cap) = take_agent_side(&sc);
+        let mut clk = clock::create_for_testing(ts::ctx(&mut sc));
+        clk.set_for_testing(1000);
+        let req = new_request(&mut sc, &wallet, &cap, &v, 100, &clk);
+
+        drain(&mut sc, &mut wallet, req, &v, &clk);
+        clock::destroy_for_testing(clk);
+        return_agent_side(&sc, v, wallet, cap);
+        ts::end(sc);
+    }
+
+    // ── the second line of defence: a cap the sender really owns, held by someone who is not the agent ──
+    //
+    // The first line is Sui's own object model, and it is out of a Move unit test's reach: an
+    // owner-signed `request_spend` never executes, because the `AgentCap` is owned by the agent and
+    // a transaction the owner signs cannot present it (proved on testnet, `bins/rill/tests/
+    // delegation_live.rs`). This is the line behind it. `AgentCap` has `store`, so the agent can hand
+    // it to a third address, and that address then owns the cap outright: the object model lets it
+    // present the cap, and the contract must still refuse, because possession is not identity.
+    #[test, expected_failure(abort_code = E_NOT_AGENT, location = aw)]
+    fun request_spend_by_cap_holder_who_is_not_the_agent_aborts() {
+        let mut sc = ts::begin(OWNER);
+        create(&mut sc, 1000, 10_000);
+
+        // The agent gives its cap away.
+        ts::next_tx(&mut sc, AGENT);
+        let cap = ts::take_from_sender<AgentCap>(&sc);
+        transfer::public_transfer(cap, CAP_HOLDER);
+
+        // The holder owns the cap, matches `wallet.cap_id`, and is not `wallet.agent`.
+        ts::next_tx(&mut sc, CAP_HOLDER);
+        let (v, mut wallet, cap) = take_agent_side(&sc);
+        assert!(aw::cap_id(&wallet) == object::id(&cap), 0);
+        assert!(aw::agent(&wallet) != CAP_HOLDER, 1);
         let mut clk = clock::create_for_testing(ts::ctx(&mut sc));
         clk.set_for_testing(1000);
         let req = new_request(&mut sc, &wallet, &cap, &v, 100, &clk);
