@@ -5,7 +5,7 @@
 //! Every step is signed by the agent, and no step needs the owner's key.
 
 use rill_chain::{grpc::GrpcSui, SuiRead, SuiWrite};
-use rill_ptb::book::parse_u64_return;
+use rill_ptb::book::{book_params_transaction, parse_book_params};
 use rill_ptb::book_params::BookParams;
 use rill_ptb::deepbook::{place_limit_order, LimitOrder, FLOAT_SCALAR};
 use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
@@ -63,6 +63,9 @@ async fn owned_input(chain: &GrpcSui, id: &str, label: &str) -> Result<ObjectInp
 
 /// Ask the pool for its tick, lot and minimum.
 ///
+/// The PTB and the decoding both live in `rill_ptb::book`, so the live test that reads two pools
+/// exercises the same builder this command ships rather than a second copy of its shape.
+///
 /// `gas_price` is the reference price the command already read for its own transaction. A read
 /// needs it too: the node refuses one priced below the reference before the function runs, and
 /// does not price the read itself.
@@ -73,43 +76,15 @@ async fn read_book_params(
     shared: &SharedObjects,
     gas_price: u64,
 ) -> Result<BookParams, String> {
-    use sui_sdk_types::Identifier;
-    use sui_transaction_builder::Function;
-
-    let mut tx = TransactionBuilder::new();
-    tx.set_sender(Address::ZERO);
-    tx.set_gas_budget(10_000_000);
-    tx.set_gas_price(gas_price);
-    let pool_arg = tx.object(
-        shared
-            .input(pool.pool_id, false)
-            .map_err(|e| e.to_string())?,
-    );
-    tx.move_call(
-        Function::new(
-            deepbook_package
-                .parse()
-                .map_err(|_| "bad deepbook package id")?,
-            Identifier::new("pool").map_err(|_| "pool")?,
-            Identifier::new("pool_book_params").map_err(|_| "pool_book_params")?,
-        )
-        .with_type_args(vec![
-            pool.base_coin_type
-                .parse()
-                .map_err(|_| "bad base coin type")?,
-            pool.quote_coin_type
-                .parse()
-                .map_err(|_| "bad quote coin type")?,
-        ]),
-        vec![pool_arg],
-    );
-    tx.add_gas_objects([ObjectInput::owned(
-        "0x1".parse().expect("valid"),
-        1,
-        Digest::ZERO,
-    )]);
-    let mut built = tx.try_build().map_err(|e| e.to_string())?;
-    built.gas_payment.objects.clear();
+    let built = book_params_transaction(
+        deepbook_package
+            .parse()
+            .map_err(|_| "bad deepbook package id")?,
+        pool,
+        shared,
+        gas_price,
+    )
+    .map_err(|e| e.to_string())?;
 
     let b64 = {
         use base64::Engine as _;
@@ -120,23 +95,13 @@ async fn read_book_params(
         .simulate_read(&b64)
         .await
         .map_err(|e| format!("reading the pool's parameters: {e}"))?;
-    let values: Vec<u64> = outcome
+    let returned: Vec<&[u8]> = outcome
         .command_returns
         .iter()
         .flatten()
-        .filter_map(|b| parse_u64_return(b).ok())
+        .map(Vec::as_slice)
         .collect();
-    if values.len() != 3 {
-        return Err(format!(
-            "pool_book_params returned {} values, expected 3 (tick, lot, min)",
-            values.len()
-        ));
-    }
-    Ok(BookParams {
-        tick_size: values[0],
-        lot_size: values[1],
-        min_size: values[2],
-    })
+    parse_book_params(&returned).map_err(|e| e.to_string())
 }
 
 pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Result<(), String> {

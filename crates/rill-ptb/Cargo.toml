@@ -16,3 +16,7 @@ base64 = { workspace = true }
 bcs = "0.1"
 tokio = { workspace = true, features = ["macros", "rt"] }
 rill-chain = { workspace = true }
+# A dev-only cycle, which Cargo allows: rill-policy depends on this crate. The live order test
+# decodes a landed transaction with the signer's own decoder rather than a second copy of it, so
+# what it asserts is what a signer would actually see. rill-chain is already here on the same terms.
+rill-policy = { workspace = true }

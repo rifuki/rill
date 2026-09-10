@@ -1322,6 +1322,7 @@ dependencies = [
  "bcs",
  "rill-chain",
  "rill-core",
+ "rill-policy",
  "sui-sdk-types",
  "sui-transaction-builder",
  "thiserror 2.0.20",

@@ -79,6 +79,75 @@ impl GrpcSui {
         })
         .await
     }
+
+    /// The exact bytes of a transaction that already landed, base64 BCS.
+    ///
+    /// # Effects say a transaction worked, never what it did
+    ///
+    /// [`SuiWrite::wait_for`] reads a digest's effects, which report success, gas and balance
+    /// changes. None of that names a single Move call, so a claim of the form "this digest placed a
+    /// DeepBook order through the delegated capability" cannot be checked from effects at all. It
+    /// was instead recorded in a commit message, which no test reads.
+    ///
+    /// These are the bytes the signature covered. Handed to the signer's own decoder they yield the
+    /// Move call sequence that is on chain, so a recorded digest becomes an assertion rather than a
+    /// note. It costs nothing and changes nothing: a read of a transaction that was already paid
+    /// for.
+    ///
+    /// Inherent rather than on [`SuiRead`], because no production path needs it and every
+    /// implementor of that trait would otherwise have to answer for a transaction history it does
+    /// not have.
+    ///
+    /// # A recorded digest is not permanent evidence
+    ///
+    /// A public fullnode prunes. `GiL7unaYVnx7TF9QDtpUgc3nFSdWxVgkLb6sMDQfCm77`, recorded by commit
+    /// `4ebe18a`, was gone from `fullnode.testnet.sui.io` eight days later, confirmed by `sui client
+    /// tx-block` answering the same way. So `NotFound` here means what it says and is a normal
+    /// outcome rather than a fault: the caller decides whether a digest it can no longer read is a
+    /// failure. It is also why a test that only reads digests back is not enough on its own.
+    pub async fn landed_transaction_base64(&self, digest: &str) -> ChainResult<String> {
+        use sui_rpc::proto::sui::rpc::v2::GetTransactionRequest;
+        let mut request = GetTransactionRequest::default();
+        request.digest = Some(digest.to_owned());
+        request.read_mask = Some(GrpcSui::mask(&["digest", "transaction.bcs"]));
+
+        let response = self
+            .client
+            .clone()
+            .ledger_client()
+            .get_transaction(request)
+            .await
+            // The shared classifier sends every status that is not one of Sui's two refusal codes
+            // to `Transport`, which is right for a build or a submit: there, not knowing is the
+            // thing the caller must not mistake for an answer. Here an unknown digest *is* the
+            // answer, and reporting it as "could not reach the Sui node" would send a reader to
+            // check a network that is fine. So this one status is translated at this one call site
+            // rather than changed for every path that shares the classifier.
+            .map_err(|status| match status.code() {
+                tonic::Code::NotFound => ChainError::NotFound(status.message().to_owned()),
+                _ => refusal_or_transport(status),
+            })?
+            .into_inner();
+
+        // A node that answers without the bytes is not the same thing as a node that says the
+        // digest is unknown, but both leave the caller with nothing to decode, and decoding an
+        // empty buffer would report "this transaction called nothing", a false acquittal.
+        let bytes = response
+            .transaction
+            .as_ref()
+            .and_then(|t| t.transaction.as_ref())
+            .and_then(|t| t.bcs.as_ref())
+            .and_then(|b| b.value.as_ref())
+            .ok_or_else(|| {
+                ChainError::NotFound(format!(
+                    "the node returned no transaction bytes for {digest}; it may not have that \
+                     transaction, or it may be pruned"
+                ))
+            })?;
+
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
 }
 
 /// One page of a listing, in this crate's terms.

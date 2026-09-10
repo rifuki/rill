@@ -83,11 +83,40 @@ fn the_order_builder_never_calls_the_owner_only_deposit() {
         assert!(
             !code.contains("ident(\"deposit\")"),
             "the builder emits balance_manager::deposit, which needs the manager owner's \
-             signature — and request_spend in the same transaction needs the agent's:\n  {line}"
+             signature, and request_spend in the same transaction needs the agent's:\n  {line}"
         );
         assert!(
             !code.contains("ident(\"generate_proof_as_owner\")"),
             "the builder emits generate_proof_as_owner, which needs the owner's signature:\n  {line}"
+        );
+    }
+}
+
+/// The positive control for the grep above.
+///
+/// A check that something is absent passes just as well when the thing it looks for has stopped
+/// being written that way at all. Move a function name out of `ident("...")` into a constant, a
+/// helper, or a `format!`, and the test above goes green on a file it can no longer see into, while
+/// reading exactly as though it had verified something.
+///
+/// So the shape is asserted from the other side: the two delegated calls the order path depends on
+/// must appear in the file in the same `ident("...")` form the grep scans for. If this fails, the
+/// grep has stopped meaning anything and needs rewriting before it is trusted again.
+#[test]
+fn the_grep_above_is_looking_at_a_file_still_written_in_the_shape_it_greps_for() {
+    let source = include_str!("../src/deepbook.rs");
+    for delegated in ["deposit_with_cap", "generate_proof_as_trader"] {
+        let shape = format!("ident(\"{delegated}\")");
+        let emitted = source.lines().any(|line| {
+            line.split("//")
+                .next()
+                .unwrap_or("")
+                .contains(shape.as_str())
+        });
+        assert!(
+            emitted,
+            "the builder no longer emits {delegated} as {shape}, so a grep for the owner-only form \
+             written the same way cannot see it either; the negative check above is now vacuous"
         );
     }
 }

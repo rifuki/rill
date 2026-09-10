@@ -23,6 +23,7 @@ use rill_core::amounts::AmountError;
 use sui_sdk_types::{Address, Identifier};
 use sui_transaction_builder::{Function, TransactionBuilder};
 
+use crate::book_params::BookParams;
 use crate::shared::{SharedObjects, UnknownSharedVersion};
 
 use crate::deepbook::{PoolSpec, FLOAT_SCALAR};
@@ -78,6 +79,10 @@ pub enum BookError {
     NoReturnValue,
     /// The bytes were not the u64 the function is declared to return.
     UnreadableValue,
+    /// `pool_book_params` is declared to return three u64s and returned a different number of them.
+    WrongParameterCount {
+        found: usize,
+    },
 }
 
 impl std::fmt::Display for BookError {
@@ -93,6 +98,10 @@ impl std::fmt::Display for BookError {
             Self::UnreadableValue => write!(
                 f,
                 "the mid-price call returned something that is not a u64; refusing to guess at it"
+            ),
+            Self::WrongParameterCount { found } => write!(
+                f,
+                "pool_book_params returned {found} values, expected 3 (tick, lot, min)"
             ),
         }
     }
@@ -114,10 +123,14 @@ fn ident(s: &str) -> Result<Identifier, BookError> {
 pub const PLACEHOLDER_GAS_OBJECT: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000001";
 
-/// Build the transaction whose simulation returns a pool's mid price.
+/// What a keyless pool read is allowed to cost. A ceiling on a transaction nobody submits, and the
+/// only number here that is not read from the chain, because nothing charges it.
+const READ_GAS_BUDGET: u64 = 10_000_000;
+
+/// The builder every keyless pool read starts from.
 ///
-/// Nothing here needs a sender with funds — it is never submitted. A zero sender is used so the
-/// call cannot be mistaken for something meant to execute.
+/// Nothing here needs a sender with funds, because none of these transactions is ever submitted. A
+/// zero sender is used so the call cannot be mistaken for something meant to execute.
 ///
 /// # The price is a parameter, even for a read
 ///
@@ -129,45 +142,27 @@ pub const PLACEHOLDER_GAS_OBJECT: &str =
 /// which mainnet's may one day be and testnet's already once was. The caller reads the reference
 /// price once per command and passes it here, the same number it puts on the transaction it
 /// submits.
-pub fn mid_price_transaction(
-    deepbook_package: Address,
-    pool: &PoolSpec,
-    clock_id: Address,
-    // Initial shared versions read from the chain; a missing one refuses the build.
-    shared: &SharedObjects,
-    // The network's reference gas price, read by the caller. See the note above.
-    gas_price: u64,
-) -> Result<sui_sdk_types::Transaction, BookError> {
+fn read_builder(gas_price: u64) -> TransactionBuilder {
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
-    tx.set_gas_budget(10_000_000);
+    tx.set_gas_budget(READ_GAS_BUDGET);
     tx.set_gas_price(gas_price);
+    tx
+}
 
-    let pool_object = tx.object(shared.input(pool.pool_id, false)?);
-    let clock = tx.object(shared.input(clock_id, false)?);
-
-    let base: sui_sdk_types::TypeTag = pool
-        .base_coin_type
-        .parse()
-        .map_err(|_| BookError::BadIdentifier(pool.base_coin_type.clone()))?;
-    let quote: sui_sdk_types::TypeTag = pool
-        .quote_coin_type
-        .parse()
-        .map_err(|_| BookError::BadIdentifier(pool.quote_coin_type.clone()))?;
-
-    tx.move_call(
-        Function::new(deepbook_package, ident("pool")?, ident("mid_price")?)
-            .with_type_args(vec![base, quote]),
-        vec![pool_object, clock],
-    );
-
-    // A read has no payer, but the builder will not produce a transaction without a gas object. So
-    // one is supplied to satisfy the builder and then removed: an empty gas payment is what asks
-    // the node to select gas itself, and it is the only shape a public fullnode accepts for a
-    // transaction whose sender owns nothing.
-    //
-    // Naming a real object here instead would be worse than pointless — the node looks it up, finds
-    // it at a different version, and refuses with a message about rebuilding the transaction.
+/// Close a keyless read: give the builder a gas object, then take it away again.
+///
+/// A read has no payer, but the builder will not produce a transaction without a gas object. So one
+/// is supplied to satisfy the builder and then removed: an empty gas payment is what asks the node
+/// to select gas itself, and it is the only shape a public fullnode accepts for a transaction whose
+/// sender owns nothing.
+///
+/// Naming a real object here instead would be worse than pointless: the node looks it up, finds it
+/// at a different version, and refuses with a message about rebuilding the transaction.
+fn finish_read(
+    mut tx: TransactionBuilder,
+    label: &str,
+) -> Result<sui_sdk_types::Transaction, BookError> {
     tx.add_gas_objects([sui_transaction_builder::ObjectInput::owned(
         PLACEHOLDER_GAS_OBJECT
             .parse()
@@ -178,9 +173,110 @@ pub fn mid_price_transaction(
 
     let mut built = tx
         .try_build()
-        .map_err(|_| BookError::BadIdentifier("mid_price transaction".into()))?;
+        .map_err(|_| BookError::BadIdentifier(label.to_owned()))?;
     built.gas_payment.objects.clear();
     Ok(built)
+}
+
+/// The pool's two coin types, as type arguments.
+fn pool_type_args(pool: &PoolSpec) -> Result<Vec<sui_sdk_types::TypeTag>, BookError> {
+    let base: sui_sdk_types::TypeTag = pool
+        .base_coin_type
+        .parse()
+        .map_err(|_| BookError::BadIdentifier(pool.base_coin_type.clone()))?;
+    let quote: sui_sdk_types::TypeTag = pool
+        .quote_coin_type
+        .parse()
+        .map_err(|_| BookError::BadIdentifier(pool.quote_coin_type.clone()))?;
+    Ok(vec![base, quote])
+}
+
+/// Build the transaction whose simulation returns a pool's mid price.
+///
+/// See [`read_builder`] for why the gas price is a parameter rather than a number named here.
+pub fn mid_price_transaction(
+    deepbook_package: Address,
+    pool: &PoolSpec,
+    clock_id: Address,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
+    // The network's reference gas price, read by the caller. See `read_builder`.
+    gas_price: u64,
+) -> Result<sui_sdk_types::Transaction, BookError> {
+    let mut tx = read_builder(gas_price);
+
+    let pool_object = tx.object(shared.input(pool.pool_id, false)?);
+    let clock = tx.object(shared.input(clock_id, false)?);
+
+    tx.move_call(
+        Function::new(deepbook_package, ident("pool")?, ident("mid_price")?)
+            .with_type_args(pool_type_args(pool)?),
+        vec![pool_object, clock],
+    );
+
+    finish_read(tx, "mid_price transaction")
+}
+
+/// Build the transaction whose simulation returns what a pool will accept.
+///
+/// # Why this is here and not at the call site
+///
+/// `rill order` built this same shape inline, and so did the test that read the numbers off two
+/// pools. Three copies of one PTB, and the two that were checked were not the one that ships, so a
+/// green test said nothing about the command. One builder, used by both, is what makes the live test
+/// cover production.
+///
+/// Paired with [`parse_book_params`], which reads the three numbers back out in the order the Move
+/// function declares them.
+pub fn book_params_transaction(
+    deepbook_package: Address,
+    pool: &PoolSpec,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
+    // The network's reference gas price, read by the caller. See `read_builder`.
+    gas_price: u64,
+) -> Result<sui_sdk_types::Transaction, BookError> {
+    let mut tx = read_builder(gas_price);
+
+    let pool_object = tx.object(shared.input(pool.pool_id, false)?);
+
+    tx.move_call(
+        Function::new(deepbook_package, ident("pool")?, ident("pool_book_params")?)
+            .with_type_args(pool_type_args(pool)?),
+        vec![pool_object],
+    );
+
+    finish_read(tx, "pool_book_params transaction")
+}
+
+/// Read a pool's tick, lot and minimum out of what the simulation returned.
+///
+/// The argument is every return value the simulation produced, flattened across commands, which for
+/// a transaction with one call is that call's three u64s.
+///
+/// # A value that does not parse is a refusal, not a value to skip
+///
+/// Dropping an unreadable return would turn a three-value answer into a two-value one, and the
+/// caller would then be told the pool returned the wrong number of parameters: a true statement
+/// about the wrong fault, pointing at DeepBook when the fault is in the decoding here. The order is
+/// the one `pool_book_params` declares, and nothing in the returned bytes labels which is which, so
+/// getting it wrong is silent and this is the single place it can happen.
+pub fn parse_book_params(returned: &[&[u8]]) -> Result<BookParams, BookError> {
+    if returned.len() != 3 {
+        return Err(BookError::WrongParameterCount {
+            found: returned.len(),
+        });
+    }
+    let values = [
+        parse_u64_return(returned[0])?,
+        parse_u64_return(returned[1])?,
+        parse_u64_return(returned[2])?,
+    ];
+    Ok(BookParams {
+        tick_size: values[0],
+        lot_size: values[1],
+        min_size: values[2],
+    })
 }
 
 /// Read a u64 out of a command's BCS return value.
@@ -314,6 +410,62 @@ mod tests {
         assert!(mid_price_transaction(pkg, &pool, clock, &shared, 1_000).is_ok());
     }
 
+    #[test]
+    fn the_book_params_transaction_builds() {
+        let pkg: Address = "0x000000000000000000000000000000000000000000000000000000000000dee9"
+            .parse()
+            .unwrap();
+        let mut pool = spec(1_000_000, 1_000_000_000);
+        pool.pool_id = "0x0000000000000000000000000000000000000000000000000000000000000020"
+            .parse()
+            .unwrap();
+        let mut shared = SharedObjects::new();
+        shared.insert(pool.pool_id, 419_123);
+        let built = book_params_transaction(pkg, &pool, &shared, 1_000).expect("builds");
+        assert!(
+            built.gas_payment.objects.is_empty(),
+            "a read asks the node to select its own gas, which an empty payment is what requests"
+        );
+    }
+
+    /// The pool reports three bare numbers and labels none of them, so the order they are read in is
+    /// the whole of the meaning. Swapping two is a silent change: every value still parses.
+    #[test]
+    fn the_three_returned_numbers_keep_the_order_the_move_function_declares() {
+        let tick = 10_000_000u64.to_le_bytes();
+        let lot = 1_000_000u64.to_le_bytes();
+        let min = 10_000_000u64.to_le_bytes();
+        let params = parse_book_params(&[&tick, &lot, &min]).expect("three u64s");
+        assert_eq!(
+            params,
+            BookParams {
+                tick_size: 10_000_000,
+                lot_size: 1_000_000,
+                min_size: 10_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_return_of_the_wrong_length_names_how_many_came_back() {
+        let one = 10u64.to_le_bytes();
+        let err = parse_book_params(&[&one, &one]).unwrap_err();
+        assert_eq!(err, BookError::WrongParameterCount { found: 2 });
+        assert!(err.to_string().contains("expected 3"), "{err}");
+    }
+
+    /// Skipping the value that did not parse would leave two good ones and report the pool as having
+    /// answered with two parameters, which points at DeepBook for a decoding fault here.
+    #[test]
+    fn an_unreadable_parameter_is_refused_rather_than_skipped() {
+        let good = 10u64.to_le_bytes();
+        let short = [1u8, 2, 3];
+        assert_eq!(
+            parse_book_params(&[&good, &short, &good]),
+            Err(BookError::UnreadableValue)
+        );
+    }
+
     /// The bug this module was written against: a pool entered at version zero is not a pool the
     /// node can find, and it must be refused here rather than discovered as a missing object.
     #[test]
@@ -331,5 +483,12 @@ mod tests {
             mid_price_transaction(pkg, &pool, clock, &shared, 1_000),
             Err(BookError::UnknownShared(_))
         ));
+        assert!(
+            matches!(
+                book_params_transaction(pkg, &pool, &shared, 1_000),
+                Err(BookError::UnknownShared(_))
+            ),
+            "the parameter read references the same pool and must refuse on the same ground"
+        );
     }
 }
