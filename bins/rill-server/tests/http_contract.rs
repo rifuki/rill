@@ -16,8 +16,23 @@ use tower::ServiceExt as _;
 use rill_server::routes;
 use rill_server::state::{AppState, Config, Network};
 
+/// A router with a store of its own.
+///
+/// The directory was once keyed on the process id alone, so every test in this binary shared one
+/// `oauth.json`. Tests run in parallel, the file store rewrites the whole file on change, and two
+/// instances each holding their own in-memory copy overwrote each other: a registration made by
+/// one test could vanish before the next line of the same test read it back. That is a flake that
+/// only appears once a test writes, which is why it stayed hidden until the OAuth flow was
+/// exercised end to end. A counter per call is enough, and a router that needs continuity across
+/// several requests is cloned rather than rebuilt.
 fn app() -> axum::Router {
-    let dir = std::env::temp_dir().join(format!("rill-server-test-{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "rill-server-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let config = Config {
         port: 3939,
@@ -828,4 +843,195 @@ async fn an_unsupported_grant_type_is_refused_by_name() {
 async fn revoking_a_token_that_never_existed_still_answers_ok() {
     let status = post_status("/oauth/revoke", serde_json::json!({ "token": "nonsense" })).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ── The OAuth wire format, which is not this repository's to choose ──────────────────────────
+//
+// `/api/*` answers the deployed frontend and keeps its `{success, data}` envelope. `/oauth/*`
+// answers OAuth libraries, and they read the RFCs. The two were sharing one helper, so a
+// successful token exchange came back wrapped and every conforming client saw a malformed
+// response. These hold the line at the wire, where the client actually reads it.
+
+/// Post to `path` with an explicit content type, returning the status and parsed body.
+async fn post_raw(path: &str, content_type: &str, body: &str) -> (StatusCode, Value) {
+    let response = app()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Register a client and walk a PKCE authorization to a code, on one router instance.
+///
+/// The whole exchange has to happen against the same `app()` because the store lives in that
+/// instance; a second router would not know the code.
+async fn code_for(router: &axum::Router, challenge: &str) -> (String, String) {
+    let registration = router
+        .clone()
+        .oneshot(
+            Request::post("/oauth/register")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"redirect_uris":["http://127.0.0.1:9/cb"],"client_name":"wire format probe"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = registration.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body.get("data").is_none(),
+        "RFC 7591 section 3.2.1 puts client_id at the top level, not inside an envelope: {body}"
+    );
+    let client_id = body["client_id"].as_str().expect("a client_id").to_owned();
+
+    let query = format!(
+        "/oauth/authorize?client_id={client_id}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcb\
+         &response_type=code&code_challenge={challenge}&code_challenge_method=S256\
+         &resource=https%3A%2F%2Fapi.rill.test%2Fmcp&scope=mcp+offline_access"
+    );
+    let authorized = router
+        .clone()
+        .oneshot(Request::get(&query).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = authorized.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let code = body["code"].as_str().expect("a code").to_owned();
+    (client_id, code)
+}
+
+/// A PKCE pair whose verifier is known. Fixed rather than random: the challenge is the SHA-256 of
+/// the verifier, base64url without padding, and a test that generates it re-implements the thing
+/// under test.
+const VERIFIER: &str = "iRnMS3Y5MvsCJDCLTNKzJfvvUnfEnIVFrGwyBBcQOFo";
+const CHALLENGE: &str = "fyVcRG51fw07O0JaykUIkzTdiS-0yOWhklK7wwdopJU";
+
+/// The failure this whole section exists for: the RFC's own content type was refused.
+#[tokio::test]
+async fn the_token_endpoint_accepts_the_form_encoding_the_rfc_mandates() {
+    let router = app();
+    let (client_id, code) = code_for(&router, CHALLENGE).await;
+    let form = format!(
+        "grant_type=authorization_code&code={code}&client_id={client_id}\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcb&code_verifier={VERIFIER}\
+         &resource=https%3A%2F%2Fapi.rill.test%2Fmcp"
+    );
+    let response = router
+        .oneshot(
+            Request::post("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a form-encoded token request is the only kind most clients send: {body}"
+    );
+    assert!(
+        body["access_token"].is_string(),
+        "RFC 6749 section 5.1: access_token is a top-level member, not one inside `data`: {body}"
+    );
+    assert_eq!(body["token_type"], "Bearer");
+    assert!(body["expires_in"].is_number());
+    assert!(
+        body.get("success").is_none() && body.get("data").is_none(),
+        "the /api/* envelope has no place on a token response: {body}"
+    );
+}
+
+/// The verifier must still be checked. A test that only proved the body parses would pass with
+/// PKCE removed.
+#[tokio::test]
+async fn a_form_encoded_request_with_the_wrong_verifier_is_still_refused() {
+    let router = app();
+    let (client_id, code) = code_for(&router, CHALLENGE).await;
+    let form = format!(
+        "grant_type=authorization_code&code={code}&client_id={client_id}\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcb&code_verifier=not-the-verifier\
+         &resource=https%3A%2F%2Fapi.rill.test%2Fmcp"
+    );
+    let (status, body) = post_raw_on(
+        &router,
+        "/oauth/token",
+        "application/x-www-form-urlencoded",
+        &form,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].is_string(), "{body}");
+    assert!(body.get("success").is_none(), "{body}");
+}
+
+async fn post_raw_on(
+    router: &axum::Router,
+    path: &str,
+    content_type: &str,
+    body: &str,
+) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// JSON stays accepted, because something may already be sending it.
+#[tokio::test]
+async fn the_token_endpoint_still_accepts_json() {
+    let router = app();
+    let (client_id, code) = code_for(&router, CHALLENGE).await;
+    let json = format!(
+        r#"{{"grant_type":"authorization_code","code":"{code}","client_id":"{client_id}",
+            "redirect_uri":"http://127.0.0.1:9/cb","code_verifier":"{VERIFIER}",
+            "resource":"https://api.rill.test/mcp"}}"#
+    );
+    let (status, body) = post_raw_on(&router, "/oauth/token", "application/json", &json).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["access_token"].is_string(), "{body}");
+}
+
+/// No `/oauth/*` success may carry the frontend's envelope, whichever endpoint it is.
+#[tokio::test]
+async fn no_oauth_success_carries_the_api_envelope() {
+    let (status, body) = post_raw(
+        "/oauth/revoke",
+        "application/json",
+        r#"{"token":"nothing-real"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "RFC 7009 answers 200 regardless");
+    assert!(
+        body.get("success").is_none() && body.get("data").is_none(),
+        "an OAuth client does not unwrap an envelope: {body}"
+    );
 }

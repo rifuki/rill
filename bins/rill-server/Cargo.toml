@@ -23,6 +23,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 rill-policy = { workspace = true }
 tower-http = { version = "0.6", features = ["cors"] }
 

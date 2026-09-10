@@ -239,9 +239,39 @@ pub struct TokenRequest {
 }
 
 /// Exchange a code, or rotate a refresh token.
-pub async fn token(State(state): State<AppState>, body: Option<Json<TokenRequest>>) -> Response {
-    let Some(Json(request)) = body else {
-        return bad_request("invalid_request", "a token request body is required");
+///
+/// # The body is form-encoded, and that is not a preference
+///
+/// RFC 6749 section 4.1.3 says a token request is sent with
+/// `application/x-www-form-urlencoded`, and OAuth 2.1 keeps it. Every client library sends that
+/// and nothing else: this endpoint once accepted only JSON, answered `Expected request with
+/// Content-Type: application/json` to a correctly formed request, and was therefore unusable by
+/// any conforming client while passing every test here. JSON is still accepted, because something
+/// may already be sending it, but form-encoded is the one that has to work.
+pub async fn token(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Response {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Form first: it is what the RFC mandates and what arrives in practice. A missing or unknown
+    // content type is treated as form too, since that is the likelier intent at this endpoint.
+    let parsed: Result<TokenRequest, String> = if content_type.contains("application/json") {
+        serde_json::from_str(&body).map_err(|e| e.to_string())
+    } else {
+        serde_urlencoded::from_str(&body).map_err(|e| e.to_string())
+    };
+
+    let Ok(request) = parsed else {
+        return bad_request(
+            "invalid_request",
+            "a token request body is required, form-encoded per RFC 6749 section 4.1.3",
+        );
     };
     match request.grant_type.as_str() {
         "authorization_code" => authorization_code_grant(state, request).await,

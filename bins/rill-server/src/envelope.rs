@@ -41,11 +41,20 @@ pub fn api_err_typed(
     (status, Json(body)).into_response()
 }
 
-/// A successful `/oauth/*` response.
+/// A successful `/oauth/*` response: the object itself, with no envelope.
 ///
-/// Unused until the consent endpoints land; see the note on `api_err_typed`.
+/// Not `{success, data}`. That shape belongs to `/api/*`, where the deployed frontend parses it,
+/// and this function began as a copy of [`api_ok`] carrying a note saying it was unused. By the
+/// time the OAuth routes called it, the note was wrong and the shape was too.
+///
+/// The clients here are not the frontend. RFC 6749 section 5.1 says a token response carries
+/// `access_token` and `token_type` as top-level members, and RFC 7591 section 3.2.1 says the same
+/// of `client_id` in a registration response. A library looking for `access_token` does not look
+/// inside `data`, so every conforming client, Claude.ai's connector among them, read a successful
+/// exchange as a malformed one. [`oauth_err`] was already flat, which is how the two halves of the
+/// same endpoint came to disagree.
 pub fn oauth_ok<T: Serialize>(data: T) -> Response {
-    Json(json!({ "success": true, "data": data })).into_response()
+    Json(data).into_response()
 }
 
 /// A failed `/oauth/*` response. The error text goes in `error_description`, and `error` carries
