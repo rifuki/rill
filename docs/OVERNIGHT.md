@@ -29,12 +29,37 @@ unblocks and how you would know it worked.
 Landed: `create_wallet`, `attach rules`
 (`DaVtZtYr39hTcZkTuixGELt8sT81mXNzrpLtz3swQzRv`), gated spend
 (`8o4uqBDqhrLtYdeoXUYpmVBGfN9fxUjbx1KtVqTjMnAb`). A 0.06 SUI spend against the 0.05 cap was refused
-by `per_tx`, and raising the cap client-side changed nothing — the limit is on chain.
+by `per_tx`, and raising the cap client-side changed nothing: the limit is on chain.
+
+### Two identities, reproduced by a test rather than by hand
+
+`cargo test -p rill --test delegation_live -- --ignored` builds this from nothing on every run: a
+fresh wallet, its rules, a spend the agent makes and the owner cannot, and a revoke. The digests
+below are from the run of 2026-09-10, and a later run produces different ones, which is the point.
+Nothing here is a fixture to be kept alive.
+
+| | |
+|---|---|
+| owner | `0xb649a075e07c7cf0baebeaa82150416218c63943e2e767fe93a24aa5c7ce64a9` |
+| agent | `0xb93cbb8f841a3442e5112c50880f20db9735cb1bb5f1459e745c5f602a2fe29a` |
+| wallet | `0x9c4cae50ccd4e4a08e53d2a2a832a2e4647db7be934cf1211cd1d20e29cc5c28` |
+| AgentCap | `0x10a4ee9e8515bf1c7de64bbcb6c4a74c7c8ba104dd33d912c734fb9a430385a2` |
+| create_wallet, owner-signed | `4VmT73gWLL1z26s874BU5JS83vZbnc23N5sKBCGn5twD` |
+| add_rule x2, owner-signed | `GcnM7eAKwH62aAyBXR7roL6F6xTTzUz6ir7D11MVpLjd` |
+| gated spend, agent-signed | `HLDg9AtmHtsFMqh9t857GSQ9MryQe4Qa3oWY6hSYkPTC` |
+| the same spend, owner-signed | refused while the node checked input objects, before any Move code ran |
+| revoke, owner-signed | `4e96AtnBPGrkYuex5RuanvzLxhKw7XMqqoezkg9gtTCa` |
+
+Two refusals, on two different lines. The owner is stopped by the object model, because the
+`AgentCap` belongs to the agent and Sui checks that before execution. An agent that holds a cap but
+is not `wallet.agent` is stopped by the contract, `E_NOT_AGENT` (7), which no owner-signed
+transaction can reach and which `sui move test` covers instead. The agent going over its
+per-transaction cap is stopped by `per_tx`, and the refusal names it.
 
 ## Sudah selesai sejak rencana ini ditulis
 
 - Daftar `prove` dibaca hidup dari chain lewat `policy_rules` (item 1).
-- Rule bisa direkonsiliasi, bukan cuma dipasang sekali (item 2) — dibuktikan dengan menurunkan
+- Rule bisa direkonsiliasi, bukan cuma dipasang sekali (item 2), dibuktikan dengan menurunkan
   per-tx cap 0.05 → 0.02 dan spend 0.03 yang tadinya lolos jadi ditolak.
 - Lifecycle lengkap: `revoke`, `top_up`, `rotate_agent`, `extend_expiry` (item 3).
 - Permukaan MCP bisa didorong agent: `rill_status`, `rill_wallet`, `rill_spend`, `rill_execute`.
@@ -46,7 +71,7 @@ Digest yang mendarat, urut: `DaVtZtYr…QzRv` (rules), `8o4uqBDq…MnAb` (spend)
 
 ## Riset yang sudah ada, dan statusnya
 
-`docs/research/2026-09-01-defi-addresses-unverified.md` — alamat Cetus, Haedal, DeepBook
+`docs/research/2026-09-01-defi-addresses-unverified.md`: alamat Cetus, Haedal, DeepBook
 BalanceManager, pool testnet, dan framework Sui. **Satu lapis, belum diverifikasi ulang.** Jangan
 masuk registry sebelum dicek dengan `rill describe`. Header file itu menjelaskan kenapa.
 
@@ -70,11 +95,11 @@ Agent yang sudah selesai dikembalikan dari cache seketika; hanya yang error yang
 Terbukti: dua run yang mati pada 2026-09-01 punya 6 dan 3 baris `result` di `journal.jsonl`, dan
 resume-nya hanya menjalankan sisanya.
 
-**Batasnya: cache itu milik sesi.** Sesi baru tidak bisa resume — run id-nya tidak dikenali, dan
+**Batasnya: cache itu milik sesi.** Sesi baru tidak bisa resume: run id-nya tidak dikenali, dan
 riset yang sama akan dikerjakan ulang dari awal. Jadi yang harus diselamatkan bukan run id-nya,
 melainkan **temuannya**: tulis hasil yang sudah masuk ke `docs/research/` sebelum sesi berakhir,
 dengan status verifikasinya ditandai jelas.
 
 Sebelum menutup sesi, cek `journal.jsonl` di
-`~/.claude/projects/*/subagents/workflows/<run>/` — satu baris `{"type":"result",...}` per agent
+`~/.claude/projects/*/subagents/workflows/<run>/`: satu baris `{"type":"result",...}` per agent
 yang selesai, berisi nilai kembaliannya utuh. Itu sumbernya, bukan ringkasan di chat.

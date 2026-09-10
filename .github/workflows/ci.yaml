@@ -20,7 +20,7 @@ jobs:
       - run: cargo test --workspace
 
   # The architecture's load-bearing invariant (KTD-1). rill-core holds two thirds of the
-  # system's logic and must stay unable to perform I/O — not by convention, but because it
+  # system's logic and must stay unable to perform I/O, not by convention but because it
   # cannot name anything that does. A dependency added three crates away that drags tokio
   # into rill-core would be invisible in review; it is not invisible here.
   purity:
@@ -38,11 +38,11 @@ jobs:
           echo "rill-core is pure."
 
       # The money-path invariant. The reference implementation stated this in a comment and
-      # still let a float reach a DeepBook order price — a comment cannot stop `Number(v)`.
+      # still let a float reach a DeepBook order price, and a comment cannot stop `Number(v)`.
       # Here no float type may appear in the crate at all, so there is nothing to slip through.
       - name: rill-core must contain no floating-point type
         run: |
-          # Strip doc comments first — this file's own prose explains why floats are banned,
+          # Strip doc comments first: this file's own prose explains why floats are banned,
           # and matching that text would fail the build for saying so.
           if grep -rn --include='*.rs' -vE '^\s*(//|\*)' crates/rill-core/src \
              | grep -E '\bf(32|64)\b'; then
@@ -50,6 +50,32 @@ jobs:
             exit 1
           fi
           echo "rill-core has no floating-point arithmetic."
+
+  # A house style that was written down and then not followed. The em dash is banned in everything
+  # this repository emits, and the rule held right up until an agent added three in one commit,
+  # which is the moment a convention becomes a check. Six hundred of them predate the rule and are
+  # cleaned as files are touched, so this is a ratchet rather than a sweep: nothing new lands, and
+  # the backlog does not fail an unrelated build.
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: No em dash on any line this change adds
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # A first push to a branch reports an all-zero "before"; there is nothing to diff
+          # against, so compare with the merge base against the default branch instead.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base=$(git merge-base origin/main HEAD 2>/dev/null || git rev-parse HEAD~1)
+          fi
+          added=$(git diff "$base"...HEAD --unified=0 | grep '^+' | grep -v '^+++' || true)
+          if printf '%s' "$added" | grep -q $'\u2014'; then
+            printf '%s\n' "$added" | grep -n $'\u2014' || true
+            echo "::error::An em dash (U+2014) was added. Use a comma, a colon, parentheses, or two sentences."
+            exit 1
+          fi
+          echo "No em dash added."
 
   # The contracts, tested by the same toolchain version every time. A Move test suite that
   # silently follows whatever `sui` the runner happens to ship is one that starts failing for
@@ -77,7 +103,7 @@ jobs:
 
   # The Rust builder emits Move calls positionally, so a signature change in the contracts that the
   # builder does not follow is a wrong-arity call the node rejects. These read the Move source and
-  # check the emitted shape against it — the drift that killed the reference implementation.
+  # check the emitted shape against it, which is the drift that killed the reference implementation.
   signatures:
     runs-on: ubuntu-latest
     steps:

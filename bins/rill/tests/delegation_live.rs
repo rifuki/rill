@@ -613,10 +613,22 @@ async fn the_delegation_holds_in_both_directions() {
     .await
     .expect_err("the owner's spend must not pass the gate");
     println!("  rill spend: {reported}");
+    // The property, not the sentence. An earlier form of this pinned the opening words, and the
+    // first rewording of the message failed the test while the behaviour was correct. What has to
+    // hold is that the refusal is reported as one, that it carries the node's own explanation so
+    // the reader can see which object was whose, and that it is never dressed up as an outage.
     assert!(
-        reported.starts_with("the chain refused it before execution")
-            && reported.contains("is owned by account address"),
-        "rill spend must report the ownership refusal as a verdict, not as an outage: {reported}"
+        reported.contains("refused it"),
+        "rill spend must report the ownership refusal as a refusal: {reported}"
+    );
+    assert!(
+        reported.contains("is owned by account address"),
+        "the refusal must keep the node's words, which name the object and its owner: {reported}"
+    );
+    assert!(
+        !reported.contains("did not answer"),
+        "a refusal reported as an outage sends the reader to check a network that is fine: \
+         {reported}"
     );
 
     // 5. The agent goes over the per-transaction cap. Refused by the contract, and named.
