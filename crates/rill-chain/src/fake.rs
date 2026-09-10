@@ -41,6 +41,8 @@ impl Default for SimulationBehavior {
 }
 
 struct State {
+    /// Per-object countdown of reads that must answer `not found` first.
+    not_yet_indexed: HashMap<String, usize>,
     objects: HashMap<String, ObjectSummary>,
     owned: HashMap<String, Vec<String>>,
     balances: HashMap<(String, String), u64>,
@@ -62,6 +64,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             objects: HashMap::new(),
+            not_yet_indexed: HashMap::new(),
             owned: HashMap::new(),
             balances: HashMap::new(),
             simulation: SimulationBehavior::default(),
@@ -126,6 +129,23 @@ impl FakeSui {
         self
     }
 
+    /// An object the node answers `not found` for the next `reads` times, and holds thereafter.
+    ///
+    /// This is what a fullnode looks like between certifying a transaction and indexing what it
+    /// created, and it is the only shape in which a retry loop can be told from a single attempt.
+    /// Without it a test for `settle` passes whether the loop retries or not.
+    pub fn with_object_after(
+        self,
+        reads: usize,
+        owner: Option<&str>,
+        object: ObjectSummary,
+    ) -> Self {
+        let id = object.reference.id.clone();
+        let chain = self.with_object(owner, object);
+        chain.state.borrow_mut().not_yet_indexed.insert(id, reads);
+        chain
+    }
+
     /// Stage the objects an execution should report as created.
     ///
     /// A multi-step flow cannot continue without them: `create_wallet` shares a wallet and mints a
@@ -165,6 +185,19 @@ impl FakeSui {
 
 impl SuiRead for FakeSui {
     async fn get_object(&self, id: &str) -> ChainResult<ObjectSummary> {
+        // A node that has certified a transaction has not necessarily indexed its objects yet, so
+        // a fake that can only ever answer "here" or "never" cannot express the one case
+        // `rill_chain::settle` exists for: absent now, present shortly. `with_object_after` sets
+        // the countdown this decrements.
+        {
+            let mut state = self.state.borrow_mut();
+            if let Some(remaining) = state.not_yet_indexed.get_mut(id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(ChainError::NotFound(format!("object {id}")));
+                }
+            }
+        }
         self.state
             .borrow()
             .objects

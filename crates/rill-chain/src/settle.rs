@@ -105,6 +105,44 @@ mod tests {
         )));
     }
 
+    /// The case this module exists for, and the only one that can tell a retry from a single
+    /// attempt.
+    ///
+    /// The two tests either side of this one pass whether the loop retries or not: one seeds an
+    /// object that is already there, the other seeds nothing at all. Deleting the loop entirely and
+    /// reading once left both green, which means the module's whole purpose was unguarded. The
+    /// failure it prevents is on the record: `reading the wallet object: not found on chain` one
+    /// call after the transaction effects had named that very id, the first time an agent drove
+    /// create and attach back to back instead of a person typing them.
+    #[test]
+    fn an_object_the_node_has_not_indexed_yet_is_waited_for_and_found() {
+        let chain = FakeSui::new().with_object_after(3, None, object());
+        assert!(
+            run(wait_until_readable_within(
+                &chain,
+                ID,
+                8,
+                Duration::from_millis(0)
+            )),
+            "an object absent for the first three reads and present after must be found"
+        );
+    }
+
+    /// And the waiting is bounded by the budget it was given, not by hope.
+    #[test]
+    fn an_object_that_appears_after_the_budget_runs_out_is_reported_as_not_readable() {
+        let chain = FakeSui::new().with_object_after(9, None, object());
+        assert!(
+            !run(wait_until_readable_within(
+                &chain,
+                ID,
+                3,
+                Duration::from_millis(0)
+            )),
+            "three tries must not see an object that needs nine"
+        );
+    }
+
     /// Giving up is reported, not raised: the caller has a digest and has to say what it cannot
     /// promise.
     #[test]
