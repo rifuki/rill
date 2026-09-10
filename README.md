@@ -419,6 +419,39 @@ cd move/agent_wallet && sui move test   # 36
 cd move/rill_guard   && sui move test   # 2
 ```
 
+## Running the server
+
+One replica, one volume, one URL. That is the whole deployment contract, and it is written down in
+`compose.yaml` rather than in somebody's shell history.
+
+```sh
+export RILL_OAUTH_SECRET=$(openssl rand -hex 32)
+export PUBLIC_BASE_URL=https://whatever-address-clients-will-use
+docker compose up --build
+```
+
+Three things about it are load-bearing:
+
+- **One replica.** The server holds its state in a file it rewrites whole, so two replicas would each
+  hold half the authorization codes and reject the other's. There is no clustering story here and
+  `compose.yaml` is not the place to invent one.
+- **A volume at `/app/data`.** `skills.json` and `oauth.json` live there. Lose it and every client
+  re-registers.
+- **`PUBLIC_BASE_URL` is the one value everything derives from**: both discovery documents, the
+  `WWW-Authenticate` challenge, the audience tokens are bound to, and the instructions the server
+  hands agents. Set it to the address clients will actually use. A trailing slash is fine; seven
+  places read it and they all agree, which `bins/rill-server/tests/base_url.rs` holds by minting a
+  token on a trailing-slash deployment and presenting it back.
+
+Without `RILL_OAUTH_SECRET` compose refuses to start rather than generate a per-boot secret, because
+a server that quietly regenerates it invalidates every token on restart and tells nobody.
+
+**There is no hosted deployment today.** `api.rill.naisu.one` has no DNS record and its droplet is
+unreachable, so the hosted half of this is a running command and not a URL you can curl. Everything
+that does not depend on a permanent address is verified: the container boots, passes its own
+healthcheck, serves both discovery documents, answers an unauthenticated `/mcp` with a challenge
+pointing at them, and keeps tokens valid across a restart with the volume and the same secret.
+
 ## Mainnet
 
 Nothing here has spent real money, and the guard that keeps it that way is not coming out.

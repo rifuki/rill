@@ -1,0 +1,51 @@
+# One replica, one volume, one URL. That is the whole deployment contract.
+#
+# `rill-server` holds its state in a file it rewrites whole, so two replicas would each hold half the
+# authorization codes and reject the other's. There is no clustering story here and this file is not
+# the place to invent one: see the note in crates/rill-store/src/lib.rs.
+#
+# PUBLIC_BASE_URL is the one value everything else derives from. Set it to the address clients will
+# actually use, including the scheme, and with or without a trailing slash: seven places read it and
+# they all agree now, asserted in bins/rill-server/tests/base_url.rs.
+
+services:
+  rill-server:
+    build:
+      context: .
+    # The image names its own port and healthcheck, and both are part of the contract: change them
+    # here and an orchestrator stops being able to tell a wedged process from a slow one.
+    ports:
+      - "${RILL_PORT:-3939}:3939"
+    environment:
+      # Required in practice. Without it the server advertises http://localhost:3939, which is
+      # correct for a laptop and wrong for anything a client reaches over a network.
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://localhost:3939}"
+
+      # Testnet unless an operator opts into mainnet explicitly, which asserts everything in
+      # docs/MAINNET.md. Never set this to mainnet to see what happens.
+      SUI_NETWORK: "${SUI_NETWORK:-testnet}"
+
+      # Set this, or every token becomes invalid on restart and every connected agent has to
+      # re-authorize. Generate one with: openssl rand -hex 32
+      RILL_OAUTH_SECRET: "${RILL_OAUTH_SECRET:?set RILL_OAUTH_SECRET, or restarts invalidate every token}"
+
+      # Optional, and both or neither. They gate the long-lived credential a headless agent uses;
+      # the server refuses to start on a half-configured pair rather than issue grants that refuse
+      # every request.
+      RILL_OWNER_SECRET: "${RILL_OWNER_SECRET:-}"
+      RILL_OWNER_ADDRESS: "${RILL_OWNER_ADDRESS:-}"
+
+      # Optional. Without it the build tool refuses by name rather than guessing an address.
+      DEEPBOOK_PACKAGE_ID: "${DEEPBOOK_PACKAGE_ID:-}"
+      RILL_GUARD_PACKAGE_ID: "${RILL_GUARD_PACKAGE_ID:-}"
+    volumes:
+      # skills.json and oauth.json live here and must survive a restart. A named volume rather than
+      # a bind mount so the container's own user (uid 10001) owns it without a chown on the host.
+      - rill-data:/app/data
+    restart: unless-stopped
+    # One. Not a default worth overriding: see the note at the top.
+    deploy:
+      replicas: 1
+
+volumes:
+  rill-data:

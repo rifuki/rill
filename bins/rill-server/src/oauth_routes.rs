@@ -203,7 +203,7 @@ pub async fn authorize(
     };
     // The canonical resource is this server's own MCP endpoint: a token minted for it must not be
     // replayable at another server that happens to share the secret.
-    let canonical = format!("{}/mcp", state.config.public_base_url);
+    let canonical = state.config.resource();
     let resource = match resolve_resource(
         query.resource.as_deref(),
         &canonical,
@@ -370,7 +370,7 @@ async fn refresh_token_grant(state: AppState, request: TokenRequest) -> Response
         &state.config.oauth_secret,
         Expectation {
             kind: TokenKind::Refresh,
-            audience: &format!("{}/mcp", state.config.public_base_url),
+            audience: &state.config.resource(),
             now_secs: now_secs(),
         },
     ) {
@@ -454,7 +454,7 @@ fn agent_token_grant(
         Ok(scope) => scope,
         Err(e) => return bad_request(e.code, &e.description),
     };
-    let canonical = format!("{}/mcp", state.config.public_base_url);
+    let canonical = state.config.resource();
     let resource = match resolve_resource(
         request.resource.as_deref(),
         &canonical,
@@ -619,7 +619,7 @@ pub async fn revoke(
         // An unparseable body names no token, so there is nothing to reveal by answering 200.
         return oauth_ok(json!({ "revoked": true }));
     };
-    let audience = format!("{}/mcp", state.config.public_base_url);
+    let audience = state.config.resource();
     let expect = |kind: TokenKind| Expectation {
         kind,
         audience: &audience,

@@ -480,7 +480,7 @@ fn prompt_step(manifest: Option<&CapabilityManifest>) -> Option<Step> {
 /// Not numbered, because it is not a step in the setup. It is here because every other sentence
 /// above asks the reader to believe something about where the key is.
 fn keyless_check(config: &Config) -> Vec<String> {
-    let base = config.public_base_url.trim_end_matches('/');
+    let base = config.base();
     vec![
         "## Checking the builder holds no key".into(),
         String::new(),

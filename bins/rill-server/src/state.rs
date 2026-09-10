@@ -139,9 +139,25 @@ impl Config {
         self.owner_secret.is_some() && self.owner_address.is_some()
     }
 
-    /// The MCP endpoint tokens are audience-bound to — the one URL a user pastes into an agent.
+    /// This deployment's base URL, with no trailing slash, and the only way to read it.
+    ///
+    /// `PUBLIC_BASE_URL` comes from an operator, and an operator who types a trailing slash is
+    /// doing something entirely reasonable. Seven places read this value and four of them trimmed
+    /// while three did not, so `https://api.rill.example/` produced `…/mcp` in some answers and
+    /// `…//mcp` in others. That is not cosmetic: tokens are audience-bound to the resource string
+    /// per RFC 8707 and the audience is compared as a string, so a deployment configured that way
+    /// issues tokens bound to one spelling and checks them against another, and every request fails
+    /// with an invalid-audience error that names nothing an operator can act on.
+    ///
+    /// One accessor rather than normalising at load, because tests construct `Config` literally and
+    /// a normalisation that only happens in `from_env` is one a test cannot see.
+    pub fn base(&self) -> &str {
+        self.public_base_url.trim_end_matches('/')
+    }
+
+    /// The MCP endpoint tokens are audience-bound to: the one URL a user pastes into an agent.
     pub fn resource(&self) -> String {
-        format!("{}/mcp", self.public_base_url.trim_end_matches('/'))
+        format!("{}/mcp", self.base())
     }
 
     /// Refuse to start rather than run in a state whose failures are hard to attribute.

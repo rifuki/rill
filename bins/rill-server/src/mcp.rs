@@ -54,7 +54,7 @@ fn unauthorized(state: &AppState, description: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
-            discovery_header(&state.config.public_base_url),
+            discovery_header(state.config.base()),
         )],
         Json(json!({ "error": "invalid_token", "error_description": description })),
     )

@@ -98,7 +98,7 @@ async fn health(State(state): State<AppState>) -> Response {
         "status": "ok",
         "network": state.config.network.as_str(),
         "keyless": true,
-        "docs": state.config.public_base_url,
+        "docs": state.config.base(),
         "mcp": {
             "endpoint": state.config.resource(),
             "auth": "oauth2.1+pkce+dcr",
@@ -121,7 +121,7 @@ async fn health(State(state): State<AppState>) -> Response {
 async fn protected_resource_metadata(State(state): State<AppState>) -> Response {
     bare(json!({
         "resource": state.config.resource(),
-        "authorization_servers": [state.config.public_base_url],
+        "authorization_servers": [state.config.base()],
         "bearer_methods_supported": ["header"],
         "scopes_supported": rill_auth::oauth::SUPPORTED_SCOPES,
     }))
@@ -129,7 +129,7 @@ async fn protected_resource_metadata(State(state): State<AppState>) -> Response 
 
 /// RFC 8414. What an MCP client fetches to learn where to register, authorize, and get tokens.
 async fn authorization_server_metadata(State(state): State<AppState>) -> Response {
-    let base = state.config.public_base_url.trim_end_matches('/');
+    let base = state.config.base();
     bare(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
@@ -165,7 +165,7 @@ async fn mcp_get(State(state): State<AppState>) -> Response {
         StatusCode::SEE_OTHER,
         [(
             header::LOCATION,
-            format!("{}/api/docs", state.config.public_base_url),
+            format!("{}/api/docs", state.config.base()),
         )],
     )
         .into_response()
