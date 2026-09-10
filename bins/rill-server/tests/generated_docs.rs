@@ -68,6 +68,10 @@ fn config(base: &str) -> Config {
         oauth_secret: "test-secret".into(),
         oauth_secret_from_env: true,
         guard_package_id: Some("0xguard".into()),
+        // The long-lived credential U8 added is configured, not defaulted, so a document
+        // generated on a deployment that never sets an owner is the ordinary case here.
+        owner_secret: None,
+        owner_address: None,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
         oauth_store_path: dir.join("oauth.json").to_string_lossy().into(),
     }
