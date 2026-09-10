@@ -251,6 +251,29 @@ library and `cargo tree -p rill` must contain one, both in CI, and
 `crates/rill-mcp/tests/surface_split.rs` holds the tool split and the protocol negotiation from the
 one producer that emits both surfaces.
 
+### Checking the builder cannot sign, yourself
+
+Two commands, neither of which needs a key, a wallet, or trust in this README.
+
+```sh
+# 1. The binary that builds transactions links no signing library. Nothing it does can sign.
+cargo tree --locked -p rill-server --edges normal | grep sui-crypto   # prints nothing
+cargo tree --locked -p rill        --edges normal | grep sui-crypto   # prints a line
+
+# 2. And the whole claim, asserted in one suite that needs no network:
+cargo test -p rill-server --test keyless_observable
+```
+
+The asymmetry is the point. The builder cannot sign because it has nothing to sign with; the signer
+can because it does. CI asserts both directions on every push, since an asymmetry checked one way is
+one claim rather than two.
+
+Against a running deployment the same thing is visible from outside: `rill_build_action` returns an
+`ExecutionEnvelope` whose `unsignedPtb` is exactly that, with no signature anywhere in the response,
+and submitting it to a fullnode without one is refused. What turns it into a transaction is the local
+binary, which re-derives the digest from the bytes, checks the call sequence against its own pinned
+run-set, re-simulates against live state, and signs only then.
+
 ### Over stdio
 
 `rill mcp` speaks MCP over stdio. An agent reads the wallet's limits from the chain that enforces

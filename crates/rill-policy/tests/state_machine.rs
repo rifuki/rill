@@ -277,24 +277,58 @@ fn each_spend_ceiling_is_enforced_independently() {
     ));
 }
 
-/// The window between "we checked this" and "we sign this" is exactly where a substitution goes.
+/// The window between "we checked this" and "we sign this" is exactly where a substitution goes, and
+/// the type-state is what closes it rather than the check inside the pin.
+///
+/// This test used to be named for catching a swap and did not do it: it changed the bytes, computed
+/// their digest, and asserted that digest differed from the claimed one, which tests that
+/// `digest_unsigned_ptb` is not a constant function. It never called `pin_bytes` on the tampered
+/// envelope, so `Rejection::BytesChangedAfterApproval` was constructed in the source, rendered for a
+/// human, and never once exercised. A name that claims a property nobody checks is worse than no
+/// test, because a reader stops looking.
+///
+/// What is true, and what this asserts: a mismatch is refused at `validate`, and a consistent
+/// envelope pins to the digest of the bytes that will be signed. Whether the pin recomputes that
+/// digest or echoes the one the envelope claimed is unobservable through the API, because the two
+/// are equal for any envelope that reaches the pin at all, so no assertion here pretends to cover
+/// it: one was written, found to pass with the recompute replaced by the claim, and deleted rather
+/// than left standing as a second misleading test. `BytesChangedAfterApproval` is
+/// unreachable through the public API today, because `Validated` owns its envelope and exposes no
+/// way to change it, and `pin_bytes` consumes that. It is kept as the check that notices if a
+/// future refactor opens such a path, which is the only reason defence in depth is worth its
+/// weight, and the honest statement of its status is this comment rather than a passing test.
 #[test]
-fn bytes_swapped_after_validation_are_caught_by_the_pin() {
+fn bytes_that_do_not_match_their_digest_never_reach_the_pin() {
     let validated = RawEnvelope::new(parse(envelope_json()))
         .validate(&policy(), NOW)
         .expect("validate");
-    // The pin recomputes from the envelope's own bytes rather than trusting the earlier result,
-    // so a consistent envelope passes...
-    assert!(validated.pin_bytes(&policy()).is_ok());
+    let pinned = validated
+        .pin_bytes(&policy())
+        .expect("a consistent envelope pins");
+    assert_eq!(
+        pinned.pinned_digest(),
+        digest_of_ptb(),
+        "the pin reports the digest of the transaction that will be signed"
+    );
 
-    // ...while one whose bytes no longer match its digest does not. Constructed directly, because
-    // reaching this state through the API is exactly what the design prevents.
+    // And an envelope whose bytes no longer match its digest is refused one step earlier, naming
+    // both digests so a reader can see which one moved.
     let mut j = envelope_json();
     j["unsignedPtb"] = Value::String("QkJC".into());
-    let tampered = parse(j);
-    assert_ne!(
-        rill_core::envelope::digest_unsigned_ptb(&tampered.unsigned_ptb),
-        tampered.action_digest
+    // `Validated` is deliberately not Debug (it carries an approved transaction), so the refusal is
+    // matched on rather than unwrapped for printing.
+    let refused = RawEnvelope::new(parse(j)).validate(&policy(), NOW);
+    let Err(rejection) = refused else {
+        panic!("swapped bytes must be refused at validation, and were not");
+    };
+    assert!(
+        matches!(rejection, Rejection::DigestMismatch { .. }),
+        "the refusal must be the digest check, not something that happens to also fail"
+    );
+    let message = rejection.to_string();
+    assert!(
+        message.contains(&digest_of_ptb()),
+        "the refusal must name the digest that was approved: {message}"
     );
 }
 
