@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::{
-    BalanceDelta, ChainError, ChainResult, ExecutionOutcome, ObjectSummary, SimulationOutcome,
-    SuiRead, SuiWrite, Verification,
+    BalanceDelta, ChainError, ChainResult, CreatedObject, ExecutionOutcome, ObjectSummary,
+    SimulationOutcome, SuiRead, SuiWrite, Verification,
 };
 
 /// What the fake should answer for the next simulation.
@@ -49,6 +49,11 @@ struct State {
     next_digest: usize,
     /// What `simulate_read` hands back, command by command.
     read_returns: Vec<Vec<Vec<u8>>>,
+    /// What successive reads hand back, one per read, the last repeating. Empty means the fake
+    /// answers every read with `read_returns`.
+    read_sequence: std::collections::VecDeque<Vec<u8>>,
+    /// What an execution reports as brought into existence.
+    created: Vec<CreatedObject>,
     /// What the fake network answers when asked its price, or why it cannot.
     reference_gas_price: ChainResult<u64>,
 }
@@ -63,6 +68,8 @@ impl Default for State {
             executions: Vec::new(),
             next_digest: 0,
             read_returns: Vec::new(),
+            read_sequence: std::collections::VecDeque::new(),
+            created: Vec::new(),
             // Testnet's, at the time of writing. Real, and different from mainnet's 100. This is
             // the network's answer, which a caller reads; it is not a price a caller assumed.
             reference_gas_price: Ok(1_000),
@@ -105,6 +112,28 @@ impl FakeSui {
     /// Stage the BCS bytes a read should return — a mid price, a quote, a balance.
     pub fn with_read_return(self, bytes: Vec<u8>) -> Self {
         self.state.borrow_mut().read_returns.push(vec![bytes]);
+        self
+    }
+
+    /// Stage what successive reads should answer, one entry per read, the last one repeating.
+    ///
+    /// A read asks about live state, and a transaction in between changes the answer: a wallet
+    /// with no rules, then the same wallet with two. [`FakeSui::with_read_return`] can only give
+    /// one answer however many times it is asked, so a path that reads, writes, and reads again to
+    /// confirm what it wrote could not be driven offline at all.
+    pub fn with_read_sequence(self, answers: Vec<Vec<u8>>) -> Self {
+        self.state.borrow_mut().read_sequence = answers.into();
+        self
+    }
+
+    /// Stage the objects an execution should report as created.
+    ///
+    /// A multi-step flow cannot continue without them: `create_wallet` shares a wallet and mints a
+    /// capability, and both ids are knowable only from the transaction's effects. A fake that
+    /// always answered "nothing was created" could not exercise the step that reads them out,
+    /// which is the one step a person was doing by hand between the two commands.
+    pub fn with_created(self, created: Vec<CreatedObject>) -> Self {
+        self.state.borrow_mut().created = created;
         self
     }
 
@@ -202,7 +231,20 @@ impl SuiRead for FakeSui {
     /// A read returns whatever `command_returns` was staged with, so a caller reading a price can
     /// be tested without a node.
     async fn simulate_read(&self, _unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
-        let returns = self.state.borrow().read_returns.clone();
+        // A staged sequence answers one read at a time, and its last entry keeps answering. That
+        // is what lets a test pose the same question before and after a transaction changed it.
+        let mut state = self.state.borrow_mut();
+        let returns = if state.read_sequence.is_empty() {
+            state.read_returns.clone()
+        } else {
+            let answer = if state.read_sequence.len() == 1 {
+                state.read_sequence[0].clone()
+            } else {
+                state.read_sequence.pop_front().expect("a staged answer")
+            };
+            vec![vec![answer]]
+        };
+        drop(state);
         Ok(SimulationOutcome {
             ok: true,
             verification: Verification::Verified,
@@ -234,7 +276,7 @@ impl SuiWrite for FakeSui {
             error: None,
             gas_used_mist: 1_000_000,
             balance_changes: Vec::<BalanceDelta>::new(),
-            created: Vec::new(),
+            created: s.created.clone(),
         })
     }
 

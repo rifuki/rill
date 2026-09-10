@@ -20,11 +20,9 @@ use rill_chain::describe::describe_function;
 use rill_cli::keystore::{Keystore, KeystoreError, SIGN_AS_VAR};
 use rill_cli::runset::RunSet;
 use rill_cli::stdio::{serve, WalletContext};
-use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
-
-/// The `Version` object the testnet package gates itself on, from the reference deployment.
-const DEFAULT_VERSION_ID: &str =
-    "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65";
+use rill_ptb::deployments::{
+    is_superseded, TESTNET_AGENT_WALLET, TESTNET_AGENT_WALLET_VERSION as DEFAULT_VERSION_ID,
+};
 
 /// The positional arguments, with `--as <address>` removed.
 ///

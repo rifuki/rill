@@ -611,7 +611,8 @@ async fn the_delegation_holds_in_both_directions() {
         ),
     )
     .await
-    .expect_err("the owner's spend must not pass the gate");
+    .expect_err("the owner's spend must not pass the gate")
+    .to_string();
     println!("  rill spend: {reported}");
     // The property, not the sentence. An earlier form of this pinned the opening words, and the
     // first rewording of the message failed the test while the behaviour was correct. What has to
@@ -662,7 +663,8 @@ async fn the_delegation_holds_in_both_directions() {
         ),
     )
     .await
-    .expect_err("the over-cap spend must not pass the gate");
+    .expect_err("the over-cap spend must not pass the gate")
+    .to_string();
     assert!(
         reported.starts_with("per_tx refused it"),
         "rill spend must name the rule first: {reported}"

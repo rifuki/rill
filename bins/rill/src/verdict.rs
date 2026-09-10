@@ -16,8 +16,83 @@
 //! reference across commands, so the only way to hold a stale one is for something else to have
 //! spent the coin in between, and the answer is to run again.
 
+use rill_chain::aborts::{classify_rule_abort, RuleRefusal};
 use rill_chain::stale::classify_stale_object;
 use rill_chain::ChainError;
+
+/// Why a command did not happen: a rule refused it, by name, or something else went wrong.
+///
+/// # A refusal and a failure are different answers
+///
+/// A rule that refused is the wallet working, and the rule's name is the whole of what the caller
+/// needs in order to decide what to do next: spend less, or stop asking. Anything else is a
+/// failure whose words belong to the node.
+///
+/// Carried as a type rather than as one formatted string because the MCP layer has to put the
+/// rule's name in a field. A response that said `"code": "refused"` and buried `per_tx` in prose
+/// left an agent nothing to act on but a substring match, and an agent that cannot tell "the cap
+/// stopped you" from "the node is down" retries the same amount forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// A rule attached to the wallet refused it. Named, and carrying its own advice.
+    Refused(RuleRefusal),
+    /// Anything else: a bad argument, a node that did not answer, a submission that failed.
+    Failed(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The rule first, then what to do about it. Byte for byte what the one call site that
+            // did this by hand produced, because a person reads this line too, not only a caller
+            // matching on its opening words.
+            Self::Refused(refusal) => write!(f, "{refusal}.\n\n{}", refusal.advice()),
+            Self::Failed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// Every `?` inside a command path hands back a sentence, and a sentence is a plain failure.
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
+/// A simulation the chain ran and said would fail, with the rule named when a rule is what refused.
+///
+/// Used by every build path before it signs anything. The alternative, which each path used to do
+/// for itself, was to quote the abort: `the chain says this would fail: MoveAbort(MoveLocation {
+/// module: ModuleId { ... name: Identifier("per_tx") ... }, 1)`. That is the same information and
+/// nobody reads it.
+pub fn would_fail(error: Option<String>) -> Failure {
+    let error = error.unwrap_or_else(|| "no reason given".into());
+    named_or(&error, format!("the chain says this would fail: {error}"))
+}
+
+/// A transaction that was submitted and then failed on chain.
+///
+/// Rare by construction, because nothing is submitted that the chain has not already agreed would
+/// execute. Not impossible: a wallet's budget can be consumed by another transaction in between,
+/// and then the abort is a rule's and has to be named here as it would have been before signing.
+pub fn did_fail(error: &str) -> Failure {
+    named_or(error, format!("the transaction failed on chain: {error}"))
+}
+
+fn named_or(error: &str, sentence: String) -> Failure {
+    match classify_rule_abort(error) {
+        Some(refusal) => Failure::Refused(refusal),
+        None => Failure::Failed(sentence),
+    }
+}
 
 /// A simulation that produced no verdict: the node could not be reached, or it refused to run
 /// the transaction at all.
@@ -105,5 +180,65 @@ mod tests {
     fn a_stale_coin_at_submission_gets_the_same_advice() {
         let text = submit_failed(ChainError::Rejected(STALE.into()));
         assert!(text.contains("Run the command again"), "{text}");
+    }
+
+    /// The exact text a testnet node returned when a 0.06 SUI spend hit a 0.05 cap.
+    const PER_TX: &str = "MoveAbort(MoveLocation { module: ModuleId { address: b02f39d6, \
+         name: Identifier(\"per_tx\") }, function: 2, instruction: 21, \
+         function_name: Some(\"prove\") }, 1) in command 2";
+
+    /// The refusal R3 turns on: the rule survives as a rule, not as quoted bytecode.
+    #[test]
+    fn a_rule_abort_in_a_simulation_is_named_rather_than_quoted() {
+        let failure = would_fail(Some(PER_TX.into()));
+        let Failure::Refused(refusal) = &failure else {
+            panic!("a per_tx abort must be a refusal, not a failure: {failure}");
+        };
+        assert_eq!(refusal.module, "per_tx");
+        assert_eq!(refusal.code, 1);
+        assert!(
+            failure.to_string().starts_with("per_tx refused it"),
+            "{failure}"
+        );
+        assert!(
+            failure.to_string().contains("Spend less"),
+            "a named refusal carries its own advice: {failure}"
+        );
+    }
+
+    /// Dressing an unrelated failure up as a policy decision tells someone their limits are
+    /// working when something else is broken.
+    #[test]
+    fn a_simulation_failure_that_is_not_a_rule_keeps_the_nodes_words() {
+        let failure = would_fail(Some("InsufficientGas".into()));
+        assert_eq!(
+            failure,
+            Failure::Failed("the chain says this would fail: InsufficientGas".into())
+        );
+    }
+
+    #[test]
+    fn a_simulation_that_failed_for_no_stated_reason_says_that_rather_than_inventing_one() {
+        assert_eq!(
+            would_fail(None),
+            Failure::Failed("the chain says this would fail: no reason given".into())
+        );
+    }
+
+    /// A rule can refuse after the gate, when the wallet's state moved in between. It is still a
+    /// rule, and still named.
+    #[test]
+    fn a_rule_abort_at_submission_is_named_too() {
+        let failure = did_fail(PER_TX);
+        assert!(matches!(failure, Failure::Refused(_)), "{failure}");
+    }
+
+    #[test]
+    fn a_failure_at_submission_that_is_not_a_rule_says_it_failed_on_chain() {
+        let failure = did_fail("UnusedValueWithoutDrop");
+        assert_eq!(
+            failure,
+            Failure::Failed("the transaction failed on chain: UnusedValueWithoutDrop".into())
+        );
     }
 }

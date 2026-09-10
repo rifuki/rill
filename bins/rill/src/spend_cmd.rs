@@ -19,7 +19,7 @@ use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
-use crate::verdict::{no_verdict, submit_failed};
+use crate::verdict::{did_fail, no_verdict, submit_failed, would_fail, Failure};
 
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
@@ -39,7 +39,9 @@ pub struct SpendArgs {
 
 /// The printing command. Everything it knows comes from [`spend_json`]; it only renders.
 pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Result<(), String> {
-    let result = spend_json(endpoint, keystore, args).await?;
+    let result = spend_json(endpoint, keystore, args)
+        .await
+        .map_err(|failure| failure.to_string())?;
     for (label, key) in [
         ("wallet   ", "wallet"),
         ("amount   ", "amount"),
@@ -89,8 +91,25 @@ pub async fn spend_json(
     endpoint: &str,
     keystore: &Keystore,
     args: &SpendArgs,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, Failure> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
+    spend_json_on(&chain, keystore, args).await
+}
+
+/// The spend itself, against any chain.
+///
+/// Split out so the whole path can be driven offline against [`rill_chain::fake::FakeSui`]: five
+/// round trips, a rule list read from the wallet rather than assumed, a gas price that has to be
+/// read, and a refusal that has to name the rule. Every one of those was reachable only through a
+/// live testnet node and therefore not exercised in CI at all.
+///
+/// The client is created by the caller and used here, which keeps it inside the caller's runtime.
+/// A tonic channel built in one runtime and used in another is already closed.
+pub async fn spend_json_on(
+    chain: &(impl SuiRead + SuiWrite),
+    keystore: &Keystore,
+    args: &SpendArgs,
+) -> Result<serde_json::Value, Failure> {
     let sender = keystore.address();
 
     let wallet_id: Address = args
@@ -134,7 +153,9 @@ pub async fn spend_json(
         .filter(|o| o.object_type.as_deref() == Some(SUI_COIN_TYPE))
         .collect();
     if gas.is_empty() {
-        return Err(format!("{sender} holds no SUI to pay for this"));
+        return Err(Failure::Failed(format!(
+            "{sender} holds no SUI to pay for this"
+        )));
     }
 
     // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
@@ -180,12 +201,12 @@ pub async fn spend_json(
         .map(str::to_owned)
         .collect();
     if modules.len() != names.len() {
-        return Err(format!(
+        return Err(Failure::Failed(format!(
             "this wallet carries {} rule(s), and only {} of them have an emitter here: {names:?}\n\
              Every attached rule must be proved, so this spend cannot be built.",
             names.len(),
             modules.len()
-        ));
+        )));
     }
 
     let amount_mist = rill_core::amounts::decimal_to_base_units(&args.amount, 9)
@@ -260,19 +281,12 @@ pub async fn spend_json(
     let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
 
     if !outcome.ok {
-        let error = outcome.error.unwrap_or_else(|| "no reason given".into());
         // A rule refusing is the wallet working. Saying so is the difference between a caller who
         // trusts the limits and one who thinks the tool is broken — and between an agent that
-        // changes the amount and one that retries the same call forever.
-        return Err(match rill_chain::aborts::classify_rule_abort(&error) {
-            Some(refusal) => format!(
-                "{refusal}.
-
-{}",
-                refusal.advice()
-            ),
-            None => format!("the chain refused it: {error}"),
-        });
+        // changes the amount and one that retries the same call forever. The naming lives in
+        // `verdict` now, because create and attach need exactly the same answer and used to give a
+        // quoted abort instead.
+        return Err(would_fail(outcome.error));
     }
 
     let mut result = serde_json::json!({
@@ -300,7 +314,7 @@ pub async fn spend_json(
         .map_err(submit_failed)?;
 
     if let Some(error) = &outcome.error {
-        return Err(format!("the transaction failed on chain: {error}"));
+        return Err(did_fail(error));
     }
 
     result["submitted"] = serde_json::Value::Bool(true);

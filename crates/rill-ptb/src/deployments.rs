@@ -33,6 +33,15 @@
 pub const TESTNET_AGENT_WALLET: &str =
     "0xb02f39d682d0471344b1cc264f6f29d625280b9e73560d5beee3db3090563740";
 
+/// The shared `Version` object [`TESTNET_AGENT_WALLET`] gates itself on.
+///
+/// Every call into the package takes it, so every command and every tool needs the id. It was
+/// written out in `main.rs` and again in `stdio.rs`, which is two places for one deployment fact:
+/// a redeploy that updated one of them would leave the other building transactions against a
+/// version object the package no longer accepts, and the failure arrives as a Move abort.
+pub const TESTNET_AGENT_WALLET_VERSION: &str =
+    "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65";
+
 /// The previous deployment, kept named so that finding it in a config is recognition rather than
 /// research. It exposes `spend()` and none of the hot-potato sequence.
 pub const TESTNET_AGENT_WALLET_SUPERSEDED: &str =

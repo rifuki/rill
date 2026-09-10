@@ -16,6 +16,7 @@
 pub mod describe;
 pub mod fake;
 pub mod grpc;
+pub mod settle;
 
 pub use rill_chain_types::*;
 

@@ -186,6 +186,79 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                     "additionalProperties": false
                 })),
             ),
+            // The two owner-side steps, which used to be commands a person typed.
+            //
+            // Without them the flow an agent could drive started halfway through: it could spend
+            // from a wallet and could not get one, so every demonstration began with a human at a
+            // terminal. Offering them here does not widen what an agent may do, because the
+            // contract decides that and not this list: `add_rule` asserts the owner, so a signer
+            // launched with the agent's key is refused by name the moment it tries.
+            destructive(
+                "rill_create_wallet",
+                "Mint an agent wallet and the AgentCap that drives it, funded from the key this \
+                 signer holds. The key here becomes the wallet's owner and the cap goes to the \
+                 agent address you name, which is what makes the two identities different keys. \
+                 THIS SUBMITS A REAL TRANSACTION and cannot be undone. The wallet is shared with \
+                 NO rules attached, and a wallet with no rules has no limits, so call \
+                 rill_attach_rules with the id this returns before the cap is worth anything. Do \
+                 not retry a success: a second call mints a second wallet and funds it again.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "The agent's Sui address, which receives the AgentCap. Public, never a key."
+                        },
+                        "amount": {
+                            "type": "string",
+                            "description": "Decimal SUI to fund the wallet with, as text, never a number. \"0.05\", not 0.05."
+                        },
+                        "budget": {
+                            "type": "string",
+                            "description": "Total mist the agent may ever spend from this wallet, as text. Proved on chain by the budget rule."
+                        },
+                        "perTx": {
+                            "type": "string",
+                            "description": "Most mist one transaction may release, as text. Proved on chain by the per_tx rule."
+                        },
+                        "days": {
+                            "type": "integer",
+                            "description": "How long the wallet stays usable. Defaults to 30."
+                        }
+                    },
+                    "required": ["agent", "amount", "budget", "perTx"],
+                    "additionalProperties": false
+                })),
+            ),
+            destructive(
+                "rill_attach_rules",
+                "Attach the rules that bound a wallet: a total budget and a per-transaction cap, \
+                 both held by the Move contract and proved against every spend. Owner-only, and \
+                 the contract is what enforces that: signed with the agent's key this comes back \
+                 refused, naming agent_wallet. THIS SUBMITS A REAL TRANSACTION and cannot be \
+                 undone. It reads the wallet's live rules first and reconciles against them, so a \
+                 retry with the same values is not a second attach; a value that differs is \
+                 removed and re-added, because add_rule is not idempotent.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": {
+                            "type": "string",
+                            "description": "The AgentWallet object id, from rill_create_wallet."
+                        },
+                        "budget": {
+                            "type": "string",
+                            "description": "Total mist the agent may ever spend from this wallet, as text, never a number."
+                        },
+                        "perTx": {
+                            "type": "string",
+                            "description": "Most mist one transaction may release, as text, never a number."
+                        }
+                    },
+                    "required": ["wallet", "budget", "perTx"],
+                    "additionalProperties": false
+                })),
+            ),
             destructive(
                 "rill_spend",
                 "Release funds from an agent wallet and send them, gated by the rules the wallet \
@@ -217,10 +290,12 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope built \
                  elsewhere. Distinct from rill_spend, which builds locally: this is the path where \
                  a keyless server proposes and this signer independently re-derives everything \
-                 before agreeing. THIS SUBMITS A REAL TRANSACTION and cannot be undone. Never \
-                 retry this call for the same envelope: a second call submits a second \
-                 transaction. If it refused, read why in rill_status and change what it objected \
-                 to — retrying an unchanged envelope produces the same refusal.",
+                 before agreeing. THIS SUBMITS A REAL TRANSACTION and cannot be undone. An \
+                 envelope this signer has already handed to the chain is refused on a second call, \
+                 naming the digest of the first, so a retry cannot become a second transaction. \
+                 Build a new action instead. If it refused before submitting, read why in \
+                 rill_status and change what it objected to: retrying an unchanged envelope \
+                 produces the same refusal.",
                 object_schema(json!({
                     "type": "object",
                     "properties": { "envelope": { "type": "object" } },
@@ -307,7 +382,12 @@ mod tests {
     /// thing worth catching: an agent decides whether to ask a human from this flag.
     #[test]
     fn every_submitting_tool_is_marked_destructive_and_no_other_is() {
-        const SUBMITS: &[&str] = &["rill_spend", "rill_execute"];
+        const SUBMITS: &[&str] = &[
+            "rill_create_wallet",
+            "rill_attach_rules",
+            "rill_spend",
+            "rill_execute",
+        ];
 
         let destructive: Vec<String> = [Surface::Actions, Surface::Wallet]
             .into_iter()
@@ -328,6 +408,47 @@ mod tests {
                 submits, marked,
                 "{} submits={submits} but is marked destructive={marked}",
                 tool.name
+            );
+        }
+    }
+
+    /// Every step from no wallet to a bounded spend is a tool, not a command somebody types.
+    ///
+    /// R3 is not "a spend tool exists". Creating a wallet and attaching its rules used to be
+    /// commands run by hand, so the flow an agent could drive started halfway through: it could
+    /// spend from a wallet and could not get one. A surface missing either step sends whoever is
+    /// checking the claim back to a terminal.
+    #[test]
+    fn the_wallet_surface_offers_every_step_from_no_wallet_to_a_bounded_spend() {
+        let names: Vec<String> = tools(Surface::Wallet)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for step in ["rill_create_wallet", "rill_attach_rules", "rill_spend"] {
+            assert!(
+                names.contains(&step.to_string()),
+                "{step} is missing, so the flow still needs a human at a terminal: {names:?}"
+            );
+        }
+    }
+
+    /// The keyless surface gains nothing from the flow above. It holds no key, so it could not
+    /// complete any of it, and offering a tool it cannot finish is worse than not offering one.
+    #[test]
+    fn the_two_surfaces_differ_by_exactly_the_tools_that_need_a_key() {
+        let actions: Vec<String> = tools(Surface::Actions)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for signing in [
+            "rill_create_wallet",
+            "rill_attach_rules",
+            "rill_spend",
+            "rill_execute",
+        ] {
+            assert!(
+                !actions.contains(&signing.to_string()),
+                "{signing} needs a key and the builder has none"
             );
         }
     }

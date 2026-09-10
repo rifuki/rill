@@ -4,26 +4,42 @@
 //! is a separate refusal: a simulation that fails never reaches the signing code, and a signature
 //! is never produced for bytes the chain has not already agreed would execute.
 //!
-//! # Why the ids are printed rather than remembered
+//! # Why the ids are returned rather than remembered
 //!
 //! `create_wallet` shares a wallet and mints a capability, and neither id exists until the
 //! transaction lands. Everything after this step needs both. They come out of the effects and are
-//! printed, because the alternative — writing them into a state file the user did not ask for — is
-//! a second source of truth about what exists on chain.
+//! handed back. The alternative, writing them into a state file the user did not ask for, is a
+//! second source of truth about what exists on chain.
+//!
+//! # Two callers, one producer
+//!
+//! A person runs `rill wallet create` and reads lines. An agent calls `rill_create_wallet` over MCP
+//! and reads JSON, on a stream where a stray `println!` corrupts the protocol. So the work happens
+//! in [`create_json`], which returns the data, and [`create`] only renders it. Neither can drift
+//! from the other, because there is nothing to drift: the printing path knows only what the JSON
+//! carries.
 
 use rill_chain::{grpc::GrpcSui, ChainError, SuiRead, SuiWrite};
 use rill_core::manifest::{CapabilityManifest, CapabilityRule};
 use rill_ptb::create::{build_create_wallet, NewWallet};
 use rill_ptb::shared::SharedObjects;
+use serde_json::{json, Value};
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 use crate::keystore::Keystore;
-use crate::verdict::{no_verdict, submit_failed};
+use crate::verdict::{did_fail, no_verdict, submit_failed, would_fail, Failure};
 
 /// Fully-expanded SUI, the way the chain writes it in an object type.
 const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
+
+/// What a freshly created wallet permits, which is nothing, said where both callers read it.
+const NO_RULES_YET: &str =
+    "This wallet has NO rules attached yet, and confirm_spend on an empty policy requires zero \
+     receipts, so the capability is unbounded until rules are attached. Attach them before the \
+     cap is handed to anything: `rill wallet rules --wallet <id> --submit`, or the rill_attach_rules \
+     tool with this wallet id.";
 
 pub struct CreateArgs {
     pub package_id: String,
@@ -40,13 +56,98 @@ pub struct CreateArgs {
     pub dry_run: bool,
 }
 
+/// The printing command. Everything it knows comes from [`create_json`]; it only renders.
 pub async fn create(
     endpoint: &str,
     keystore: &Keystore,
     args: &CreateArgs,
     now_ms: u64,
 ) -> Result<(), String> {
+    let report = create_json(endpoint, keystore, args, now_ms)
+        .await
+        .map_err(|failure| failure.to_string())?;
+    let text = |key: &str| report[key].as_str().unwrap_or_default().to_owned();
+
+    println!("sender  : {}", text("sender"));
+    println!("agent   : {}", text("agent"));
+    println!("funding : {}", text("funding"));
+    println!(
+        "rules   : {}",
+        report["rules"]
+            .as_array()
+            .map(|rules| rules
+                .iter()
+                .map(|r| r.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(", "))
+            .unwrap_or_else(|| "none".into())
+    );
+    println!("\nsimulation: ok=true gas={}", report["gasUsed"]);
+
+    if report["submitted"] != Value::Bool(true) {
+        println!("\ndry run: nothing signed, nothing submitted.");
+        println!("re-run with --submit to sign and send it.");
+        return Ok(());
+    }
+
+    println!("\ndigest  : {}", text("digest"));
+    println!("success : true");
+    println!("gas used: {}", report["gasUsed"]);
+
+    println!("\ncreated:");
+    let nothing = Vec::new();
+    for object in report["created"].as_array().unwrap_or(&nothing) {
+        println!(
+            "  {}  {}\n      {}",
+            object["objectId"].as_str().unwrap_or_default(),
+            object["objectType"]
+                .as_str()
+                .unwrap_or("(type not reported)"),
+            object["ownership"].as_str().unwrap_or("owned")
+        );
+    }
+
+    // The two ids every later step needs, named rather than left to be picked out of the list.
+    println!("\nnext step needs:");
+    for (label, key) in [("wallet", "wallet"), ("cap", "cap")] {
+        match report[key].as_str() {
+            Some(id) => println!("  {label:7}: {id}"),
+            None => println!("  {label:7}: not found in the effects, check the type filter"),
+        }
+    }
+    // The note, not the constant: it carries what a fresh wallet permits and, when the node has
+    // not indexed it yet, that too.
+    println!("\n{}", text("note"));
+    Ok(())
+}
+
+/// Mint the wallet and the capability, and return what happened as structured data.
+pub async fn create_json(
+    endpoint: &str,
+    keystore: &Keystore,
+    args: &CreateArgs,
+    now_ms: u64,
+) -> Result<Value, Failure> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
+    create_json_on(&chain, keystore, args, now_ms).await
+}
+
+/// The creation itself, against any chain.
+///
+/// Split out so the whole path can be driven offline against [`rill_chain::fake::FakeSui`]: the
+/// Version object's shared version read rather than assumed, every SUI coin collected rather than
+/// the first, a gas price read because a literal is wrong on one of the two networks, the
+/// simulation gate, and the ids picked out of the effects afterwards. All of it was reachable only
+/// through a live node, so none of it ran in CI.
+///
+/// The client is created by the caller and used here, which keeps it inside the caller's runtime. A
+/// tonic channel built in one runtime and used in another is already closed.
+pub async fn create_json_on(
+    chain: &(impl SuiRead + SuiWrite),
+    keystore: &Keystore,
+    args: &CreateArgs,
+    now_ms: u64,
+) -> Result<Value, Failure> {
     let sender = keystore.address();
     let version_id: Address = args
         .version_id
@@ -75,9 +176,9 @@ pub async fn create(
         .filter(|o| o.object_type.as_deref() == Some(SUI_COIN_TYPE))
         .collect();
     if gas.is_empty() {
-        return Err(format!(
+        return Err(Failure::Failed(format!(
             "{sender} holds no SUI, so it cannot pay for anything"
-        ));
+        )));
     }
 
     let amount_mist = rill_core::amounts::decimal_to_base_units(&args.amount, 9)
@@ -135,28 +236,28 @@ pub async fn create(
             .encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?)
     };
 
-    println!("sender  : {sender}");
-    println!("agent   : {}", wallet.agent);
-    println!("funding : {} SUI ({amount_mist} mist)", args.amount);
-    println!("rules   : {}", describe(&args.manifest));
+    let mut report = json!({
+        "sender": sender.to_string(),
+        "agent": wallet.agent.to_string(),
+        "funding": format!("{} SUI ({amount_mist} mist)", args.amount),
+        "fundingBaseUnits": amount_mist.to_string(),
+        "rules": describe(&args.manifest),
+        "expiresAtMs": wallet.expires_at_ms.to_string(),
+        "submitted": false,
+    });
 
     // The gate. Nothing below runs unless the chain has already agreed this would execute.
     let outcome = chain.simulate(&b64).await.map_err(no_verdict)?;
-    println!(
-        "\nsimulation: ok={} verification={:?} gas={}",
-        outcome.ok, outcome.verification, outcome.gas_used_mist
-    );
     if !outcome.ok {
-        return Err(format!(
-            "the chain says this would fail: {}",
-            outcome.error.unwrap_or_else(|| "no reason given".into())
-        ));
+        return Err(would_fail(outcome.error));
     }
+    report["gasUsed"] = json!(outcome.gas_used_mist);
 
     if args.dry_run {
-        println!("\ndry run — nothing signed, nothing submitted.");
-        println!("re-run with --submit to sign and send it.");
-        return Ok(());
+        report["note"] = json!(format!(
+            "Simulated only. Nothing was signed and nothing was submitted. {NO_RULES_YET}"
+        ));
+        return Ok(report);
     }
 
     let signature = keystore.sign(&built).map_err(|e| e.to_string())?;
@@ -164,66 +265,66 @@ pub async fn create(
         .execute(&b64, &[signature.to_base64()])
         .await
         .map_err(submit_failed)?;
-
-    println!("\ndigest  : {}", outcome.digest);
-    println!("success : {}", outcome.success);
     if let Some(error) = &outcome.error {
-        return Err(format!("the transaction failed on chain: {error}"));
+        return Err(did_fail(error));
     }
-    println!("gas used: {}", outcome.gas_used_mist);
 
-    println!("\ncreated:");
-    for object in &outcome.created {
-        let kind = match object.shared_initial_version {
-            Some(v) => format!("shared at version {v}"),
-            None => match &object.owner {
-                Some(owner) => format!("owned by {owner}"),
-                None => "owned".into(),
+    report["submitted"] = json!(true);
+    report["digest"] = json!(outcome.digest);
+    report["gasUsed"] = json!(outcome.gas_used_mist);
+    report["created"] = json!(outcome
+        .created
+        .iter()
+        .map(|object| json!({
+            "objectId": object.object_id,
+            "objectType": object.object_type,
+            "ownership": match object.shared_initial_version {
+                Some(v) => format!("shared at version {v}"),
+                None => match &object.owner {
+                    Some(owner) => format!("owned by {owner}"),
+                    None => "owned".to_string(),
+                },
             },
-        };
-        println!(
-            "  {}  {}\n      {kind}",
-            object.object_id,
-            object
-                .object_type
-                .as_deref()
-                .unwrap_or("(type not reported)")
-        );
-    }
+        }))
+        .collect::<Vec<_>>());
 
     // The two ids every later step needs, named rather than left to be picked out of the list.
-    let wallet_id = outcome.created.iter().find(|o| {
-        o.object_type
-            .as_deref()
-            .is_some_and(|t| t.contains("AgentWallet"))
-    });
-    let cap_id = outcome.created.iter().find(|o| {
-        o.object_type
-            .as_deref()
-            .is_some_and(|t| t.ends_with("::AgentCap"))
-    });
+    let found = |predicate: fn(&str) -> bool| {
+        outcome
+            .created
+            .iter()
+            .find(|o| o.object_type.as_deref().is_some_and(predicate))
+            .map(|o| o.object_id.clone())
+    };
+    let wallet_id = found(|t| t.contains("AgentWallet"));
+    report["wallet"] = json!(wallet_id);
+    report["cap"] = json!(found(|t| t.ends_with("::AgentCap")));
 
-    println!("\nnext step needs:");
-    match wallet_id {
-        Some(w) => println!("  wallet : {}", w.object_id),
-        None => println!("  wallet : not found in the effects — check the type filter"),
-    }
-    match cap_id {
-        Some(c) => println!("  cap    : {}", c.object_id),
-        None => println!("  cap    : not found in the effects"),
-    }
-    println!(
-        "\nThe wallet has NO rules attached yet, and confirm_spend on an empty policy requires\n\
-         zero receipts. Run `rill wallet rules` before this capability is worth anything."
-    );
+    // The next step reads this wallet, and certified is not the same as visible: see
+    // [`rill_chain::settle`], where the live failure that put this here is recorded. Waited for
+    // inside the same runtime and on the same client as everything above.
+    let readable = match &wallet_id {
+        Some(id) => rill_chain::settle::wait_until_readable(chain, id).await,
+        None => false,
+    };
+    report["visibleOnNode"] = json!(readable);
 
-    Ok(())
+    report["note"] = json!(format!(
+        "Submitted and confirmed. This cannot be undone, and calling again mints a second wallet \
+         and funds it again. {NO_RULES_YET}{}",
+        if readable {
+            ""
+        } else {
+            " The node that answered has not indexed the new wallet yet, so the next call may \
+             answer that it does not exist; the transaction landed regardless, and its digest is \
+             above. Read the wallet again before deciding anything."
+        }
+    ));
+    Ok(report)
 }
 
-fn describe(manifest: &CapabilityManifest) -> String {
-    if manifest.rules.is_empty() {
-        return "none".into();
-    }
+/// The manifest in words, one entry per rule, for whoever has to check what was asked for.
+fn describe(manifest: &CapabilityManifest) -> Vec<String> {
     manifest
         .rules
         .iter()
@@ -240,6 +341,5 @@ fn describe(manifest: &CapabilityManifest) -> String {
             } => format!("window {not_before_ms}..{not_after_ms}"),
             other => format!("{:?}", other.kind()),
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect()
 }

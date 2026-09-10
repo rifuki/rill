@@ -14,12 +14,14 @@
 //! A message with no `id` is answered with silence, not with a null-id response. Answering one is
 //! a spec violation that some clients tolerate and others hang on.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
 use crate::keystore::Keystore;
-use crate::runset::RunSet;
+use crate::runset::{RunSet, RUN_SET_VAR};
+use crate::verdict::Failure;
 
 /// Protocol versions this signer speaks.
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -36,6 +38,31 @@ pub struct WalletContext {
     pub mainnet_allowed: bool,
     /// The last policy refusal, so `rill_explain_rejection` can answer without re-running anything.
     pub last_rejection: Option<String>,
+    /// Every envelope this signer has already handed to the chain, by its pinned byte digest.
+    ///
+    /// # Why a second call is refused rather than obeyed
+    ///
+    /// `rill_execute` submits, and the tool used to say in its own answer that calling it again
+    /// with the same envelope submits a second transaction. That is a footgun described rather
+    /// than removed: an agent whose reply was lost, or which retried on a timeout, would move the
+    /// money twice, and it cannot tell its retry from its first attempt because the envelope is
+    /// identical both times. The signer can.
+    ///
+    /// The key is the digest pinned from the bytes about to be signed, so it matches the same
+    /// transaction and nothing else. It lives for the life of this process, which is the honest
+    /// scope and is stated in the refusal: a freshly started signer does not know, and a replay
+    /// would then fail on chain anyway, as an unexplained stale-object error rather than a named
+    /// refusal.
+    pub submitted: HashMap<String, Submission>,
+}
+
+/// One envelope this signer has already handed to the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submission {
+    /// The chain's digest, when the node answered. `None` means the response was lost and whether
+    /// it landed is unknown, which is the case where a blind retry is most dangerous: the first
+    /// submission may already be on chain.
+    pub digest: Option<String>,
 }
 
 impl WalletContext {
@@ -46,6 +73,7 @@ impl WalletContext {
             network,
             mainnet_allowed,
             last_rejection: None,
+            submitted: HashMap::new(),
         }
     }
 
@@ -75,14 +103,72 @@ fn tool_ok(id: Value, data: Value) -> Value {
 }
 
 fn tool_error(id: Value, code: &str, message: &str) -> Value {
+    tool_error_with(id, code, message, Value::Null)
+}
+
+/// A refusal with structured detail beside the message.
+///
+/// The message is what a person reads; the fields are what the agent acts on. A refusal that put
+/// the name of the rule that refused only into prose left that decision to a substring match, and
+/// an agent that cannot tell "the cap stopped you" from "the node is down" retries the same amount
+/// forever.
+fn tool_error_with(id: Value, code: &str, message: &str, detail: Value) -> Value {
+    let mut structured = json!({ "code": code, "message": message });
+    if let (Some(target), Some(fields)) = (structured.as_object_mut(), detail.as_object()) {
+        for (key, value) in fields {
+            target.insert(key.clone(), value.clone());
+        }
+    }
     rpc_result(
         id,
         json!({
             "content": [{ "type": "text", "text": message }],
-            "structuredContent": { "code": code, "message": message },
+            "structuredContent": structured,
             "isError": true
         }),
     )
+}
+
+/// A refusal the chain made by name, with the rule in a field of its own.
+///
+/// `rule` is what a caller acts on: `per_tx` means spend less, `agent_wallet` means the wrong key
+/// signed, and neither is legible from `"code": "refused"` with the name buried in a sentence. The
+/// name comes from [`rill_chain::aborts::classify_rule_abort`], which reads it out of the Move
+/// abort, so it is the module the chain really aborted in rather than a guess made here.
+fn rule_refusal(id: Value, refusal: &rill_chain::aborts::RuleRefusal) -> Value {
+    let message = Failure::Refused(refusal.clone()).to_string();
+    tool_error_with(
+        id,
+        "rule_refused",
+        &message,
+        json!({
+            "rule": refusal.module,
+            "abortCode": refusal.code,
+            "advice": refusal.advice(),
+        }),
+    )
+}
+
+/// Render a command's failure, keeping a named refusal named.
+///
+/// `code` is for the failures that are not refusals: which tool could not finish. A refusal never
+/// takes it, because "the per-transaction cap refused this" is not a failure of the tool and
+/// reporting it as one is how a caller concludes the signer is broken.
+///
+/// Public because this mapping is the contract, not an implementation detail: every path that
+/// refuses goes through it, and `tests/execute_flow.rs` asserts on what it produces. The paths that
+/// call it all need a node, so a test that could only reach it through one would not run in CI.
+pub fn failure_response(
+    context: &mut WalletContext,
+    id: Value,
+    code: &str,
+    failure: &Failure,
+) -> Value {
+    context.last_rejection = Some(failure.to_string());
+    match failure {
+        Failure::Refused(refusal) => rule_refusal(id, refusal),
+        Failure::Failed(message) => tool_error(id, code, message),
+    }
 }
 
 /// Handle one message. `None` means a notification, which gets no reply at all.
@@ -145,6 +231,8 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     match name {
         "rill_status" => status(context, id),
         "rill_wallet" => wallet(context, id, &params),
+        "rill_create_wallet" => create_wallet(context, id, &params),
+        "rill_attach_rules" => attach_rules(context, id, &params),
         "rill_spend" => spend(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
@@ -185,6 +273,46 @@ fn argument<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
         .and_then(|a| a.get(name))
         .and_then(Value::as_str)
 }
+
+/// A count, which is the one kind of argument that is honestly a number.
+///
+/// Amounts are never read here. They are decimal text all the way to the chain, because a JSON
+/// number on the money path is a float, and a float is how 0.1 becomes 0.09999999999999999.
+fn count_argument(params: &Value, name: &str) -> Option<u64> {
+    params
+        .get("arguments")
+        .and_then(|a| a.get(name))
+        .and_then(Value::as_u64)
+}
+
+/// The deployed package and the shared `Version` object it gates itself on.
+///
+/// Three tools need the same pair, and a capability minted against one package cannot authorise a
+/// call in another, so this is read in one place from the environment that a deployment sets.
+fn package_id() -> String {
+    std::env::var("AGENT_WALLET_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string())
+}
+
+fn version_id() -> String {
+    std::env::var("AGENT_WALLET_VERSION_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET_VERSION.to_string())
+}
+
+/// Milliseconds since the epoch, for an expiry the contract compares against its own clock.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The gas budget every tool here builds with, in mist.
+///
+/// A ceiling the gas coins have to cover, not a fee, and the same value the commands use, so a
+/// wallet minted over MCP costs what one minted by hand costs and fails the same way when the
+/// account is too thin to cover it.
+const TOOL_GAS_BUDGET: u64 = 100_000_000;
 
 /// Whether this signer can act. Says nothing about any particular wallet.
 fn status(context: &WalletContext, id: Value) -> Value {
@@ -299,42 +427,207 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         );
     };
 
-    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
-    let version = std::env::var("AGENT_WALLET_VERSION_ID").unwrap_or_else(|_| {
-        "0xd4f88a6dc271f923f0e55dd96eb8f8762ed4d45199c6719ae92365694478fd65".to_string()
-    });
-
     let args = crate::spend_cmd::SpendArgs {
-        package_id: package,
-        version_id: version,
+        package_id: package_id(),
+        version_id: version_id(),
         wallet_id: wallet.to_string(),
         cap_id: cap.to_string(),
         amount: amount.to_string(),
         recipient: argument(params, "to").map(str::to_owned),
-        gas_budget: 100_000_000,
+        gas_budget: TOOL_GAS_BUDGET,
         dry_run: false,
     };
 
+    // A rule that refused arrives as a refusal naming the rule, not as `"code": "refused"` with
+    // `per_tx` somewhere in the prose. That distinction is the whole of R3 on this path.
     match block_on(crate::spend_cmd::spend_json(
         &endpoint(context),
         keystore,
         &args,
     )) {
         Ok(Ok(result)) => tool_ok(id, result),
-        Ok(Err(e)) | Err(e) => {
-            context.last_rejection = Some(e.clone());
-            tool_error(id, "refused", &e)
-        }
+        Ok(Err(failure)) => failure_response(context, id, "spend_failed", &failure),
+        Err(e) => failure_response(context, id, "spend_failed", &Failure::Failed(e)),
     }
+}
+
+/// Mint an agent wallet and the capability that drives it. Owner-side, and the first step of a flow
+/// an agent has to be able to drive on its own.
+///
+/// # Why an owner's tool sits on the agent's surface
+///
+/// Everything before the spend was a command somebody typed, so the flow an agent could drive
+/// started halfway through: it could spend from a wallet and could not get one, and every
+/// demonstration of the claim began with a human at a terminal. Offering this here widens nothing,
+/// because what an agent may do is decided by the contract and not by this list: the cap goes to
+/// the agent address named here, `add_rule` asserts the owner, and a signer launched with the
+/// agent's key is refused by name the moment it reaches for either.
+///
+/// The key this process holds becomes the wallet's owner. That is stated in the tool's description
+/// rather than inferred, because it is the one consequence a caller cannot see from the arguments.
+fn create_wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so no wallet can be created. The key this \
+                      signer holds is what becomes the wallet's owner."
+            .to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    if context.network == "mainnet" && !context.mainnet_allowed {
+        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "mainnet_not_opted_in", &reason);
+    }
+
+    let (Some(agent), Some(amount), Some(budget), Some(per_tx)) = (
+        argument(params, "agent"),
+        argument(params, "amount"),
+        argument(params, "budget"),
+        argument(params, "perTx"),
+    ) else {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            "agent, amount, budget and perTx are all required. agent is the address that receives \
+             the AgentCap, amount is decimal SUI as text, and budget and perTx are mist as text, \
+             never numbers.",
+        );
+    };
+    if let Some(refusal) = bad_mist(id.clone(), &[("budget", budget), ("perTx", per_tx)]) {
+        return refusal;
+    }
+
+    let args = crate::wallet::CreateArgs {
+        package_id: package_id(),
+        version_id: version_id(),
+        agent: Some(agent.to_string()),
+        amount: amount.to_string(),
+        expires_in_days: count_argument(params, "days").unwrap_or(30),
+        manifest: bounded_manifest(budget, per_tx),
+        gas_budget: TOOL_GAS_BUDGET,
+        // Not a dry run. A tool whose whole purpose is to mint a wallet would otherwise answer
+        // with a simulation and leave the agent with nothing to attach rules to, and there is no
+        // second call for it to come back with: `--submit` is a flag a person types.
+        dry_run: false,
+    };
+
+    match block_on(crate::wallet::create_json(
+        &endpoint(context),
+        keystore,
+        &args,
+        now_ms(),
+    )) {
+        Ok(Ok(report)) => tool_ok(id, report),
+        Ok(Err(failure)) => failure_response(context, id, "create_failed", &failure),
+        Err(e) => failure_response(context, id, "create_failed", &Failure::Failed(e)),
+    }
+}
+
+/// Attach the rules that bound a wallet. The step that is easy to skip and expensive to skip.
+///
+/// Owner-only, enforced on chain: `add_rule` asserts the sender is the wallet's owner, so a signer
+/// holding the agent's key is refused with `E_NOT_OWNER`, named, rather than by this process
+/// declining to try. An agent driving this tool cannot widen its own limits, and the refusal it
+/// gets says which rule module said no.
+fn attach_rules(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so no rules can be attached. Attaching is \
+                      owner-only and needs the owner's key."
+            .to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    if context.network == "mainnet" && !context.mainnet_allowed {
+        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "mainnet_not_opted_in", &reason);
+    }
+
+    let (Some(wallet), Some(budget), Some(per_tx)) = (
+        argument(params, "wallet"),
+        argument(params, "budget"),
+        argument(params, "perTx"),
+    ) else {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            "wallet, budget and perTx are all required. wallet is the AgentWallet id from \
+             rill_create_wallet, and budget and perTx are mist as text, never numbers.",
+        );
+    };
+    if let Some(refusal) = bad_mist(id.clone(), &[("budget", budget), ("perTx", per_tx)]) {
+        return refusal;
+    }
+
+    let args = crate::rules_cmd::RulesArgs {
+        package_id: package_id(),
+        version_id: version_id(),
+        wallet_id: wallet.to_string(),
+        manifest: bounded_manifest(budget, per_tx),
+        gas_budget: TOOL_GAS_BUDGET,
+        dry_run: false,
+    };
+
+    match block_on(crate::rules_cmd::attach_json(
+        &endpoint(context),
+        keystore,
+        &args,
+    )) {
+        Ok(Ok(report)) => tool_ok(id, report),
+        Ok(Err(failure)) => failure_response(context, id, "attach_failed", &failure),
+        Err(e) => failure_response(context, id, "attach_failed", &Failure::Failed(e)),
+    }
+}
+
+/// The two on-chain rules these tools offer: a total and a per-transaction cap.
+///
+/// Both kinds the contract proves against the real transaction, and nothing pre-flight, because a
+/// rule this signer would have to enforce itself is not something a tool can attach to a wallet.
+fn bounded_manifest(budget: &str, per_tx: &str) -> rill_core::manifest::CapabilityManifest {
+    rill_core::manifest::CapabilityManifest {
+        wallet_coin_type: "0x2::sui::SUI".into(),
+        rules: vec![
+            rill_core::manifest::CapabilityRule::Budget {
+                total_mist: budget.to_owned(),
+            },
+            rill_core::manifest::CapabilityRule::PerTx {
+                max_mist: per_tx.to_owned(),
+            },
+        ],
+    }
+}
+
+/// Refuse an amount that is not whole mist, here rather than four round trips later.
+///
+/// The manifest projection would catch it, after the Version object has been read and the sender's
+/// objects listed, and report it as a field name from a layer the caller never mentioned. Named
+/// here, the answer is the argument the caller typed.
+fn bad_mist(id: Value, fields: &[(&str, &str)]) -> Option<Value> {
+    fields.iter().find_map(|(name, value)| {
+        value.parse::<u64>().err().map(|_| {
+            tool_error(
+                id.clone(),
+                "invalid_arguments",
+                &format!(
+                    "{name} must be a whole number of mist written as text, and \"{value}\" is \
+                     not. One SUI is 1000000000 mist."
+                ),
+            )
+        })
+    })
 }
 
 fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let Some(run_set) = context.run_set.as_ref() else {
-        let reason = "No run-set is loaded, so there are no pinned limits to validate against. \
-                      Refusing to sign rather than signing against limits nobody set.";
-        context.last_rejection = Some(reason.to_string());
-        return tool_error(id, "no_run_set", reason);
+        // Names what is missing and where it goes. "No run-set is loaded" alone tells an agent it
+        // cannot proceed without telling whoever launched the signer what to fix.
+        let reason = format!(
+            "No run-set is loaded, so there are no pinned limits to validate against. Refusing to \
+             sign rather than signing against limits nobody set. Point {RUN_SET_VAR} at a run-set \
+             file and start this signer again."
+        );
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_run_set", &reason);
     };
     if context.keystore.is_none() {
         let reason = "No signing key is configured.";
@@ -366,12 +659,7 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(p) => p,
         Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let validated = match rill_policy::RawEnvelope::new(envelope).validate(&policy, now_ms) {
+    let validated = match rill_policy::RawEnvelope::new(envelope).validate(&policy, now_ms()) {
         Ok(v) => v,
         Err(rejection) => {
             let reason = rejection.to_string();
@@ -390,6 +678,33 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
 
     let digest = pinned.pinned_digest().to_string();
     let targets = pinned.decoded().targets.clone();
+
+    // Re-issuing this call does not start a second operation. See `WalletContext::submitted`: the
+    // envelope is identical on a retry, so the agent cannot tell one from the other and the signer
+    // is the only party that can. Checked after the bytes are pinned, because the digest is
+    // re-derived from them rather than taken from what the envelope claims about itself.
+    if let Some(prior) = context.submitted.get(&digest) {
+        let reason = match &prior.digest {
+            Some(landed) => format!(
+                "This envelope was already submitted by this signer, and landed as {landed}. \
+                 Submitting it again would be a second transaction moving the same funds, so it is \
+                 refused. Build a new action if another spend is intended."
+            ),
+            None => {
+                "This envelope was already handed to the node, and the node's answer was lost, \
+                     so whether it landed is unknown. Look for it on chain before sending anything \
+                     again: a blind retry is how one intended spend becomes two."
+                    .to_string()
+            }
+        };
+        context.last_rejection = Some(reason.clone());
+        return tool_error_with(
+            id,
+            "already_submitted",
+            &reason,
+            json!({ "pinnedDigest": digest, "priorDigest": prior.digest }),
+        );
+    }
 
     // The client is built inside the runtime, and everything that uses it stays inside the same
     // one. That is not a style choice.
@@ -449,6 +764,12 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
             return match failed {
                 Failed::Chain(reason) => {
                     context.last_rejection = Some(reason.clone());
+                    // A rule that refused is not a chain problem, and reporting it as one tells an
+                    // agent to retry a spend the wallet will refuse every time. The abort text
+                    // survives the re-simulation inside the rejection, so it can still be named.
+                    if let Some(refusal) = rill_chain::aborts::classify_rule_abort(&reason) {
+                        return rule_refusal(id, &refusal);
+                    }
                     // A node that answered "this object moved" was reached. Calling that
                     // unavailable sends an agent to retry against a network that is fine,
                     // holding an envelope that will never work; what it needs is a fresh build.
@@ -468,16 +789,34 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
                     tool_error(id, "malformed_envelope", &reason)
                 }
                 Failed::Signing(reason) => tool_error(id, "signing_failed", &reason),
-                Failed::Submit(reason) => tool_error(id, "submit_failed", &reason),
+                Failed::Submit(reason) => {
+                    // The node may have taken it. Remembered with no digest, so a retry is met
+                    // with "look on chain first" rather than quietly submitting a second time.
+                    // That is the reasoning `verdict::submit_failed` states for the command path.
+                    context
+                        .submitted
+                        .insert(digest.clone(), Submission { digest: None });
+                    context.last_rejection = Some(reason.clone());
+                    tool_error(id, "submit_failed", &reason)
+                }
             };
         }
         Err(reason) => return tool_error(id, "chain_unavailable", &reason),
     };
 
     if let Some(error) = &outcome.error {
-        context.last_rejection = Some(error.clone());
-        return tool_error(id, "execution_failed", error);
+        // A rule can still refuse here, when the wallet's state moved between the simulation and
+        // the submission. Named, exactly as it would have been before signing.
+        let failure = crate::verdict::did_fail(error);
+        return failure_response(context, id, "execution_failed", &failure);
     }
+
+    context.submitted.insert(
+        digest.clone(),
+        Submission {
+            digest: Some(outcome.digest.clone()),
+        },
+    );
 
     tool_ok(
         id,
@@ -488,8 +827,12 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
             "callSequence": targets,
             "gasUsed": outcome.gas_used_mist,
             "spendBaseUnits": spend_base_units,
-            "note": "Submitted and confirmed. This cannot be undone, and calling again with the \
-                     same envelope submits a second transaction."
+            // What the code does, said in the answer. This used to read "calling again with the
+            // same envelope submits a second transaction", which described a footgun instead of
+            // removing it; the second call is now refused and answered with this digest.
+            "note": "Submitted and confirmed. This cannot be undone. Calling again with this same \
+                     envelope is refused and answered with this digest, so a retry cannot become a \
+                     second transaction; build a new action if another spend is intended."
         }),
     )
 }
