@@ -12,12 +12,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with: { components: rustfmt, clippy }
       - uses: Swatinem/rust-cache@v2
+
+      # The pin has to bind, not merely exist. `rust-toolchain.toml` is an override rustup applies
+      # inside this directory, and three things that outrank it are one line away: a `+toolchain`
+      # argument, a `RUSTUP_TOOLCHAIN` in the environment, and a setup step that installs something
+      # else and makes it the default. Under any of them fmt, clippy and the whole suite report on a
+      # compiler nobody chose, and that kind of green is worth less than red. So the version is read
+      # back out of the tools that are about to run.
+      - name: The pinned toolchain is the one that runs
+        run: |
+          pinned=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          echo "$pinned" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::rust-toolchain.toml pins '$pinned'; it must name an exact version, three numbers, not a channel"
+            exit 1; }
+          for tool in rustc cargo; do
+            got=$("$tool" --version | cut -d' ' -f2)
+            [ "$got" = "$pinned" ] || {
+              echo "::error::$tool reports $got but rust-toolchain.toml pins $pinned, so something outranks the toolchain file"
+              exit 1; }
+          done
+          echo "rustc and cargo are both $pinned, as pinned."
+
+      # `--locked` on everything that resolves: a run that rewrote Cargo.lock to get green tested
+      # dependency versions no reviewer saw, and the image and the release binaries would then be
+      # built from a different tree than the one CI approved.
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
 
   # The architecture's load-bearing invariant (KTD-1). rill-core holds two thirds of the
   # system's logic and must stay unable to perform I/O, not by convention but because it
@@ -27,10 +51,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
       - name: rill-core must have no I/O in its dependency graph
         run: |
-          if cargo tree -p rill-core --edges normal \
+          if cargo tree -p rill-core --locked --edges normal \
              | grep -E '\b(tokio|axum|sui-rpc|reqwest|hyper|tonic)\b'; then
             echo "::error::rill-core gained an I/O dependency. See KTD-1 in docs/plans/."
             exit 1
@@ -108,8 +132,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p rill-ptb --test move_signatures
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - run: cargo test -p rill-ptb --test move_signatures --locked
+
+  # The supply chain, which `--locked` alone does not cover. `--locked` pins which versions resolve;
+  # it says nothing about what those versions do at build time. A `build.rs` added inside a tree that
+  # was already approved runs arbitrary code with the privileges of the build, before any test of
+  # ours executes, and a campaign is currently using exactly that to read Sui keystores off
+  # developer and CI machines. A keystore is the one secret in this project that cannot be rotated
+  # back into safety after it leaves, so the control is review, and review needs a diff.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      # Stated on its own, ahead of any build: the lockfile is already what the manifests resolve to.
+      # Every other cargo line in this repository carries `--locked`, but they all do other work
+      # first, so a lockfile that needed rewriting would be reported as whatever else failed.
+      - name: Cargo.lock is already what the manifests resolve to
+        run: cargo metadata --format-version 1 --locked > /dev/null
+      - name: No dependency gained a build script without review
+        run: scripts/audit-build-scripts.sh check
 
   # Proves the runtime image builds and answers its own healthcheck before anything is pushed.
   # A container that compiles but cannot start is the failure this catches.

@@ -18,7 +18,13 @@ COPY crates ./crates
 COPY bins ./bins
 COPY fixtures ./fixtures
 
-RUN cargo build --release --bin rill-server
+# `--locked`: the image is built from the lockfile that was reviewed, or not at all. Without it the
+# hosted server resolves dependency versions nobody checked, while the released binaries are built
+# from Cargo.lock, so the thing serving traffic and the thing users verified a checksum for can be
+# built from different trees. That gap is the one a build script walks through: a `build.rs` runs
+# with the privileges of whoever typed `cargo build`, and a campaign is currently using exactly that
+# to read Sui keystores off developer and CI machines.
+RUN cargo build --release --locked --bin rill-server
 
 # ── runtime ──
 FROM debian:bookworm-slim AS runtime

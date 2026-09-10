@@ -32,7 +32,23 @@ permissions:
   contents: write
 
 jobs:
+  # Nothing is built until the tree's build scripts are the reviewed ones. A tag can be pushed from
+  # any commit, including one CI never saw, and every `build.rs` in the dependency graph runs on
+  # these runners with the privileges of the build. The asset a stranger downloads and checks a
+  # checksum for is only as trustworthy as what ran while it was produced, so this gate comes first
+  # and the three build jobs wait on it (plan U6, R6).
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Cargo.lock is already what the manifests resolve to
+        run: cargo metadata --format-version 1 --locked > /dev/null
+      - name: No dependency gained a build script without review
+        run: scripts/audit-build-scripts.sh check
+
   wallet:
+    needs: supply-chain
     name: rill-wallet (${{ matrix.asset }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -57,7 +73,7 @@ jobs:
             asset: rill-wallet-linux-x64
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2

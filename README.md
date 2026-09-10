@@ -44,36 +44,95 @@ publishes this binary. Pushing a `v*` tag there runs `.github/workflows/release.
 one asset per platform, checks that each one starts, and attaches it with a checksum beside it.
 Nothing else publishes `rill-wallet`; an install line that names any other repository is wrong.
 
+One block per platform. Paste the whole of yours: the checksum is verified first and the rest is
+chained to it, so a file that does not match is never made executable and never run. What the check
+prints, and what to do when it fails, is under [Verifying the download](#verifying-the-download).
+
+**macOS, Apple silicon**
+
 ```sh
-# macOS, Apple silicon
 curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-arm64
 curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-arm64.sha256
-shasum -a 256 -c rill-wallet-darwin-arm64.sha256
-chmod +x rill-wallet-darwin-arm64 && mv rill-wallet-darwin-arm64 rill-wallet
-
-# macOS, Intel
-curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64
-curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64.sha256
-shasum -a 256 -c rill-wallet-darwin-x64.sha256
-chmod +x rill-wallet-darwin-x64 && mv rill-wallet-darwin-x64 rill-wallet
-
-# Linux, x86_64
-curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64
-curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64.sha256
-shasum -a 256 -c rill-wallet-linux-x64.sha256
-chmod +x rill-wallet-linux-x64 && mv rill-wallet-linux-x64 rill-wallet
-
-./rill-wallet --status
+shasum -a 256 -c rill-wallet-darwin-arm64.sha256 \
+  && chmod +x rill-wallet-darwin-arm64 \
+  && mv rill-wallet-darwin-arm64 rill-wallet
 ```
 
-The `.sha256` file is exactly what `shasum -a 256 <asset>` printed on the build runner, one line of
-`<hex>  <asset>`, so `shasum -a 256 -c` checks it against the file of that name in the current
-directory: run the two downloads and the check from the same place. On a Linux box without
-`shasum`, `sha256sum -c rill-wallet-linux-x64.sha256` reads the same format.
+**macOS, Intel**
+
+```sh
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-darwin-x64.sha256
+shasum -a 256 -c rill-wallet-darwin-x64.sha256 \
+  && chmod +x rill-wallet-darwin-x64 \
+  && mv rill-wallet-darwin-x64 rill-wallet
+```
+
+**Linux, x86_64**
+
+```sh
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64
+curl -fsSLO https://github.com/rifuki/rill/releases/latest/download/rill-wallet-linux-x64.sha256
+sha256sum -c rill-wallet-linux-x64.sha256 \
+  && chmod +x rill-wallet-linux-x64 \
+  && mv rill-wallet-linux-x64 rill-wallet
+```
+
+Then, on any of them:
+
+```sh
+./rill-wallet --status
+```
 
 `--status` prints `rill-wallet` on its first line and then whether it can sign. With no key it says
 `not ready` and exits 1: that is the expected answer on a fresh machine, not a broken download. The
 key comes from `RILL_SUI_PRIVATE_KEY` or the `sui` CLI's own keystore, never from an argument.
+
+### Verifying the download
+
+This binary signs transactions with a key on your machine, so it is worth the twenty seconds. The
+release attaches a `.sha256` beside every asset, and it is one line, `<hex>  <asset>`, exactly what
+`shasum -a 256 <asset>` printed on the runner that built it. The name inside the file is how the
+checker finds the asset, so download both into the same directory and verify before renaming
+anything.
+
+Pick the tool your machine actually has. macOS ships `shasum` and no `sha256sum`; Linux distributions
+ship `sha256sum` from coreutils and carry `shasum` only with the full perl package, which a slim
+container image usually lacks. Both read the same file, so either works wherever both exist:
+
+```sh
+shasum -a 256 -c rill-wallet-darwin-arm64.sha256   # macOS
+shasum -a 256 -c rill-wallet-darwin-x64.sha256
+shasum -a 256 -c rill-wallet-linux-x64.sha256
+
+sha256sum -c rill-wallet-linux-x64.sha256          # Linux
+```
+
+A pass is one line naming the file, and exit 0:
+
+```console
+rill-wallet-darwin-arm64: OK
+```
+
+A failure says so in words, and exits non-zero:
+
+```console
+rill-wallet-darwin-arm64: FAILED
+shasum: WARNING: 1 computed checksum did NOT match
+```
+
+If that happens, delete both files and download them again; a truncated transfer is the likely
+cause. If it happens twice, do not run the binary: report it on the repository rather than
+chmod-ing it, because the only thing a mismatch can tell you is that what arrived is not what was
+built. With neither checker installed, `openssl dgst -sha256 <asset>` prints the same hex to compare
+with the `.sha256` file by eye.
+
+Checksums prove the bytes are the ones the release published. What produced them is the other half:
+a tag on this repository runs `.github/workflows/release.yaml`, which builds with `--locked` against
+the committed `Cargo.lock`, on the exact toolchain `rust-toolchain.toml` names, with the set of
+dependencies that run code at build time diffed against `scripts/build-scripts.baseline`. The
+container image is built the same way, by the same flags, which is checked by
+`bins/rill/tests/supply_chain.rs` rather than by reading the files and hoping.
 
 ### Which tag produces a release, and the series it continues
 
