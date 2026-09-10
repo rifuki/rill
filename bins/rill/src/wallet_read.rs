@@ -1,20 +1,41 @@
-//! Reading a wallet's limits from the chain that enforces them.
+//! Reading a wallet's limits, and saying which layer holds each one.
 //!
-//! Not from a run-set, and not from anything this process was told at startup. A limit reported
-//! from a local copy is a limit an agent could be shown after it had already changed — and the
-//! whole claim rill makes is that the limits are on chain, so the answer has to come from there.
+//! The on-chain rules come from the chain that enforces them. Not from a run-set, and not from
+//! anything this process was told at startup: a limit reported from a local copy is a limit an
+//! agent could be shown after it had already changed, so for those the answer has to come from
+//! there.
+//!
+//! # Not every limit is on chain, and this read says which
+//!
+//! The chain holds four kinds of rule and proves them against the real transaction. The other
+//! four exist only pre-flight: protocol scope, asset scope and recipient allowlist are enforced by
+//! this signer refusing to sign, and the slippage floor by the signer refusing to sign an envelope
+//! whose guard call does not match, and by the chain aborting when the floor is breached.
+//!
+//! An earlier version of this read labelled every rule `"on-chain"` with a constant and said in
+//! its note that nothing could widen them. True of the four the chain holds, false of the rest,
+//! and an owner deciding how much to grant was being told the chain held a recipient allowlist it
+//! has never heard of. The label now comes from the one producer, [`RuleKind::enforcement`], per
+//! rule, and the pre-flight rules are listed from the loaded run-set with the layer that holds
+//! them stated beside each.
 
 use rill_chain::{grpc::GrpcSui, SuiRead};
-use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
+use rill_core::manifest::{CapabilityManifest, CapabilityRule, Enforcement, RuleKind};
+use rill_ptb::policy_read::{parse_type_names, policy_rules_transaction, rule_module};
 use rill_ptb::shared::SharedObjects;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sui_sdk_types::Address;
 
-/// Read the rules attached to a wallet, and how it is identified.
+/// Read the rules attached to a wallet, how it is identified, and which layer holds each limit.
+///
+/// `local` is the loaded run-set's manifest, when there is one. It contributes only the pre-flight
+/// rules. For the on-chain kinds the chain's answer is the answer: a manifest that disagrees with
+/// it is a reconciliation problem, not a second source of truth.
 pub async fn read_limits(
     endpoint: &str,
     package_id: &str,
     wallet_id: &str,
+    local: Option<&CapabilityManifest>,
 ) -> Result<Value, String> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
     let wallet: Address = wallet_id
@@ -60,21 +81,208 @@ pub async fn read_limits(
         .ok_or("the wallet did not report its rules")
         .and_then(|b| parse_type_names(b).map_err(|_| "the rule list did not decode"))?;
 
-    let modules = attached_modules(&names);
-    let unrecognised: Vec<&String> = names
-        .iter()
-        .filter(|n| rill_ptb::policy_read::rule_module(n).is_none())
-        .collect();
+    let mut report = Map::new();
+    report.insert("wallet".into(), json!(wallet_id));
+    report.insert("objectType".into(), json!(summary.object_type));
+    report.insert("sharedInitialVersion".into(), json!(initial));
+    if let Value::Object(labels) = label_rules(&names, local) {
+        report.extend(labels);
+    }
+    Ok(Value::Object(report))
+}
 
-    Ok(json!({
-        "wallet": wallet_id,
-        "objectType": summary.object_type,
-        "sharedInitialVersion": initial,
-        "rules": modules,
+/// Which rules hold and which layer holds each, from the rule types the chain reported and the
+/// manifest the run-set carries. Pure, so a test can drive it with fixed inputs and no network.
+///
+/// `preFlightRules` is `null` rather than absent when no run-set is loaded: an absent list reads as
+/// "no limits", and what it means is that this signer has nothing to refuse against.
+pub fn label_rules(type_names: &[String], local: Option<&CapabilityManifest>) -> Value {
+    let mut rules = Vec::new();
+    let mut unrecognised = Vec::new();
+    for name in type_names {
+        // Two gates, and a type name must pass both. `rule_module` knows which modules this binary
+        // can emit a `prove` for, which is what "the chain holds it" means in practice;
+        // `from_module` hands back the kind whose producer labels it. A name that fails either is
+        // reported as unrecognised rather than labelled: inventing a layer for a rule this code
+        // has never heard of is the error this module exists to correct.
+        match rule_module(name).and_then(RuleKind::from_module) {
+            Some(kind) => rules.push(labelled(kind)),
+            None => unrecognised.push(name.clone()),
+        }
+    }
+
+    let pre_flight = local.map(|manifest| {
+        manifest
+            .rules
+            .iter()
+            .map(CapabilityRule::kind)
+            .filter(|kind| kind.enforcement() == Enforcement::PreFlight)
+            .map(labelled)
+            .collect::<Vec<Value>>()
+    });
+
+    json!({
+        "rules": rules,
         "unrecognisedRules": unrecognised,
-        "enforcement": "on-chain",
-        "note": "These rules are enforced by a Move contract. Nothing in this process, and nothing \
-                 you can pass to it, can widen them — a spend that exceeds one is refused by the \
-                 chain. Read them again after any change; this is a live read, not a cached copy."
-    }))
+        "preFlightRules": pre_flight,
+        "note": NOTE,
+    })
+}
+
+/// One rule, with the layer that holds it. The label is the producer's answer for this kind; it
+/// is never written here as a word.
+fn labelled(kind: RuleKind) -> Value {
+    let enforcement = kind.enforcement();
+    json!({
+        "module": kind.module(),
+        "enforcement": enforcement.as_str(),
+        "enforcedBy": enforced_by(enforcement),
+    })
+}
+
+/// Who refuses, in words an agent can act on. Exhaustive, so a third layer cannot arrive unnamed.
+fn enforced_by(enforcement: Enforcement) -> &'static str {
+    match enforcement {
+        Enforcement::OnChain => "the Move contract, which aborts the transaction",
+        Enforcement::PreFlight => "the signer, before it signs",
+    }
+}
+
+/// Which layer holds what, stated once, in the read every agent makes before it spends.
+const NOTE: &str = "Two layers hold this wallet's limits, and each rule above says which. The \
+    rules under `rules` are held by the Move contract: they are proved on chain against the real \
+    transaction, nothing in this process and nothing passed to it can widen them, and a spend that \
+    exceeds one is aborted by the chain. Nothing on chain checks a destination, a protocol, an \
+    asset, or a recipient: those limits are pre-flight, enforced by this signer refusing to sign, \
+    and they are listed under `preFlightRules` from the loaded run-set (null means no run-set is \
+    loaded, not that there are none). The slippage floor is enforced by the signer refusing to \
+    sign an envelope whose guard call does not match, and by the chain aborting when the floor is \
+    breached. Read again after any change: the on-chain list is a live read, not a cached copy.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(modules: &[&str]) -> Vec<String> {
+        modules
+            .iter()
+            .map(|m| format!("0xcafe::{m}::Rule"))
+            .collect()
+    }
+
+    fn manifest(rules: Vec<CapabilityRule>) -> CapabilityManifest {
+        CapabilityManifest {
+            wallet_coin_type: "0x2::sui::SUI".into(),
+            rules,
+        }
+    }
+
+    /// Every kind, labelled, carries the producer's answer. A constant would pass this for the
+    /// four kinds it happened to be right about and fail it for the other four.
+    #[test]
+    fn every_labelled_rule_carries_the_producers_answer_not_a_constant() {
+        for kind in [
+            RuleKind::Budget,
+            RuleKind::PerTx,
+            RuleKind::RateLimit,
+            RuleKind::TimeWindow,
+            RuleKind::ProtocolScope,
+            RuleKind::SlippageFloor,
+            RuleKind::AssetScope,
+            RuleKind::RecipientAllowlist,
+        ] {
+            let rule = labelled(kind);
+            assert_eq!(rule["module"], kind.module());
+            assert_eq!(
+                rule["enforcement"],
+                kind.enforcement().as_str(),
+                "{} must be labelled as the producer says",
+                kind.module()
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_the_chain_reports_is_labelled_on_chain_and_says_the_contract_holds_it() {
+        let out = label_rules(&names(&["budget", "per_tx"]), None);
+        let rules = out["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["module"], "budget");
+        assert_eq!(rules[0]["enforcement"], "on-chain");
+        assert!(rules[0]["enforcedBy"]
+            .as_str()
+            .unwrap()
+            .contains("Move contract"));
+        assert_eq!(rules[1]["module"], "per_tx");
+        assert_eq!(out["unrecognisedRules"], json!([]));
+    }
+
+    /// A rule type this binary cannot prove is reported, not labelled. Guessing a layer for it
+    /// is the mistake this module exists to correct.
+    #[test]
+    fn a_rule_type_this_binary_cannot_prove_is_reported_rather_than_labelled() {
+        let out = label_rules(&names(&["budget", "something_new"]), None);
+        assert_eq!(out["rules"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            out["unrecognisedRules"],
+            json!(["0xcafe::something_new::Rule"])
+        );
+    }
+
+    #[test]
+    fn pre_flight_rules_come_from_the_run_set_and_say_the_signer_holds_them() {
+        let local = manifest(vec![
+            CapabilityRule::Budget {
+                total_mist: "1".into(),
+            },
+            CapabilityRule::RecipientAllowlist {
+                addresses: vec!["0x1".into()],
+            },
+            CapabilityRule::SlippageFloor {
+                min_out_mist: "1".into(),
+            },
+        ]);
+        let out = label_rules(&names(&["budget"]), Some(&local));
+        let pre_flight = out["preFlightRules"].as_array().unwrap();
+        let modules: Vec<&str> = pre_flight
+            .iter()
+            .map(|r| r["module"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            modules,
+            vec!["recipient_allowlist", "slippage_floor"],
+            "only the pre-flight kinds are listed; the chain answers for budget"
+        );
+        for rule in pre_flight {
+            assert_eq!(rule["enforcement"], "pre-flight");
+            assert_eq!(rule["enforcedBy"], "the signer, before it signs");
+        }
+    }
+
+    /// Absent would read as "no limits". Null says there is nothing to refuse against yet.
+    #[test]
+    fn without_a_run_set_the_pre_flight_list_is_null_not_empty() {
+        let out = label_rules(&names(&["budget"]), None);
+        assert!(out["preFlightRules"].is_null());
+        assert!(out.get("preFlightRules").is_some());
+    }
+
+    /// The note is what an agent reads when it does not read the labels.
+    #[test]
+    fn the_note_names_both_layers_and_states_the_slippage_floor_honestly() {
+        let note = label_rules(&[], None)["note"].as_str().unwrap().to_owned();
+        for phrase in [
+            "Move contract",
+            "Nothing on chain checks a destination, a protocol, an asset, or a recipient",
+            "pre-flight, enforced by this signer refusing to sign",
+            "refusing to sign an envelope whose guard call does not match",
+            "the chain aborting when the floor is breached",
+        ] {
+            assert!(note.contains(phrase), "the note no longer says: {phrase:?}");
+        }
+        assert!(
+            !note.contains("These rules are enforced by a Move contract"),
+            "the old note claimed every rule for the chain"
+        );
+    }
 }

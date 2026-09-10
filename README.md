@@ -9,9 +9,26 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds, 323 Rust tests pass — including reads against live testnet and mainnet
-fullnodes — and the two Move packages pass their own 36 and 2. What it does not yet have is a demonstrated end-to-end submission — see
-[Known gaps](#known-gaps), which names exactly what is missing and why.
+The workspace builds and 359 Rust tests pass. Another 32, which need a live fullnode, are
+`#[ignore]` and run explicitly (see [Build](#build)). The two Move packages pass their own 36
+and 2.
+
+What is proven, on testnet, each with its digest recorded in this repository:
+
+| | |
+|---|---|
+| owner creates a wallet and names a different key as its agent | `5vShErFjcfE7TWGeygrBvB2Fqru8jxfLfA71njznyypj` |
+| owner attaches rules, an owner-only call | `Gupv6mCdiMREfo16sQUT1HLEoGgGSBZVZpXtug5fNJyr` |
+| the agent spends within them | `xh6cWff3sjxXuo7fxqKtqfUFsdtcAYCHRseqKdL9pKC` |
+| the owner attempts the same spend | refused before any Move code runs: the `AgentCap` is the agent's |
+| a spend over the per-transaction cap | refused, and the refusal names `per_tx` |
+| a spend driven over MCP by `rill_spend` | `DpTPdMKbDSndfAqekmX8EUFyDdYePAk338Y9fqgmWhmW` |
+| `rill_execute` running the whole path: validate, byte-pin, re-simulate, sign, submit | commit `06df501` |
+| owner revokes; the agent's next spend, same key, same capability, is refused | `7b6xSFWQuJW3fRpZ77een1KuuwEnmzSfKspzFeUWdr15` |
+| a gated spend flowing into a DeepBook order, in one agent-signed transaction | `GiL7unaYVnx7TF9QDtpUgc3nFSdWxVgkLb6sMDQfCm77` |
+
+The addresses and objects behind these are in `docs/OVERNIGHT.md`, and the sequence that produced
+each digest is in the commit that records it.
 
 The Bun/TypeScript implementation this replaces is the **specification**. Its behaviour is
 re-expressed here, with conformance fixtures in `fixtures/` checked against it by
@@ -97,9 +114,15 @@ One tool per question, and reads never share a tool with writes:
 
 ```jsonc
 // rill_wallet { wallet }
-{ "rules": ["budget", "per_tx"], "enforcement": "on-chain",
-  "note": "Enforced by a Move contract. Nothing in this process, and nothing you can pass
-           to it, can widen them." }
+{ "rules": [ { "module": "budget", "enforcement": "on-chain",
+               "enforcedBy": "the Move contract, which aborts the transaction" },
+             { "module": "per_tx", "enforcement": "on-chain",
+               "enforcedBy": "the Move contract, which aborts the transaction" } ],
+  "preFlightRules": [ { "module": "recipient_allowlist", "enforcement": "pre-flight",
+                        "enforcedBy": "the signer, before it signs" } ],
+  "note": "Two layers hold this wallet's limits, and each rule above says which. … Nothing on
+           chain checks a destination, a protocol, an asset, or a recipient: those limits are
+           pre-flight, enforced by this signer refusing to sign …" }
 
 // rill_spend  0.005 SUI
 { "submitted": true, "digest": "DpTPdMKbDSndfAqekmX8EUFyDdYePAk338Y9fqgmWhmW",
@@ -116,6 +139,17 @@ isError: true
 The last one is the point. A custodial agent wallet enforces limits in a server, and a server can be
 talked out of an answer. Here the limit is a Move contract: the client that built the transaction
 cannot widen it, the agent that asked cannot widen it, and the refusal arrives from the chain.
+
+**Which layer holds each limit.** That is true of four kinds of rule, and the read says which. The
+budget, the per-transaction cap, the rate limit and the time window are held by the Move contract
+and proved on chain against the real transaction. Nothing on chain checks a destination, a
+protocol, an asset, or a recipient: protocol scope, asset scope and recipient allowlist are
+pre-flight, enforced by this signer refusing to sign, and they exist only where a run-set gives it
+something to refuse against. The slippage floor is enforced by the signer refusing to sign an
+envelope whose guard call does not match, and by the chain aborting when the floor is breached.
+Every rule the wallet read returns carries its layer, computed per rule by the one producer
+(`RuleKind::enforcement` in `rill-core`) and never written as a constant; a test reads the source
+and fails if one appears.
 
 The prove list is not a guess either — it is read from the wallet with `policy_rules`, because
 `confirm_spend` counts receipts against the wallet's live policy and a mismatch aborts.
@@ -186,32 +220,17 @@ cd move/rill_guard   && sui move test   # 2
 
 Recorded here rather than discovered during a demo.
 
-**The demo wallet's capabilities belong to the superseded contract.** Two `agent_wallet` packages
-are deployed on testnet, and the reference repo's own documents disagree about which is current.
-Asked directly (`rill-chain/tests/package_probe.rs`, reproducible):
+**Two `agent_wallet` packages are deployed on testnet, and the reference repo's own documents
+disagree about which is current.** Asked directly (`rill-chain/tests/package_probe.rs`,
+reproducible):
 
 | package | named by | `request_spend` | `confirm_spend` | `spend` |
 |---|---|---|---|---|
 | `0xb02f39d6…563740` | `Published.toml`, `.env.example` | present | present | absent |
 | `0xd9265581…a636da` | README, `pitch.tsx` | absent | absent | present |
 
-The first is current. The funded testnet sender's three `AgentCap` objects are all typed
-`0xd9265581…::agent_wallet::AgentCap` — the superseded one. A capability minted by one package
-cannot authorise a call in another, so **an end-to-end submission needs a fresh `AgentCap` minted
-from `0xb02f39d6…` first.** `rill status` warns when a run-set names the old package rather than
-letting it surface as a Move abort at signing time.
-
-**Submission is unproven, and a signature is the only thing missing.** `create_wallet` against the
-current package passes the **strict** simulation on testnet — checks on, real gas objects, the same
-gate the build path runs before anything may be signed:
-
-```text
-ok           : true
-verification : Verified
-gas          : 4477760
-balance      : -1004477760 …::sui::SUI      (1 SUI funded + gas)
-```
-
-Keyless, and nothing was submitted. `cargo test -p rill-ptb --test create_wallet_live -- --ignored`
-reproduces it. What it proves is that the transaction *would* execute; signing it needs a key this
-repo does not have, and that is the whole of what stands between here and an end-to-end run.
+The first is current, and every wallet behind the digests above was created from it. The funded
+testnet sender still holds three older `AgentCap` objects typed
+`0xd9265581…::agent_wallet::AgentCap`; a capability minted by one package cannot authorise a call
+in another, so they are unused rather than a hazard. `rill status` warns when a run-set names the
+old package rather than letting it surface as a Move abort at signing time.

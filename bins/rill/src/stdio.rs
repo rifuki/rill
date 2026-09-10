@@ -233,7 +233,11 @@ fn status(context: &WalletContext, id: Value) -> Value {
     tool_ok(id, answer)
 }
 
-/// What one wallet permits, read from the chain that enforces it.
+/// What one wallet permits, and which layer holds each limit.
+///
+/// The on-chain rules are read from the chain that enforces them. The pre-flight rules come from
+/// the loaded run-set, because they exist only where this signer has something to refuse against;
+/// see [`crate::wallet_read`] for why the two are labelled separately.
 ///
 /// Its own tool rather than an argument to `rill_status`: it answers a different question, needs an
 /// argument that one does not, and costs a round trip a caller asking about the signer should not
@@ -245,11 +249,17 @@ fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
         .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
 
-    match block_on(crate::wallet_read::read_limits(
+    let local = context
+        .run_set
+        .as_ref()
+        .map(|run_set| &run_set.capability_manifest);
+    let outcome = block_on(crate::wallet_read::read_limits(
         &endpoint(context),
         &package,
         wallet,
-    )) {
+        local,
+    ));
+    match outcome {
         Ok(Ok(limits)) => tool_ok(id, limits),
         Ok(Err(e)) | Err(e) => {
             context.last_rejection = Some(e.clone());
@@ -258,10 +268,6 @@ fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     }
 }
 
-/// Read a wallet's limits from the chain that enforces them.
-///
-/// Not from the run-set, and not from anything this process was told at startup. A limit reported
-/// from a local copy is a limit an agent could be shown after it had already changed.
 /// Release funds from an agent wallet, gated by the rules the wallet carries on chain.
 ///
 /// # A refusal here is the wallet working
@@ -883,5 +889,123 @@ mod execution_tests {
         .unwrap();
         let caps = &out["result"]["structuredContent"]["runSet"]["declaration"]["caps"];
         assert_eq!(caps[0]["enforcement"], "on-chain");
+    }
+}
+
+/// The wallet read merges what the chain reports with what the run-set carries, and labels each
+/// rule with the layer that holds it. The labelling is driven directly here, with fixed inputs,
+/// because the chain half of the read needs a fullnode; the one test that needs it is ignored.
+#[cfg(test)]
+mod wallet_read_tests {
+    use super::*;
+    use crate::wallet_read::label_rules;
+
+    /// A run-set whose manifest carries one rule of each layer.
+    fn run_set_with_a_pre_flight_rule() -> RunSet {
+        serde_json::from_value(json!({
+            "label": "scoped-testnet",
+            "network": "testnet",
+            "sender": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "actionId": "skill_hero",
+            "walletPackageId": "0xcafe",
+            "walletId": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "agentCapId": "0xcap",
+            "versionId": "0xversion",
+            "capabilityManifest": {
+                "walletCoinType": "0x2::sui::SUI",
+                "rules": [
+                    { "kind": "budget", "totalMist": "5000000000" },
+                    { "kind": "recipient_allowlist", "addresses": ["0x1"] }
+                ]
+            },
+            "allowedTargets": ["0xcafe::agent_wallet::request_spend"],
+            "allowedObjectIds": ["0x1"],
+            "maxAmountBaseUnits": "2000000000",
+            "declaredSpendBaseUnits": "2000000000",
+            "minimumRemainingBaseUnits": "0",
+            "gasCeilingBaseUnits": "50000000"
+        }))
+        .unwrap()
+    }
+
+    /// What the chain would report for a wallet carrying budget and per_tx.
+    fn chain_reported() -> Vec<String> {
+        vec![
+            "0xcafe::budget::Rule".to_string(),
+            "0xcafe::per_tx::Rule".to_string(),
+        ]
+    }
+
+    #[test]
+    fn a_pre_flight_rule_in_the_loaded_run_set_is_labelled_pre_flight() {
+        let run_set = run_set_with_a_pre_flight_rule();
+        let out = label_rules(&chain_reported(), Some(&run_set.capability_manifest));
+        let pre_flight = out["preFlightRules"].as_array().unwrap();
+        assert_eq!(
+            pre_flight.len(),
+            1,
+            "budget is the chain's to report: {out}"
+        );
+        assert_eq!(pre_flight[0]["module"], "recipient_allowlist");
+        assert_eq!(pre_flight[0]["enforcement"], "pre-flight");
+        assert_eq!(pre_flight[0]["enforcedBy"], "the signer, before it signs");
+        assert!(
+            !out["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["module"] == "recipient_allowlist"),
+            "a pre-flight rule must not be listed among the rules the chain holds"
+        );
+    }
+
+    #[test]
+    fn a_rule_read_from_chain_is_labelled_on_chain() {
+        let run_set = run_set_with_a_pre_flight_rule();
+        let out = label_rules(&chain_reported(), Some(&run_set.capability_manifest));
+        let rules = out["rules"].as_array().unwrap();
+        let labels: Vec<(&str, &str)> = rules
+            .iter()
+            .map(|r| {
+                (
+                    r["module"].as_str().unwrap(),
+                    r["enforcement"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(labels, vec![("budget", "on-chain"), ("per_tx", "on-chain")]);
+    }
+
+    /// The whole tool against the wallet `docs/OVERNIGHT.md` records, through the transport. Needs
+    /// a testnet fullnode, so: `cargo test -p rill wallet_read_tests -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads a live testnet wallet"]
+    fn rill_wallet_reads_the_recorded_testnet_wallet_and_labels_every_rule() {
+        let mut ctx = WalletContext::new(None, "testnet".into(), false)
+            .with_run_set(Some(run_set_with_a_pre_flight_rule()));
+        let out = handle(
+            &mut ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "rill_wallet", "arguments": {
+                    "wallet": "0x20391fa91aec7a12b6657902af80036e125d1beff6621fe2eb73cfd032a04e5d"
+                } }
+            }),
+        )
+        .unwrap();
+        eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+        let limits = &out["result"]["structuredContent"];
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        let modules: Vec<&str> = limits["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["module"].as_str().unwrap())
+            .collect();
+        assert!(modules.contains(&"budget") && modules.contains(&"per_tx"));
+        for rule in limits["rules"].as_array().unwrap() {
+            assert_eq!(rule["enforcement"], "on-chain");
+        }
+        assert_eq!(limits["preFlightRules"][0]["enforcement"], "pre-flight");
     }
 }

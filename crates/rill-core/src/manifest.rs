@@ -128,6 +128,10 @@ impl RuleKind {
     }
 
     /// Which layer actually holds this limit.
+    ///
+    /// No wildcard arm, on purpose: a kind added without deciding which layer holds it must fail
+    /// to compile rather than default to either answer. Defaulting to on-chain would claim an
+    /// enforcement the chain does not perform; defaulting to pre-flight would hide one it does.
     pub fn enforcement(self) -> Enforcement {
         match self {
             Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow => Enforcement::OnChain,
@@ -135,6 +139,40 @@ impl RuleKind {
             | Self::SlippageFloor
             | Self::AssetScope
             | Self::RecipientAllowlist => Enforcement::PreFlight,
+        }
+    }
+
+    /// The kind whose [`module`](Self::module) is `module`, or `None` for a name no kind claims.
+    ///
+    /// The chain reports a wallet's rules as Move type names, so a consumer reading them holds a
+    /// module name and needs the kind back before it can ask which layer holds the rule. Without
+    /// this lookup it would have to answer that question itself, and the wallet read did exactly
+    /// that: it labelled every rule "on-chain" with a constant, which was wrong for half the kinds
+    /// the manifest can carry. Returning `None` for an unknown name, rather than guessing, keeps a
+    /// module this code has never heard of from being labelled at all.
+    ///
+    /// Not a match over strings. That would need a wildcard arm for unknown names, and a wildcard
+    /// arm is where a kind added later would quietly fall. Instead every kind is asked for its own
+    /// name in turn, so the two spellings cannot disagree, and the match that steps from one kind
+    /// to the next is over kinds and has no wildcard: a kind added to the enum without an arm here
+    /// fails to compile rather than becoming a name this lookup does not know.
+    pub fn from_module(module: &str) -> Option<Self> {
+        let mut kind = Self::Budget;
+        loop {
+            if kind.module() == module {
+                return Some(kind);
+            }
+            kind = match kind {
+                Self::Budget => Self::PerTx,
+                Self::PerTx => Self::RateLimit,
+                Self::RateLimit => Self::ProtocolScope,
+                Self::ProtocolScope => Self::SlippageFloor,
+                Self::SlippageFloor => Self::AssetScope,
+                Self::AssetScope => Self::RecipientAllowlist,
+                Self::RecipientAllowlist => Self::TimeWindow,
+                // The last kind. Nothing follows it, so the name matched none of them.
+                Self::TimeWindow => return None,
+            };
         }
     }
 

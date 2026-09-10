@@ -158,12 +158,18 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                  was one. Says nothing about any particular wallet — use rill_wallet for that.",
                 no_arguments(),
             ),
+            // The description carries the distinction the code computes. An earlier version
+            // called the read "Authoritative" and stopped there, and an agent reading it could
+            // conclude that every limit lived on chain; half of them do not.
             read_only(
                 "rill_wallet",
-                "What one agent wallet permits, read live from the chain that enforces it: the \
-                 rules actually attached, and how the wallet is identified. Authoritative — a Move \
-                 contract holds these limits, not this process, so this is the answer rather than \
-                 a local copy of it.",
+                "What one agent wallet permits, and which layer holds each limit. The budget, \
+                 per-transaction cap, rate limit and time window are on-chain rules: read live \
+                 from the Move contract that proves them, so this is the answer rather than a \
+                 local copy, and nothing in this process can widen them. Protocol scope, asset \
+                 scope, recipient allowlist and slippage floor are pre-flight rules: this signer \
+                 enforces them by refusing to sign, and they are listed from the loaded run-set, \
+                 if one is loaded. A rule labelled pre-flight is one the chain does not hold.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -340,6 +346,74 @@ mod tests {
                 "{} must tell an agent what not to retry; a money tool is not idempotent",
                 tool.name
             );
+        }
+    }
+
+    /// The words that name a scoping rule. None of these is enforced on chain, and no description
+    /// may say otherwise.
+    const SCOPING_WORDS: &[&str] = &["destination", "protocol", "recipient", "asset"];
+
+    /// The sentences of a description that name a scoping rule, lowercased.
+    fn scoping_sentences(description: &str) -> Vec<String> {
+        description
+            .to_lowercase()
+            .split(". ")
+            .filter(|sentence| SCOPING_WORDS.iter().any(|word| sentence.contains(word)))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A snapshot of the wallet read's description, checked for the claim it used to make.
+    ///
+    /// The check is not vacuous: the description must name both layers, and must name the
+    /// scoping rules somewhere, so that the sentence-level assertion has sentences to examine. A
+    /// description that avoided the words entirely would fail here rather than pass by silence.
+    #[test]
+    fn the_wallet_read_description_never_puts_a_scoping_rule_on_chain() {
+        let description = tools(Surface::Wallet)
+            .into_iter()
+            .find(|t| t.name == "rill_wallet")
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .expect("rill_wallet has a description");
+
+        assert!(
+            description.contains("on-chain") && description.contains("pre-flight"),
+            "both layers must be named: {description}"
+        );
+
+        let sentences = scoping_sentences(&description);
+        assert!(
+            !sentences.is_empty(),
+            "the description must name the scoping rules, or the check below checks nothing"
+        );
+        for sentence in sentences {
+            assert!(
+                !sentence.contains("on chain") && !sentence.contains("on-chain"),
+                "a scoping rule is placed on chain: {sentence:?}"
+            );
+            assert!(
+                sentence.contains("pre-flight") || sentence.contains("signer"),
+                "a scoping rule is named without saying who holds it: {sentence:?}"
+            );
+        }
+    }
+
+    /// The same rule for every tool on both surfaces, so the claim cannot move to another
+    /// description and survive.
+    #[test]
+    fn no_tool_description_puts_a_scoping_rule_on_chain() {
+        for tool in [Surface::Actions, Surface::Wallet]
+            .into_iter()
+            .flat_map(tools)
+        {
+            let description = tool.description.as_deref().unwrap_or_default();
+            for sentence in scoping_sentences(description) {
+                assert!(
+                    !sentence.contains("on chain") && !sentence.contains("on-chain"),
+                    "{} places a scoping rule on chain: {sentence:?}",
+                    tool.name
+                );
+            }
         }
     }
 
