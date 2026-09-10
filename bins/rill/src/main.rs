@@ -518,10 +518,7 @@ funded."
             };
             let submit = argv.iter().any(|a| a == "--submit");
             if submit && loaded.network == "mainnet" && !loaded.mainnet_allowed {
-                eprintln!(
-                    "rill: refusing to submit on mainnet. Set RILL_ALLOW_MAINNET=true if that is \
-                     really the intent."
-                );
+                eprintln!("rill: {}", rill_core::mainnet::mainnet_refusal());
                 std::process::exit(1);
             }
 

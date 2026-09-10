@@ -419,6 +419,25 @@ cd move/agent_wallet && sui move test   # 36
 cd move/rill_guard   && sui move test   # 2
 ```
 
+## Mainnet
+
+Nothing here has spent real money, and the guard that keeps it that way is not coming out.
+
+`RILL_ALLOW_MAINNET=true` is the only thing the code asks for, and setting it is not a configuration
+step: it asserts that the contracts holding the money have been audited, that every precondition in
+[`docs/MAINNET.md`](docs/MAINNET.md) is green, and that a named person authorised the cutover. The
+refusal says exactly that, from one producer, because the sentence it replaced named the override and
+nothing else, which is a refusal whose only content is how to get past it.
+
+Thirteen of seventeen preconditions are green today. The four that are not divide cleanly and none of
+them can be closed by writing more code: a Move audit has to be funded (roughly three to six
+person-days, commonly four to twelve weeks of lead time), a host has to exist, a release has to be
+tagged, and somebody has to put their name to the decision. Nobody is named yet, and an unnamed
+authoriser is the difference between a gate and a speed bump.
+
+The guard stays after cutover too. Its reason is not that mainnet is unready; it is that a testnet run
+and a mainnet run are one typo apart.
+
 ## Known gaps
 
 Recorded here rather than discovered during a demo.

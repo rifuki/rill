@@ -409,7 +409,7 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         return tool_error(id, "no_key", &reason);
     };
     if context.network == "mainnet" && !context.mainnet_allowed {
-        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        let reason = rill_core::mainnet::mainnet_refusal();
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "mainnet_not_opted_in", &reason);
     }
@@ -473,7 +473,7 @@ fn create_wallet(context: &mut WalletContext, id: Value, params: &Value) -> Valu
         return tool_error(id, "no_key", &reason);
     };
     if context.network == "mainnet" && !context.mainnet_allowed {
-        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        let reason = rill_core::mainnet::mainnet_refusal();
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "mainnet_not_opted_in", &reason);
     }
@@ -537,7 +537,7 @@ fn attach_rules(context: &mut WalletContext, id: Value, params: &Value) -> Value
         return tool_error(id, "no_key", &reason);
     };
     if context.network == "mainnet" && !context.mainnet_allowed {
-        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.".to_string();
+        let reason = rill_core::mainnet::mainnet_refusal();
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "mainnet_not_opted_in", &reason);
     }
@@ -636,7 +636,8 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     // Mainnet needs an explicit opt-in, and it is checked before anything is parsed — the cheapest
     // possible place to stop.
     if run_set.network == rill_core::envelope::Network::Mainnet && !context.mainnet_allowed {
-        let reason = "Refusing to sign on mainnet without RILL_ALLOW_MAINNET=true.";
+        let reason = rill_core::mainnet::mainnet_refusal();
+        let reason = reason.as_str();
         context.last_rejection = Some(reason.to_string());
         return tool_error(id, "mainnet_not_opted_in", reason);
     }
