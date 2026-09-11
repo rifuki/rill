@@ -52,6 +52,19 @@ pub enum SpendError {
     /// that cannot be confirmed, and guessing at the call shape would produce one that is wrong.
     UnprovableRule(&'static str),
     BadIdentifier(String),
+    /// The wallet carries no rules, so nothing would bound the spend.
+    ///
+    /// `confirm_spend` counts receipts against the wallet's live policy, and an empty policy requires
+    /// zero receipts: the sequence is then `request_spend` followed directly by `confirm_spend`, it
+    /// executes, and the amount is limited only by the wallet's balance. `wallet create` warns about
+    /// exactly this state, because a wallet is minted before its rules are attached, and the warning
+    /// was the only thing standing between that window and an unbounded spend.
+    ///
+    /// Refused here rather than in each caller. Three paths build a gated spend, and the two that
+    /// existed before this both read the rule list from the chain rather than from a manifest, so the
+    /// manifest validation that refuses an empty rule set never ran: one checked that every attached
+    /// rule had an emitter, which `0 == 0` satisfies, and the other checked nothing.
+    NoRulesAttached,
 }
 
 impl std::fmt::Display for SpendError {
@@ -66,6 +79,10 @@ impl std::fmt::Display for SpendError {
                  proof — the resulting transaction could never be confirmed"
             ),
             Self::BadIdentifier(s) => write!(f, "\"{s}\" is not a valid Move identifier"),
+            Self::NoRulesAttached => write!(
+                f,
+                "this wallet has no rules attached, so nothing would bound the spend:                  confirm_spend counts receipts against the wallet's live policy, and an empty                  policy requires zero receipts, which means the only limit left is the balance.                  Attach at least a budget and a per-transaction cap with `rill wallet rules`                  first, or over MCP with rill_attach_rules."
+            ),
         }
     }
 }
@@ -103,6 +120,9 @@ pub fn build_gated_spend_for_modules(
 ) -> Result<Argument, SpendError> {
     if amount_base_units == 0 {
         return Err(SpendError::ZeroAmount);
+    }
+    if modules.is_empty() {
+        return Err(SpendError::NoRulesAttached);
     }
 
     let coin_type: sui_sdk_types::TypeTag = binding
