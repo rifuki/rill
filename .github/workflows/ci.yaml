@@ -100,9 +100,10 @@ jobs:
 
   # A house style that was written down and then not followed. The em dash is banned in everything
   # this repository emits, and the rule held right up until an agent added three in one commit,
-  # which is the moment a convention becomes a check. Six hundred of them predate the rule and are
-  # cleaned as files are touched, so this is a ratchet rather than a sweep: nothing new lands, and
-  # the backlog does not fail an unrelated build.
+  # which is the moment a convention becomes a check. 884 of them predated the rule and are cleaned
+  # as files are touched, so this is a ratchet rather than a sweep: nothing new lands, and the
+  # backlog does not fail an unrelated build. It is working as intended rather than in principle:
+  # the backlog was 884 when this check landed and is lower now, and nothing has been added since.
   style:
     runs-on: ubuntu-latest
     steps:

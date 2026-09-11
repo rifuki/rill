@@ -165,3 +165,53 @@ fn a_manifest_with_no_rules_cannot_produce_a_spend() {
     ));
     assert!(expected_spend_targets(&b).is_err());
 }
+
+/// Both builders refuse a wallet with nothing gating it, and they arrive at that refusal through
+/// different layers.
+///
+/// This is one test rather than two on purpose. `build_manifest_gated_spend` inherits the refusal
+/// from `CapabilityManifest::validate`; `build_gated_spend_for_modules` takes a module list and
+/// constructs no manifest, so it reaches no validator and carries its own guard. For two releases
+/// it carried none, and the reason the gap survived review is that the covered sibling made the
+/// uncovered one look covered. Asserting the pair together is what makes that assumption false
+/// rather than invisible: a third builder, or a refactor that drops either guard, fails here.
+#[test]
+fn neither_builder_will_spend_from_a_wallet_that_nothing_gates() {
+    use rill_ptb::spend::build_gated_spend_for_modules;
+
+    let b = binding(vec![]);
+
+    let mut tx = TransactionBuilder::new();
+    let manifest_err = build_manifest_gated_spend(&mut tx, &b, 1, &resolved())
+        .expect_err("a manifest with no rules must not build");
+    assert!(
+        matches!(manifest_err, SpendError::Manifest(_)),
+        "the manifest path must refuse at the manifest layer, not somewhere else: {manifest_err:?}"
+    );
+
+    let mut tx = TransactionBuilder::new();
+    let modules_err = build_gated_spend_for_modules(&mut tx, &b, 1, &[], &resolved())
+        .expect_err("an empty module list must not build");
+    assert!(
+        matches!(modules_err, SpendError::NoRulesAttached),
+        "the modules path has no validator to inherit from and must refuse itself: {modules_err:?}"
+    );
+
+    // The distinct variants are the point: one refusal is inherited, the other is local. Collapsing
+    // them into one error would hide which layer is doing the work, and a later change that routed
+    // the modules path through the manifest would then look like no change at all.
+    assert!(
+        !matches!(manifest_err, SpendError::NoRulesAttached),
+        "the manifest path must not be reported as the local guard"
+    );
+
+    // And the inverse, so this cannot pass by refusing everything: one attached rule builds on both.
+    let one = binding(vec![CapabilityRule::Budget {
+        total_mist: "5000000000".into(),
+    }]);
+    let mut tx = TransactionBuilder::new();
+    build_manifest_gated_spend(&mut tx, &one, 1, &resolved()).expect("one rule builds");
+    let mut tx = TransactionBuilder::new();
+    build_gated_spend_for_modules(&mut tx, &one, 1, &["budget"], &resolved())
+        .expect("one module builds");
+}

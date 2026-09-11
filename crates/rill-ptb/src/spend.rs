@@ -108,9 +108,21 @@ fn ident(s: &str) -> Result<Identifier, SpendError> {
 /// its own to explain it. Omitting one that is aborts `E_RULE_NOT_SATISFIED` at the last command,
 /// after every other check has passed.
 ///
-/// A manifest is one way to obtain that list, and [`crate::policy_read`] — reading the chain — is
-/// the better one. This takes the list itself so the caller can use either, and so the two never
+/// A manifest is one way to obtain that list, and [`crate::policy_read`], reading the chain, is the
+/// better one. This takes the list itself so the caller can use either, and so the two never
 /// silently disagree inside this function.
+///
+/// # Why the empty case is refused here and not inherited
+///
+/// An empty list is refused with [`SpendError::NoRulesAttached`]. Its sibling
+/// [`build_manifest_gated_spend`] never needs that check, because it calls
+/// `to_on_chain_rule_params`, which calls `CapabilityManifest::validate`, which returns
+/// `ManifestError::NoRules` for a manifest with no rules. That is exactly why this guard was absent
+/// for two releases: the two builders look like a pair, so the one that was covered made the one
+/// that was not look covered too, and nothing in between them said that the coverage came from a
+/// layer only one of them goes through. This function takes `&[&str]` and constructs no manifest, so
+/// it reaches no validator and must refuse the empty case itself. A third entry point that takes its
+/// module list from anywhere other than a validated manifest inherits this same obligation.
 pub fn build_gated_spend_for_modules(
     tx: &mut TransactionBuilder,
     binding: &WalletBinding,
