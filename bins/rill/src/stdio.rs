@@ -233,6 +233,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_create_wallet" => create_wallet(context, id, &params),
         "rill_attach_rules" => attach_rules(context, id, &params),
         "rill_spend" => spend(context, id, &params),
+        "rill_swap" => swap(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
@@ -447,6 +448,87 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(Ok(result)) => tool_ok(id, result),
         Ok(Err(failure)) => failure_response(context, id, "spend_failed", &failure),
         Err(e) => failure_response(context, id, "spend_failed", &Failure::Failed(e)),
+    }
+}
+
+/// Release funds under the wallet's rules and swap them, in one transaction.
+///
+/// The gated prefix is the same builder `rill spend` and `rill order` use, so the SUI that enters the
+/// swap was released by the contract against its own rules: a swap above a cap is refused by the
+/// chain, and the refusal names the rule. A swap from this signer's own coins would be an ordinary
+/// swap with extra steps, and would prove nothing the product claims.
+fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so nothing can be signed.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    if context.network == "mainnet" && !context.mainnet_allowed {
+        let reason = rill_core::mainnet::mainnet_refusal();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "mainnet_not_opted_in", &reason);
+    }
+
+    let required = [
+        "wallet",
+        "cap",
+        "amount",
+        "pool",
+        "integratePackage",
+        "globalConfig",
+        "coinTypeA",
+        "coinTypeB",
+    ];
+    let mut missing = Vec::new();
+    for name in required {
+        if argument(params, name).is_none() {
+            missing.push(name);
+        }
+    }
+    let a2b = params
+        .get("arguments")
+        .and_then(|a| a.get("a2b"))
+        .and_then(Value::as_bool);
+    if a2b.is_none() {
+        missing.push("a2b");
+    }
+    if !missing.is_empty() {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            &format!(
+                "missing: {}. amount is decimal text, never a number, and a2b is a boolean saying \
+                 which side the wallet's SUI funds.",
+                missing.join(", ")
+            ),
+        );
+    }
+    let get = |name: &str| argument(params, name).unwrap_or_default().to_string();
+
+    let args = crate::swap_cmd::SwapArgs {
+        package_id: package_id(),
+        version_id: version_id(),
+        wallet_id: get("wallet"),
+        cap_id: get("cap"),
+        integrate_package_id: get("integratePackage"),
+        global_config_id: get("globalConfig"),
+        pool_id: get("pool"),
+        coin_type_a: get("coinTypeA"),
+        coin_type_b: get("coinTypeB"),
+        a2b: a2b.unwrap_or(false),
+        spend: get("amount"),
+        gas_budget: TOOL_GAS_BUDGET,
+        dry_run: false,
+    };
+
+    match block_on(crate::swap_cmd::swap_json(
+        &endpoint(context),
+        keystore,
+        &args,
+    )) {
+        Ok(Ok(result)) => tool_ok(id, result),
+        Ok(Err(failure)) => failure_response(context, id, "swap_failed", &failure),
+        Err(e) => failure_response(context, id, "swap_failed", &Failure::Failed(e)),
     }
 }
 

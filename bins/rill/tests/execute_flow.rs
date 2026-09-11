@@ -547,6 +547,7 @@ fn the_transport_advertises_the_whole_flow_and_marks_only_the_submitting_tools_d
         "rill_create_wallet",
         "rill_attach_rules",
         "rill_spend",
+        "rill_swap",
         "rill_execute",
     ];
     for step in SUBMITS {

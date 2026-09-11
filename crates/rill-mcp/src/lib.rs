@@ -316,6 +316,43 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 })),
             ),
             destructive(
+                "rill_swap",
+                "Release funds from an agent wallet and swap them on Cetus, in one transaction, \
+                 gated by the rules the wallet carries on chain. THIS SUBMITS A REAL TRANSACTION \
+                 and cannot be undone. The SUI that enters the swap is released by the contract \
+                 against its own rules, so a swap larger than a rule allows is refused by the chain \
+                 and nothing moves; that is the wallet working, not an error to retry. The swap \
+                 returns two coins, the one it bought and whatever it did not spend, and both are \
+                 sent to this signer. The price bound is derived from the direction rather than \
+                 taken from you: a bound on the wrong side aborts inside Cetus with a code that \
+                 names nothing. Do not retry a success: a second call swaps again.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": { "type": "string", "description": "The AgentWallet object id." },
+                        "cap": { "type": "string", "description": "The AgentCap this signer holds." },
+                        "amount": {
+                            "type": "string",
+                            "description": "Decimal SUI to release and swap, as text, never a number. \"0.001\", not 0.001."
+                        },
+                        "pool": { "type": "string", "description": "The Cetus pool object id." },
+                        "integratePackage": {
+                            "type": "string",
+                            "description": "Cetus's integrate package, where router::swap lives."
+                        },
+                        "globalConfig": { "type": "string", "description": "Cetus's GlobalConfig object id." },
+                        "coinTypeA": { "type": "string", "description": "The pool's coin A type, in the pool's own order." },
+                        "coinTypeB": { "type": "string", "description": "The pool's coin B type." },
+                        "a2b": {
+                            "type": "boolean",
+                            "description": "True to spend coin A and buy B. The wallet releases SUI, so set this to whichever side SUI is not."
+                        }
+                    },
+                    "required": ["wallet", "cap", "amount", "pool", "integratePackage", "globalConfig", "coinTypeA", "coinTypeB", "a2b"],
+                    "additionalProperties": false
+                })),
+            ),
+            destructive(
                 "rill_execute",
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope built \
                  elsewhere. Distinct from rill_spend, which builds locally: this is the path where \
@@ -416,6 +453,7 @@ mod tests {
             "rill_create_wallet",
             "rill_attach_rules",
             "rill_spend",
+            "rill_swap",
             "rill_execute",
         ];
 

@@ -13,10 +13,11 @@ use rill_mcp::{negotiate_protocol_version, tools, Surface, LATEST_PROTOCOL_VERSI
 use std::collections::BTreeMap;
 
 /// The tools that need a key. Asserted in both directions below rather than trusted.
-const SIGNING_TOOLS: [&str; 4] = [
+const SIGNING_TOOLS: [&str; 5] = [
     "rill_create_wallet",
     "rill_attach_rules",
     "rill_spend",
+    "rill_swap",
     "rill_execute",
 ];
 
