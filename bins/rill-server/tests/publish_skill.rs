@@ -45,6 +45,10 @@ fn config_in(dir: &std::path::Path) -> Config {
         guard_package_id: Some("0xguard".into()),
         owner_secret: None,
         owner_address: None,
+        // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
+        // tests are about the routes, not about where the socket is.
+        bind_address: "127.0.0.1".into(),
+        open_authorization_acknowledged: false,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
         oauth_store_path: dir.join("oauth.json").to_string_lossy().into(),
     }

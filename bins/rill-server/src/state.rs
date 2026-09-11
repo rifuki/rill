@@ -47,6 +47,12 @@ pub struct Config {
     /// True when the secret came from the environment, and therefore survives a restart.
     pub oauth_secret_from_env: bool,
     pub guard_package_id: Option<String>,
+    /// The address to listen on. `0.0.0.0` by default, because a container that bound loopback
+    /// would be unreachable from outside itself and the failure would look like a crash.
+    pub bind_address: String,
+    /// The operator's acknowledgement that this deployment issues authorization codes to anyone who
+    /// can reach it. See [`Config::boot_check`].
+    pub open_authorization_acknowledged: bool,
     /// The operator credential that authorizes minting a long-lived agent credential.
     ///
     /// Not a token and not a key: it is the only owner identity this deployment has until
@@ -94,16 +100,38 @@ impl Config {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
         let oauth_secret_from_env = from_env.is_some();
-        let oauth_secret = from_env.unwrap_or_else(|| match network {
-            Network::Mainnet => String::new(),
-            Network::Testnet => rill_auth::tokens::random_id(),
-        });
+
+        // Unset on testnet, the secret is generated once and kept beside the store rather than
+        // regenerated per boot.
+        //
+        // A per-boot secret invalidates every token the moment the process restarts, so a local
+        // agent has to complete the OAuth flow again after every rebuild. The old code warned about
+        // that, which is not the same as not doing it: the warning is printed at boot and read, if
+        // ever, long before the agent fails. Keeping it turns "connected" into something that
+        // survives a restart.
+        //
+        // On disk beside `oauth.json`, which already holds authorization codes and agent credential
+        // records, so this is not a new class of secret in that directory. Mainnet still refuses to
+        // start without an explicit one: a key an operator cannot rotate from their own secret
+        // manager is not one they control.
+        let oauth_store_path =
+            std::env::var("OAUTH_STORE_PATH").unwrap_or_else(|_| "./data/oauth.json".into());
+        let generated_path = std::path::Path::new(&oauth_store_path).with_file_name("oauth-secret");
+        let oauth_secret = match from_env {
+            Some(secret) => secret,
+            None => match network {
+                Network::Mainnet => String::new(),
+                Network::Testnet => read_or_create_secret(&generated_path),
+            },
+        };
 
         if !oauth_secret_from_env && network == Network::Testnet {
             eprintln!(
-                "[oauth] RILL_OAUTH_SECRET is unset, so a random per-boot secret is in use. Every issued \
-                 token becomes invalid when this process restarts, and connected agents must \
-                 re-authorize. Set it for anything longer-lived than local development."
+                "[oauth] RILL_OAUTH_SECRET is unset, so a generated one is in use, kept at {}. \
+                 Tokens survive a restart because of that file: delete it and every connected agent \
+                 must re-authorize. Set RILL_OAUTH_SECRET for anything you want to rotate from a \
+                 secret manager rather than a filesystem.",
+                generated_path.display()
             );
         }
 
@@ -117,6 +145,9 @@ impl Config {
             public_base_url,
             oauth_secret,
             oauth_secret_from_env,
+            bind_address: std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".into()),
+            open_authorization_acknowledged: std::env::var("RILL_ALLOW_OPEN_AUTHORIZATION")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             guard_package_id: std::env::var("RILL_GUARD_PACKAGE_ID")
                 .ok()
                 .filter(|s| !s.is_empty()),
@@ -124,8 +155,7 @@ impl Config {
             owner_address: trimmed_env("RILL_OWNER_ADDRESS"),
             skills_store_path: std::env::var("SKILLS_STORE_PATH")
                 .unwrap_or_else(|_| "./data/skills.json".into()),
-            oauth_store_path: std::env::var("OAUTH_STORE_PATH")
-                .unwrap_or_else(|_| "./data/oauth.json".into()),
+            oauth_store_path,
         }
     }
 
@@ -200,6 +230,27 @@ impl Config {
             }
             (None, None) => {}
         }
+        // `/oauth/authorize` has no consent step: it returns an authorization code to whoever asks,
+        // registration is open, and a public client presents no credential. On loopback that is
+        // defensible, because reaching the port already means being on the machine. Bound wider it
+        // means anyone who can route to this port can mint a token for the build surface and read
+        // the owner's catalogue. What they cannot do is sign: the key is in a separate process and
+        // this one has none, which is what bounds the exposure rather than removing it.
+        //
+        // So the combination is a decision rather than a default. A container legitimately needs a
+        // wide bind, and setting the flag in a compose file is one line; discovering this from the
+        // outside is not.
+        if !is_loopback(&self.bind_address) && !self.open_authorization_acknowledged {
+            return Err(format!(
+                "Refusing to start: BIND_ADDRESS is {} and this deployment has no consent step, so \
+                 anyone who can reach port {} could register a client and mint an access token for \
+                 the build surface. The signing key is not here, so they could not sign anything, \
+                 but they could read this owner's published actions and have envelopes built. Set \
+                 BIND_ADDRESS=127.0.0.1 to keep it on this machine, or \
+                 RILL_ALLOW_OPEN_AUTHORIZATION=1 to say that a wide bind is intended.",
+                self.bind_address, self.port
+            ));
+        }
         if self.network != Network::Mainnet {
             return Ok(());
         }
@@ -222,6 +273,50 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+/// The generated signing secret, created on first boot and reused after that.
+///
+/// A read that fails for any reason falls back to a fresh secret rather than refusing to start: a
+/// local server that will not run because of a permissions problem on a convenience file is worse
+/// than one whose tokens do not survive this particular restart. The warning above names the path so
+/// the cause is visible either way.
+pub(crate) fn read_or_create_secret(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    let fresh = rill_auth::tokens::random_id();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(path, &fresh).is_ok() {
+        // Readable by this user only. A secret at 644 in a shared directory is one anybody on the
+        // machine can sign tokens with.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    fresh
+}
+
+/// Whether an address keeps traffic on this machine.
+///
+/// Both families, and the unspecified forms are deliberately **not** loopback: `0.0.0.0` and `::`
+/// mean every interface, which is the case this check exists for.
+fn is_loopback(address: &str) -> bool {
+    let trimmed = address.trim().trim_start_matches('[').trim_end_matches(']');
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A hostname rather than an address. `localhost` is the one that resolves to loopback on
+        // every machine this runs on; anything else is treated as wide, because guessing that a
+        // name is local is how this check would be bypassed by accident.
+        Err(_) => trimmed.eq_ignore_ascii_case("localhost"),
     }
 }
 
@@ -271,5 +366,93 @@ impl From<Network> for rill_core::envelope::Network {
             Network::Testnet => Self::Testnet,
             Network::Mainnet => Self::Mainnet,
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    //! The generated signing secret, tested without touching the process environment.
+    //!
+    //! An earlier version of these drove `Config::from_env` with `set_var`, which passed serially and
+    //! raced every other test in the same binary. The behaviour worth pinning is this function's, and
+    //! it needs a path and nothing else.
+
+    use super::read_or_create_secret;
+
+    fn dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rill-secret-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A second call returns the first secret, which is what makes a token survive a restart.
+    ///
+    /// The old behaviour minted one per boot and printed a warning. A warning at boot is read, if
+    /// ever, long before the agent fails, and what an operator actually meets is their agent asking
+    /// to re-authorize after a rebuild. This is the assertion that separates "warned about" from
+    /// "fixed".
+    #[test]
+    fn the_same_path_yields_the_same_secret() {
+        let path = dir().join("oauth-secret");
+        let first = read_or_create_secret(&path);
+        assert!(!first.is_empty());
+        assert_eq!(read_or_create_secret(&path), first);
+    }
+
+    /// Deleting the file is the documented way to invalidate every token, so it must do that.
+    #[test]
+    fn removing_the_file_produces_a_different_secret() {
+        let path = dir().join("oauth-secret");
+        let first = read_or_create_secret(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_ne!(read_or_create_secret(&path), first);
+    }
+
+    /// Owner-only on disk. A secret at 644 in a shared directory is one anybody on the machine can
+    /// sign tokens with.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_not_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir().join("oauth-secret");
+        read_or_create_secret(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
+
+    /// A blank or whitespace-only file is treated as absent rather than used as a secret.
+    ///
+    /// An empty HMAC key signs tokens anyone can forge, and a file truncated by a disk problem is
+    /// exactly how one would arrive.
+    #[test]
+    fn a_blank_file_is_replaced_rather_than_used() {
+        let path = dir().join("oauth-secret");
+        std::fs::write(&path, "   \n").unwrap();
+        let secret = read_or_create_secret(&path);
+        assert!(!secret.trim().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            secret,
+            "and the replacement is written back, so the next boot agrees with this one"
+        );
+    }
+
+    /// A path whose parent does not exist yet still works: the directory is created.
+    #[test]
+    fn a_missing_directory_is_created() {
+        let path = dir().join("nested").join("deeper").join("oauth-secret");
+        let secret = read_or_create_secret(&path);
+        assert!(
+            path.exists(),
+            "the file was not written: {}",
+            path.display()
+        );
+        assert_eq!(read_or_create_secret(&path), secret);
     }
 }

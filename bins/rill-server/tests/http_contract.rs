@@ -58,6 +58,10 @@ fn config_in(dir: &std::path::Path) -> Config {
         guard_package_id: Some("0xguard".into()),
         owner_secret: None,
         owner_address: None,
+        // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
+        // tests are about the routes, not about where the socket is.
+        bind_address: "127.0.0.1".into(),
+        open_authorization_acknowledged: false,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
         oauth_store_path: dir.join("oauth.json").to_string_lossy().into(),
     }
@@ -289,6 +293,8 @@ fn mainnet_config(secret: &str, guard: Option<&str>) -> Config {
         guard_package_id: guard.map(str::to_owned),
         owner_secret: None,
         owner_address: None,
+        bind_address: "127.0.0.1".into(),
+        open_authorization_acknowledged: false,
         skills_store_path: "/tmp/x.json".into(),
         oauth_store_path: "/tmp/y.json".into(),
     }
@@ -1607,4 +1613,79 @@ fn a_half_configured_owner_is_refused_at_boot_on_every_network() {
     typo.owner_address = Some("0xnot-an-address".into());
     let err = typo.boot_check().unwrap_err();
     assert!(err.contains("not a Sui address"), "{err}");
+}
+
+// ── where the socket is, and what that means given there is no consent step ──
+
+/// A wide bind is refused unless the operator says it is intended.
+///
+/// `/oauth/authorize` returns an authorization code to whoever asks: registration is open and a
+/// public client presents no credential. On loopback that is defensible, because reaching the port
+/// already means being on the machine. Bound to every interface it means anyone who can route to the
+/// port can mint a build-surface token and read this owner's published actions. They still cannot
+/// sign, because the key is in another process, which bounds the exposure without removing it.
+///
+/// So it is a decision. This test is the only thing that makes it one.
+#[test]
+fn a_wide_bind_without_acknowledgement_is_refused() {
+    let mut config = config_in(&fresh_dir());
+    config.bind_address = "0.0.0.0".into();
+    config.open_authorization_acknowledged = false;
+
+    let refusal = config
+        .boot_check()
+        .expect_err("a wide bind with no consent step must not start silently");
+    assert!(
+        refusal.contains("no consent step"),
+        "the refusal must say why the bind matters: {refusal}"
+    );
+    assert!(
+        refusal.contains("could not sign anything"),
+        "and must not overstate it: the signing key is elsewhere: {refusal}"
+    );
+    assert!(
+        refusal.contains("BIND_ADDRESS=127.0.0.1")
+            && refusal.contains("RILL_ALLOW_OPEN_AUTHORIZATION=1"),
+        "and must name both ways out, since one of them is right for a container: {refusal}"
+    );
+}
+
+/// Acknowledged, it starts. A container needs a wide bind and the flag is how it says so.
+#[test]
+fn an_acknowledged_wide_bind_starts() {
+    let mut config = config_in(&fresh_dir());
+    config.bind_address = "0.0.0.0".into();
+    config.open_authorization_acknowledged = true;
+    assert!(config.boot_check().is_ok());
+}
+
+/// Loopback needs no acknowledgement, in either address family and under its usual name.
+#[test]
+fn loopback_needs_no_acknowledgement() {
+    for address in ["127.0.0.1", "::1", "[::1]", "localhost", "127.0.0.5"] {
+        let mut config = config_in(&fresh_dir());
+        config.bind_address = address.into();
+        config.open_authorization_acknowledged = false;
+        assert!(
+            config.boot_check().is_ok(),
+            "{address} keeps traffic on this machine"
+        );
+    }
+}
+
+/// The unspecified addresses are not loopback, which is the whole point of the check.
+///
+/// `0.0.0.0` and `::` mean every interface. An `is_loopback` that treated them as local because they
+/// contain no routable host would pass exactly the case this refuses.
+#[test]
+fn the_unspecified_addresses_are_not_treated_as_local() {
+    for address in ["0.0.0.0", "::", "[::]", "192.168.1.10", "example.internal"] {
+        let mut config = config_in(&fresh_dir());
+        config.bind_address = address.into();
+        config.open_authorization_acknowledged = false;
+        assert!(
+            config.boot_check().is_err(),
+            "{address} is reachable from off this machine"
+        );
+    }
 }

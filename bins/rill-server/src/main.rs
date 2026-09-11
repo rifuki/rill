@@ -23,9 +23,24 @@ async fn main() {
     }
 
     let port = config.port;
+    // Parsed before the router is built so a bad address fails before anything else is set up.
+    // `boot_check` has already decided whether this address is allowed to be a wide one.
+    let host: std::net::IpAddr = match config.bind_address.trim() {
+        "localhost" => std::net::IpAddr::from([127, 0, 0, 1]),
+        other => match other.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                eprintln!(
+                    "BIND_ADDRESS is {other:?}, which is not an IP address. Use 127.0.0.1 to keep \
+                     this on one machine, or 0.0.0.0 for every interface."
+                );
+                std::process::exit(1);
+            }
+        },
+    };
     let app = routes::router(AppState::new(config));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(host, port);
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {

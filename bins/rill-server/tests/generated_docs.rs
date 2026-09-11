@@ -72,6 +72,10 @@ fn config(base: &str) -> Config {
         // generated on a deployment that never sets an owner is the ordinary case here.
         owner_secret: None,
         owner_address: None,
+        // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
+        // tests are about the routes, not about where the socket is.
+        bind_address: "127.0.0.1".into(),
+        open_authorization_acknowledged: false,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
         oauth_store_path: dir.join("oauth.json").to_string_lossy().into(),
     }

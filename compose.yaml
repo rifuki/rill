@@ -29,6 +29,15 @@ services:
       # re-authorize. Generate one with: openssl rand -hex 32
       RILL_OAUTH_SECRET: "${RILL_OAUTH_SECRET:?set RILL_OAUTH_SECRET, or restarts invalidate every token}"
 
+      # A container must bind every interface or nothing outside it can connect, and the server
+      # refuses a wide bind unless that is stated. It is stated here because it is true of any
+      # container, not because the exposure is harmless: /oauth/authorize has no consent step, so
+      # whoever can reach the published port can mint a token for the build surface and read this
+      # owner's published actions. They cannot sign: the key lives in the local rill binary and
+      # never in this container. Put this behind whatever fronts it, and publish the port to a
+      # network you control rather than to 0.0.0.0 on a public host.
+      RILL_ALLOW_OPEN_AUTHORIZATION: "1"
+
       # Optional, and both or neither. They gate the long-lived credential a headless agent uses;
       # the server refuses to start on a half-configured pair rather than issue grants that refuse
       # every request.
