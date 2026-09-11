@@ -11,13 +11,37 @@ use sui_rpc::proto::sui::rpc::v2::{
 };
 
 use crate::{
-    classify_failure, BalanceDelta, ChainError, ChainResult, CreatedObject, ExecutionOutcome,
-    ObjectRef, ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
+    classify_failure, BalanceDelta, ChainError, ChainResult, CreatedObject, DynamicFieldSummary,
+    ExecutionOutcome, ObjectRef, ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
 };
 
 /// Fields worth asking for on an object read. Requesting a mask rather than everything keeps the
 /// response small, and makes it obvious at the call site what the caller actually depends on.
 const OBJECT_MASK: &[&str] = &["object_id", "version", "digest", "object_type", "owner"];
+
+/// The same, plus the object's Move fields.
+///
+/// A separate mask rather than one more entry in `OBJECT_MASK`, because the two call sites want
+/// different things: a single `get_object` is reading one object and usually wants to know what is
+/// in it, while `list_owned_objects` walks every object an address holds and wants references. The
+/// fields are what let a read report a wallet's remaining budget instead of only the fact that a
+/// budget rule is attached, and asking for them on a gas-coin sweep would pay for that on every
+/// coin.
+/// What a dynamic field read asks for: which field it is, and what is inside it.
+///
+/// `field_object.json` is the part that matters. The wrapper carries the key and the value as BCS,
+/// which would have to be decoded here against a Move type this crate does not know; the node will
+/// decode it instead and hand back the value's fields.
+const DYNAMIC_FIELD_MASK: &[&str] = &["field_id", "value_type", "field_object.json"];
+
+const OBJECT_WITH_FIELDS_MASK: &[&str] = &[
+    "object_id",
+    "version",
+    "digest",
+    "object_type",
+    "owner",
+    "json",
+];
 
 /// How many objects one `ListOwnedObjects` round trip asks for.
 ///
@@ -155,8 +179,8 @@ impl GrpcSui {
 }
 
 /// One page of a listing, in this crate's terms.
-struct Page<T> {
-    objects: Vec<ObjectSummary>,
+struct Page<T, I> {
+    objects: Vec<I>,
     next: Option<T>,
 }
 
@@ -165,10 +189,10 @@ struct Page<T> {
 /// Separated from the transport so the walk itself can be tested without a node: the property
 /// that matters is that the token is carried into the next request until the node stops sending
 /// one, and that property does not need gRPC to be checked.
-async fn walk_pages<T, F, Fut>(mut fetch: F) -> ChainResult<Vec<ObjectSummary>>
+async fn walk_pages<T, I, F, Fut>(mut fetch: F) -> ChainResult<Vec<I>>
 where
     F: FnMut(Option<T>) -> Fut,
-    Fut: std::future::Future<Output = ChainResult<Page<T>>>,
+    Fut: std::future::Future<Output = ChainResult<Page<T, I>>>,
 {
     let mut all = Vec::new();
     let mut token = None;
@@ -208,6 +232,40 @@ fn refusal_or_transport(status: tonic::Status) -> ChainError {
     }
 }
 
+/// A protobuf `Value` as `serde_json::Value`.
+///
+/// The node returns an object's Move fields as a `google.protobuf.Value`, which carries the same
+/// shapes JSON does and none of its types. Numbers are the part that matters here: protobuf has only
+/// `double`, so a `u64` field arrives as an f64 and a balance above 2^53 would come back rounded.
+/// Integral values are therefore written back out as integers, and anything with a fractional part
+/// is kept as a float rather than silently truncated.
+fn proto_value_to_json(v: &prost_types::Value) -> serde_json::Value {
+    use prost_types::value::Kind;
+    match &v.kind {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::StringValue(s)) => serde_json::Value::String(s.clone()),
+        Some(Kind::NumberValue(n)) => {
+            if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.007_199_254_740_992e15 {
+                serde_json::Value::from(*n as i64)
+            } else {
+                serde_json::Number::from_f64(*n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        }
+        Some(Kind::ListValue(l)) => {
+            serde_json::Value::Array(l.values.iter().map(proto_value_to_json).collect())
+        }
+        Some(Kind::StructValue(st)) => serde_json::Value::Object(
+            st.fields
+                .iter()
+                .map(|(k, v)| (k.clone(), proto_value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
 fn to_summary(o: &sui_rpc::proto::sui::rpc::v2::Object) -> ObjectSummary {
     ObjectSummary {
         reference: ObjectRef {
@@ -216,7 +274,7 @@ fn to_summary(o: &sui_rpc::proto::sui::rpc::v2::Object) -> ObjectSummary {
             digest: o.digest().to_owned(),
         },
         object_type: o.object_type.clone(),
-        fields: None,
+        fields: o.json.as_deref().map(proto_value_to_json),
         // `Owner.version` carries the initial shared version when the object is shared, so it is
         // read only for the SHARED kind — for an owned object the same field means nothing.
         shared_initial_version: o.owner.as_ref().and_then(|owner| {
@@ -292,7 +350,7 @@ impl SuiRead for GrpcSui {
     async fn get_object(&self, id: &str) -> ChainResult<ObjectSummary> {
         let mut request = GetObjectRequest::default();
         request.object_id = Some(id.to_owned());
-        request.read_mask = Some(GrpcSui::mask(OBJECT_MASK));
+        request.read_mask = Some(GrpcSui::mask(OBJECT_WITH_FIELDS_MASK));
 
         let response = self
             .client
@@ -316,6 +374,44 @@ impl SuiRead for GrpcSui {
     async fn list_owned_objects(&self, owner: &str) -> ChainResult<Vec<ObjectSummary>> {
         self.list_owned_objects_paged(owner, OWNED_OBJECTS_PAGE_SIZE)
             .await
+    }
+
+    async fn list_dynamic_fields(&self, parent: &str) -> ChainResult<Vec<DynamicFieldSummary>> {
+        use sui_rpc::proto::sui::rpc::v2::ListDynamicFieldsRequest;
+        walk_pages(|token| async move {
+            let mut request = ListDynamicFieldsRequest::default();
+            request.parent = Some(parent.to_owned());
+            request.page_size = Some(OWNED_OBJECTS_PAGE_SIZE);
+            request.page_token = token;
+            request.read_mask = Some(GrpcSui::mask(DYNAMIC_FIELD_MASK));
+
+            let response = self
+                .client
+                .clone()
+                .state_client()
+                .list_dynamic_fields(request)
+                .await
+                .map_err(refusal_or_transport)?
+                .into_inner();
+
+            Ok(Page {
+                objects: response
+                    .dynamic_fields
+                    .iter()
+                    .map(|f| DynamicFieldSummary {
+                        field_id: f.field_id().to_owned(),
+                        value_type: f.value_type.clone(),
+                        fields: f
+                            .field_object
+                            .as_ref()
+                            .and_then(|o| o.json.as_deref())
+                            .map(proto_value_to_json),
+                    })
+                    .collect(),
+                next: response.next_page_token,
+            })
+        })
+        .await
     }
 
     async fn get_balance(&self, owner: &str, coin_type: &str) -> ChainResult<u64> {
@@ -638,8 +734,9 @@ mod tests {
         }
     }
 
-    type PageFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = ChainResult<Page<usize>>>>>;
+    type PageFuture = std::pin::Pin<
+        Box<dyn std::future::Future<Output = ChainResult<Page<usize, ObjectSummary>>>>,
+    >;
 
     /// The bug this guards: fifty-one objects on a fifty-object page, and the fifty-first is the
     /// gas coin.

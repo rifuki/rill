@@ -19,6 +19,7 @@ pub const BINARY_NAME: &str = rill_core::release::WALLET_BINARY;
 
 pub mod init;
 pub mod keystore;
+pub mod limits;
 pub mod manager_cmd;
 pub mod order_cmd;
 pub mod revoke_cmd;

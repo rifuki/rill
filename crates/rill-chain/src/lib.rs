@@ -44,6 +44,22 @@ pub mod rill_chain_types {
         pub shared_initial_version: Option<u64>,
     }
 
+    /// One dynamic field hanging off a parent object.
+    ///
+    /// The fields are the value's, not the wrapper's: a `Field<RuleKey<budget::Rule>,
+    /// budget::Config>` reports the `Config`'s own contents, which is where a rule's configured
+    /// ceiling lives. `value_type` is the wrapper's full type, because that is the only thing that
+    /// says which rule a config belongs to.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DynamicFieldSummary {
+        pub field_id: String,
+        /// The full type of the field, e.g. `0x2::dynamic_field::Field<...RuleKey<...budget::Rule>,
+        /// ...budget::Config>`. `None` when the node did not report one.
+        pub value_type: Option<String>,
+        /// Raw JSON of the field object's contents, when requested.
+        pub fields: Option<serde_json::Value>,
+    }
+
     /// A coin balance delta observed during simulation or execution.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct BalanceDelta {
@@ -167,6 +183,13 @@ pub trait SuiRead {
     /// coins out of this list cannot tell a short list from a truncated one, so the truncation
     /// must never happen here.
     async fn list_owned_objects(&self, owner: &str) -> ChainResult<Vec<ObjectSummary>>;
+    /// Every dynamic field on `parent`, with each field's own contents.
+    ///
+    /// A wallet's rules are dynamic fields on its policy, and a rule's configured ceiling is inside
+    /// the field rather than on the wallet. Without this, a read can say a `budget` rule is attached
+    /// and cannot say what the budget is, which is the difference between an agent that knows
+    /// whether a spend will be allowed and one that has to try it and be refused.
+    async fn list_dynamic_fields(&self, parent: &str) -> ChainResult<Vec<DynamicFieldSummary>>;
     async fn get_balance(&self, owner: &str, coin_type: &str) -> ChainResult<u64>;
     /// Evaluate an unsigned transaction. Takes base64 BCS so this trait stays independent of the
     /// transaction-builder crate.

@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::{
-    BalanceDelta, ChainError, ChainResult, CreatedObject, ExecutionOutcome, ObjectSummary,
-    SimulationOutcome, SuiRead, SuiWrite, Verification,
+    BalanceDelta, ChainError, ChainResult, CreatedObject, DynamicFieldSummary, ExecutionOutcome,
+    ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
 };
 
 /// What the fake should answer for the next simulation.
@@ -45,6 +45,8 @@ struct State {
     not_yet_indexed: HashMap<String, usize>,
     objects: HashMap<String, ObjectSummary>,
     owned: HashMap<String, Vec<String>>,
+    /// Dynamic fields by parent object id.
+    dynamic_fields: HashMap<String, Vec<DynamicFieldSummary>>,
     balances: HashMap<(String, String), u64>,
     simulation: SimulationBehavior,
     executions: Vec<String>,
@@ -66,6 +68,7 @@ impl Default for State {
             objects: HashMap::new(),
             not_yet_indexed: HashMap::new(),
             owned: HashMap::new(),
+            dynamic_fields: HashMap::new(),
             balances: HashMap::new(),
             simulation: SimulationBehavior::default(),
             executions: Vec::new(),
@@ -101,6 +104,17 @@ impl FakeSui {
                 s.owned.entry(owner.to_owned()).or_default().push(id);
             }
         }
+        self
+    }
+
+    /// Stage one dynamic field on a parent, the way a rule's config hangs off a wallet's policy.
+    pub fn with_dynamic_field(self, parent: &str, field: DynamicFieldSummary) -> Self {
+        self.state
+            .borrow_mut()
+            .dynamic_fields
+            .entry(parent.to_owned())
+            .or_default()
+            .push(field);
         self
     }
 
@@ -215,6 +229,16 @@ impl SuiRead for FakeSui {
                     .filter_map(|id| s.objects.get(id).cloned())
                     .collect()
             })
+            .unwrap_or_default())
+    }
+
+    async fn list_dynamic_fields(&self, parent: &str) -> ChainResult<Vec<DynamicFieldSummary>> {
+        Ok(self
+            .state
+            .borrow()
+            .dynamic_fields
+            .get(parent)
+            .cloned()
             .unwrap_or_default())
     }
 
