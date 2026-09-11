@@ -133,14 +133,22 @@ pub async fn swap_json_on(
     // The floor, resolved before any object is read, so a swap that was never going to be allowed
     // costs no round trips. Zero is not a floor: the guard would emit nothing and the transaction
     // would carry no bound, which is the one outcome a caller must not reach by omission.
-    let min_out = rill_core::amounts::parse_u64_string(&args.min_out_base_units)
-        .map_err(|e| format!("the minimum output: {e}"))?;
+    // An absent field and a zero floor are the same mistake and get the same answer. Letting the
+    // amount parser speak for an omitted argument produced "value must be a non-empty string", which
+    // tells a caller the type of the thing it left out and nothing about what to put there.
+    let min_out = if args.min_out_base_units.trim().is_empty() {
+        0
+    } else {
+        rill_core::amounts::parse_u64_string(&args.min_out_base_units)
+            .map_err(|e| format!("the minimum output: {e}"))?
+    };
     if min_out == 0 && !args.accept_any_output {
         // `Failed`, not `Refused`: `Refused` means a rule on the wallet stopped this, and an agent
         // that cannot tell a missing argument from a policy decision retries the policy decision.
         return Err(Failure::Failed(
-            "minOut is zero, so this swap would accept any output including none. The wallet's \
-             rules bound what goes into the swap and nothing bounds what comes back, so a thin pool \
+            "minOut is missing or zero, so this swap would accept any output including none. The \
+             wallet's rules bound what goes into the swap and nothing bounds what comes back, so a \
+             thin pool \
              or a sandwich returns dust and the transaction still succeeds. Set minOut to the least \
              the bought coin may hold, in that coin's base units, or pass acceptAnyOutput to send it \
              unprotected on purpose."

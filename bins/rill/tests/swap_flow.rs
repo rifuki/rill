@@ -535,3 +535,32 @@ fn the_floor_value_is_reported_as_given() {
     assert_eq!(report["slippageFloor"], serde_json::json!("enforced"));
     assert_eq!(report["minOutBaseUnits"], serde_json::json!("12345"));
 }
+
+/// A caller that omits `minOut` entirely is told what to supply, not what type it should have been.
+///
+/// The first version of this path let the amount parser answer an absent argument, which produced
+/// "value must be a non-empty string". That names the type of the thing the caller left out and
+/// nothing about what belongs there, and the caller here is frequently an agent with no other source
+/// for the answer.
+#[test]
+fn an_omitted_floor_is_explained_the_same_way_a_zero_one_is() {
+    let agent = key(7);
+    let chain = chain(&agent, &["budget"]);
+    let mut a = args("0.001", false);
+    a.min_out_base_units = String::new();
+    let err = run(swap_json_on(&chain, &agent, &a)).expect_err("an omitted floor must be refused");
+    let said = format!("{err}");
+    assert!(
+        said.contains("minOut is missing or zero"),
+        "an omitted floor must get the floor's own explanation: {said}"
+    );
+    assert!(
+        said.contains("acceptAnyOutput"),
+        "and must name the way to proceed without one: {said}"
+    );
+    assert!(
+        !said.contains("non-empty string"),
+        "and must not answer with the type of the missing field: {said}"
+    );
+    assert!(chain.submitted().is_empty());
+}
