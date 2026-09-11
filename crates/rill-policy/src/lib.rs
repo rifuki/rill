@@ -147,10 +147,6 @@ pub enum Rejection {
     ObjectSetMismatch {
         unexpected: Vec<String>,
     },
-    GuardSetMismatch {
-        expected: Vec<String>,
-        found: Vec<String>,
-    },
     /// The bytes changed between validation and signing.
     BytesChangedAfterApproval {
         approved: String,
@@ -239,10 +235,6 @@ impl std::fmt::Display for Rejection {
                 f,
                 "the transaction touches objects that were not approved: {}",
                 unexpected.join(", ")
-            ),
-            Self::GuardSetMismatch { expected, found } => write!(
-                f,
-                "guard set differs — expected {expected:?}, found {found:?}"
             ),
             Self::BytesChangedAfterApproval { approved, now } => write!(
                 f,

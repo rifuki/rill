@@ -62,26 +62,6 @@ pub fn check_object_scope(approved: &[String], touched: &[String]) -> Result<(),
     }
 }
 
-/// The guards the envelope promised must be exactly the guards the transaction contains.
-///
-/// Equality in both directions, which is the only version that means anything. A missing guard is
-/// an unprotected swap. An extra guard the envelope did not declare is a call nobody reviewed,
-/// sitting in the middle of a money path.
-pub fn check_guard_set(expected: &[String], found: &[String]) -> Result<(), Rejection> {
-    let mut a = expected.to_vec();
-    let mut b = found.to_vec();
-    a.sort();
-    b.sort();
-    if a == b {
-        Ok(())
-    } else {
-        Err(Rejection::GuardSetMismatch {
-            expected: a,
-            found: b,
-        })
-    }
-}
-
 /// After this spend, the wallet must still hold at least the reserve.
 ///
 /// No on-chain rule expresses this. `budget` caps the total ever spent; nothing says "always leave
@@ -173,22 +153,58 @@ mod tests {
         );
     }
 
+    /// A guard is a Move call, so the sequence check is what refuses a missing one.
+    ///
+    /// These three assertions replace a `check_guard_set` that existed, passed its own tests, and
+    /// was called from no production path. `decode` records every `MoveCall` target in command
+    /// order and `check_target_sequence` demands ordered equality against the run-set, so an absent
+    /// guard is already a shorter sequence and an added one is already off-scope. The deleted
+    /// function compared the same names as an unordered set, which is strictly weaker, and its test
+    /// named `guard_order_does_not_matter` asserted a tolerance the live path does not have. Three
+    /// green tests on an uncalled function read as coverage of the guard check, which is worse than
+    /// no tests at all: the real coverage lives in a different function and nothing said so.
     #[test]
-    fn a_missing_guard_is_refused() {
-        assert!(check_guard_set(&v(&["g"]), &v(&[])).is_err());
+    fn a_guard_the_envelope_promised_and_the_transaction_omits_is_refused() {
+        let declared = v(&[
+            "pkg::wallet::request_spend",
+            "pkg::guard::check",
+            "pkg::wallet::confirm_spend",
+        ]);
+        let without_the_guard = v(&["pkg::wallet::request_spend", "pkg::wallet::confirm_spend"]);
+        assert!(
+            matches!(
+                check_target_sequence(&declared, &without_the_guard),
+                Err(Rejection::TargetSequenceMismatch { .. })
+            ),
+            "dropping the guard out of the middle of a money path must not pass"
+        );
     }
 
     #[test]
-    fn an_extra_undeclared_guard_is_also_refused() {
+    fn a_guard_the_envelope_never_declared_is_refused_as_off_scope() {
+        let declared = v(&["pkg::wallet::request_spend", "pkg::wallet::confirm_spend"]);
+        let with_a_surprise = v(&[
+            "pkg::wallet::request_spend",
+            "pkg::surprise::guard",
+            "pkg::wallet::confirm_spend",
+        ]);
         assert!(
-            check_guard_set(&v(&[]), &v(&["surprise"])).is_err(),
+            matches!(
+                check_target_sequence(&declared, &with_a_surprise),
+                Err(Rejection::OffScopeTarget(t)) if t == "pkg::surprise::guard"
+            ),
             "a call nobody reviewed sitting in a money path is not made acceptable by being a guard"
         );
     }
 
     #[test]
-    fn guard_order_does_not_matter() {
-        assert!(check_guard_set(&v(&["a", "b"]), &v(&["b", "a"])).is_ok());
+    fn guard_order_does_matter_on_the_path_that_actually_runs() {
+        let declared = v(&["pkg::a::guard", "pkg::b::guard"]);
+        let reordered = v(&["pkg::b::guard", "pkg::a::guard"]);
+        assert!(
+            check_target_sequence(&declared, &reordered).is_err(),
+            "the live check is ordered, and a test claiming otherwise would invite weakening it"
+        );
     }
 
     #[test]
