@@ -266,10 +266,14 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 "Mint an agent wallet and the AgentCap that drives it, funded from the key this \
                  signer holds. The key here becomes the wallet's owner and the cap goes to the \
                  agent address you name, which is what makes the two identities different keys. \
-                 THIS SUBMITS A REAL TRANSACTION and cannot be undone. The wallet is shared with \
-                 NO rules attached, and a wallet with no rules has no limits, so call \
-                 rill_attach_rules with the id this returns before the cap is worth anything. Do \
-                 not retry a success: a second call mints a second wallet and funds it again.",
+                 THIS SUBMITS TWO REAL TRANSACTIONS and cannot be undone: one mints and funds the \
+                 wallet, the second attaches the budget and perTx rules you pass, because a wallet \
+                 cannot have rules added in the transaction that creates it. A success means both \
+                 landed and the wallet is bounded. If the second fails the answer is an error \
+                 named created_but_unbounded, carrying the wallet id: the wallet then exists with \
+                 no limit, so do not hand the cap to anything and call rill_attach_rules with that \
+                 id. Do not retry a success: a second call mints a second wallet and funds it \
+                 again.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {

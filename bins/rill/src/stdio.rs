@@ -773,13 +773,37 @@ fn create_wallet(context: &mut WalletContext, id: Value, params: &Value) -> Valu
         dry_run: false,
     };
 
-    match block_on(crate::wallet::create_json(
+    // Create and attach in one runtime over one client: see `create_and_bound_json_on`. This tool
+    // required budget and perTx and used to leave the wallet with no rules at all, so a caller who
+    // had just passed both limits held an unbounded cap. Found by driving it for a stake, which the
+    // no-rules guard then refused.
+    let outcome = block_on(crate::wallet::create_and_bound_json(
         &endpoint(context),
         keystore,
         &args,
         now_ms(),
-    )) {
-        Ok(Ok(report)) => tool_ok(id, report),
+    ));
+    match outcome {
+        Ok(Ok(crate::wallet::Bounded::Yes { report })) => tool_ok(id, report),
+        // Answered as an error, because an agent that reads a success here hands over a cap with no
+        // limit on it. The id is in the message: without it the funded wallet cannot be found.
+        Ok(Ok(crate::wallet::Bounded::CreatedButUnbounded {
+            wallet_id,
+            created,
+            why,
+        })) => {
+            tool_error(
+                id,
+                "created_but_unbounded",
+                &format!(
+                "The wallet {} was created and funded, but its rules were not attached, so it is \
+                 UNBOUNDED right now. Do not hand the cap to anything. Call rill_attach_rules with \
+                 that wallet, budget {budget} and perTx {per_tx}. Why: {why}\n\nWhat was \
+                 created: {created}",
+                wallet_id.as_deref().unwrap_or("(id not readable, see below)")
+            ),
+            )
+        }
         Ok(Err(failure)) => failure_response(context, id, "create_failed", &failure),
         Err(e) => failure_response(context, id, "create_failed", &Failure::Failed(e)),
     }

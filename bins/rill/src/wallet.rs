@@ -343,3 +343,80 @@ fn describe(manifest: &CapabilityManifest) -> Vec<String> {
         })
         .collect()
 }
+
+/// What creating a bounded wallet produced.
+#[derive(Debug)]
+pub enum Bounded {
+    /// Both transactions landed: the wallet exists and carries its rules.
+    Yes { report: Value },
+    /// The wallet exists and holds funds with no limit on them. Carried as its own outcome rather
+    /// than folded into an error, because the caller must be told the id of the thing that now
+    /// needs attaching, and an error that lost it would leave a funded unbounded wallet nobody can
+    /// find.
+    CreatedButUnbounded {
+        wallet_id: Option<String>,
+        created: Value,
+        why: String,
+    },
+}
+
+/// Mint a wallet and attach its rules, in two transactions over one client.
+///
+/// Two transactions because a wallet cannot have rules added in the transaction that shares it: the
+/// rule modules' `add` takes `&mut AgentWallet`, and a freshly shared object has no initial version
+/// a later command in the same transaction could name. One client because a tonic channel built in
+/// one runtime and used in another is already closed; this is the whole of the reason the two steps
+/// share a function rather than being called one after the other from the handler.
+pub async fn create_and_bound_json_on(
+    chain: &(impl SuiRead + SuiWrite),
+    keystore: &Keystore,
+    args: &CreateArgs,
+    now_ms: u64,
+) -> Result<Bounded, Failure> {
+    let created = create_json_on(chain, keystore, args, now_ms).await?;
+    let Some(wallet_id) = created["wallet"].as_str().map(str::to_owned) else {
+        return Ok(Bounded::CreatedButUnbounded {
+            wallet_id: None,
+            created,
+            why: "the new wallet's id could not be read from the transaction's effects".into(),
+        });
+    };
+
+    let rules = crate::rules_cmd::RulesArgs {
+        package_id: args.package_id.clone(),
+        version_id: args.version_id.clone(),
+        wallet_id: wallet_id.clone(),
+        manifest: args.manifest.clone(),
+        gas_budget: args.gas_budget,
+        dry_run: false,
+    };
+    match crate::rules_cmd::attach_json_on(chain, keystore, &rules).await {
+        Ok(attached) => {
+            let mut report = created;
+            report["rulesAttached"] = attached["rules"].clone();
+            report["attachDigest"] = attached["digest"].clone();
+            report["note"] = json!(
+                "Created, funded, and bounded: two transactions, both confirmed. The wallet carries \
+                 the rules this call was given, proved on chain against every spend. This cannot be \
+                 undone, and calling again mints and funds a second wallet."
+            );
+            Ok(Bounded::Yes { report })
+        }
+        Err(failure) => Ok(Bounded::CreatedButUnbounded {
+            wallet_id: Some(wallet_id),
+            created,
+            why: failure.to_string(),
+        }),
+    }
+}
+
+/// The same, against a real node, with the one client both steps share.
+pub async fn create_and_bound_json(
+    endpoint: &str,
+    keystore: &Keystore,
+    args: &CreateArgs,
+    now_ms: u64,
+) -> Result<Bounded, Failure> {
+    let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
+    create_and_bound_json_on(&chain, keystore, args, now_ms).await
+}

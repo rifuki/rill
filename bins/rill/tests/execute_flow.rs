@@ -1114,3 +1114,114 @@ fn the_whole_flow_runs_over_the_mcp_transport_against_testnet() {
         created["digest"], attached["digest"], spent["digest"]
     );
 }
+
+// ── create leaves a bounded wallet, or says loudly that it did not ──
+
+/// A chain that answers a create and then the attach that follows it.
+fn chain_for_create_then_attach(owner: &Keystore, agent: &Keystore) -> FakeSui {
+    chain_for_create(owner, agent).with_read_sequence(vec![
+        // What the new wallet carries before the attach, then after it.
+        type_names(&[]),
+        type_names(&["budget", "per_tx"]),
+    ])
+}
+
+/// Creating a wallet attaches the rules it was given, in a second transaction.
+///
+/// `rill_create_wallet` required budget and perTx and used to leave the wallet with no rules, so a
+/// caller who had just passed both limits held an unbounded cap. The second submitted transaction is
+/// decoded here, so this cannot pass on a report that merely claims the rules were attached.
+#[test]
+fn creating_a_wallet_attaches_its_rules_in_a_second_transaction() {
+    let owner = key(31);
+    let agent = key(32);
+    let chain = chain_for_create_then_attach(&owner, &agent);
+
+    let outcome = run(rill_cli::wallet::create_and_bound_json_on(
+        &chain,
+        &owner,
+        &create_args(&agent.address().to_string()),
+        now_ms(),
+    ))
+    .expect("the create and the attach both run");
+    let rill_cli::wallet::Bounded::Yes { report } = outcome else {
+        panic!("the wallet must come back bounded: {outcome:?}");
+    };
+
+    let submitted = chain.submitted();
+    assert_eq!(submitted.len(), 2, "one create, one attach");
+    let create = rill_policy::decode::decode(&submitted[0]).expect("the create decodes");
+    let attach = rill_policy::decode::decode(&submitted[1]).expect("the attach decodes");
+    assert_eq!(
+        create.targets,
+        vec![format!("{PACKAGE}::agent_wallet::create_wallet")]
+    );
+    assert_eq!(
+        attach.targets,
+        vec![
+            format!("{PACKAGE}::budget::add"),
+            format!("{PACKAGE}::per_tx::add"),
+        ],
+        "the second transaction must attach both rules the call was given"
+    );
+    assert!(report["attachDigest"].is_string(), "{report}");
+    assert!(
+        report["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bounded"),
+        "{report}"
+    );
+}
+
+/// When the attach fails, the wallet is reported as created and unbounded, with its id.
+///
+/// The funds have already moved when the second step fails, so this is not an ordinary error: the
+/// caller must be told which wallet now needs its rules, and must not be told it succeeded.
+#[test]
+fn a_failed_attach_reports_the_wallet_as_created_and_unbounded_with_its_id() {
+    let owner = key(33);
+    let agent = key(34);
+    // A rule list that does not decode, which the attach reads and the create does not.
+    let chain = chain_for_create(&owner, &agent).with_read_return(vec![0xff, 0xff]);
+
+    let outcome = run(rill_cli::wallet::create_and_bound_json_on(
+        &chain,
+        &owner,
+        &create_args(&agent.address().to_string()),
+        now_ms(),
+    ))
+    .expect("the create itself succeeds");
+    match outcome {
+        rill_cli::wallet::Bounded::CreatedButUnbounded { wallet_id, why, .. } => {
+            assert_eq!(
+                wallet_id.as_deref(),
+                Some(WALLET),
+                "the id must survive the failure"
+            );
+            assert!(!why.is_empty(), "and the reason must be carried");
+        }
+        other => panic!("a failed attach must not read as bounded: {other:?}"),
+    }
+    assert_eq!(
+        chain.submitted().len(),
+        1,
+        "the create landed and the attach never submitted"
+    );
+}
+
+/// Through the tool: a failed attach is an error named created_but_unbounded, carrying the id.
+#[test]
+fn the_tool_answers_a_failed_attach_as_an_error_naming_the_wallet() {
+    let source = shipped(STDIO);
+    let start = source.find("fn create_wallet(").expect("create_wallet");
+    let body = &source[start..start + source[start..].find("\nfn attach_rules(").expect("next fn")];
+    assert!(
+        body.contains("\"created_but_unbounded\""),
+        "a funded wallet with no rules must come back as a named error, not a success"
+    );
+    assert!(
+        body.contains("UNBOUNDED"),
+        "and the message must say so in words an agent will not skim past"
+    );
+}
