@@ -405,7 +405,7 @@ pub async fn swap_json(
     swap_json_on(&chain, keystore, args).await
 }
 
-fn encode(tx: &sui_sdk_types::Transaction) -> String {
+pub(crate) fn encode(tx: &sui_sdk_types::Transaction) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .encode(bcs::to_bytes(tx).expect("a built transaction encodes"))
@@ -414,7 +414,11 @@ fn encode(tx: &sui_sdk_types::Transaction) -> String {
 /// One owned object, read at the version the node holds.
 ///
 /// Takes the chain generically rather than `GrpcSui`, so this path can be driven against the fake.
-async fn owned_input(chain: &impl SuiRead, id: &str, label: &str) -> Result<ObjectInput, String> {
+pub(crate) async fn owned_input(
+    chain: &impl SuiRead,
+    id: &str,
+    label: &str,
+) -> Result<ObjectInput, String> {
     let summary = chain
         .get_object(id)
         .await

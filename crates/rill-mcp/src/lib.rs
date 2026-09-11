@@ -402,6 +402,35 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 })),
             ),
             destructive(
+                "rill_stake",
+                "Release SUI from an agent wallet and liquid-stake it with Haedal, in one \
+                 transaction, gated by the rules the wallet carries on chain. THIS SUBMITS A REAL \
+                 TRANSACTION and cannot be undone. The SUI is released by the contract against its \
+                 own rules, so a stake larger than a rule allows is refused by the chain and nothing \
+                 moves; read rill_wallet's largestSpendNow first. Haedal's minimum is 1 SUI and a \
+                 smaller amount is refused before anything is built. The haSUI Haedal mints goes to \
+                 this signer, not back to the wallet. There is no minOut: Haedal mints at its own \
+                 exchange rate, which a sandwich cannot move inside the transaction, and the report \
+                 shows what arrived. Do not retry a success: a second call stakes again.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": { "type": "string", "description": "The AgentWallet object id." },
+                        "cap": { "type": "string", "description": "The AgentCap this signer holds." },
+                        "amount": {
+                            "type": "string",
+                            "description": "Decimal SUI to release and stake, as text, never a number. At least \"1\"."
+                        },
+                        "validator": {
+                            "type": "string",
+                            "description": "Optional. The validator to delegate to. Omit it, or pass 0x0, to let Haedal choose, which is what its testnet deployment expects since it delegates to none of its own yet."
+                        }
+                    },
+                    "required": ["wallet", "cap", "amount"],
+                    "additionalProperties": false
+                })),
+            ),
+            destructive(
                 "rill_execute",
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope built \
                  elsewhere. Distinct from rill_spend, which builds locally: this is the path where \
@@ -503,6 +532,7 @@ mod tests {
             "rill_attach_rules",
             "rill_spend",
             "rill_swap",
+            "rill_stake",
             "rill_execute",
         ];
 

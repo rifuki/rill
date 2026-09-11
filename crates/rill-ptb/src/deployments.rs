@@ -69,6 +69,23 @@ pub const TESTNET_CETUS_INTEGRATE: &str =
 pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
     "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a";
 
+/// Haedal's package on testnet, the latest version and so the call target.
+///
+/// Not the type-defining package: the `Staking` object's type and haSUI's are both defined at
+/// `0x771b0ab9…`, the original. Calling the original rather than the latest runs code a later
+/// upgrade replaced, so the two are named separately. `interface::request_stake` was confirmed on
+/// this one by reading the deployed package.
+pub const TESTNET_HAEDAL_PACKAGE: &str =
+    "0x0a6ff2b974e08b65649d334c38db5ca046b78b4a5d892087740b9cdb3eb08e47";
+
+/// Haedal's shared `Staking` object on testnet. Read live: not paused, version 6.
+pub const TESTNET_HAEDAL_STAKING: &str =
+    "0xb399662ac5d3973256a1e8629a913336449a2baa16847502ce6bdbf4a0003f07";
+
+/// The haSUI coin type on testnet, so a report can say what arrived.
+pub const TESTNET_HASUI_TYPE: &str =
+    "0x771b0ab909f629d1b8ef68a62ba8e2074d8726804ac6b7e91b23cdc855117683::hasui::HASUI";
+
 /// Whether an address is the superseded deployment, so a caller can say so plainly instead of
 /// letting a Move abort explain it.
 pub fn is_superseded(package_id: &str) -> bool {

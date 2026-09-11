@@ -156,9 +156,21 @@ fn the_refusal_names_both_the_amount_and_the_floor() {
     assert!(message.contains(&MIN_STAKE_MIST.to_string()));
 }
 
+/// The stake is one call, and it is a call the deployed package actually has.
+///
+/// This used to assert only that the sequence had one entry, so it passed while that entry named
+/// `staking::request_stake`, which does not exist on the testnet package: nothing had ever submitted
+/// through the adapter, so nothing had noticed. What the package declares, read from the chain in
+/// `rill-chain/tests/haedal_signature.rs`, is `interface::request_stake(system_state, staking, coin,
+/// validator)` with no return value, and `staking::request_stake_coin` with the same arguments
+/// returning the haSUI coin. The adapter's contract is that haSUI goes to the sender, which is the
+/// first of those.
 #[test]
-fn the_stake_sequence_is_one_call() {
-    assert_eq!(expected_stake_targets(addr(0xad)).len(), 1);
+fn the_stake_sequence_is_one_call_to_a_function_that_exists() {
+    assert_eq!(
+        expected_stake_targets(addr(0xad)),
+        vec![format!("{}::interface::request_stake", addr(0xad))]
+    );
 }
 
 /// The composed flow the reference supports: swap output funds the stake.

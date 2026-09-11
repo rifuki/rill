@@ -235,6 +235,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_attach_rules" => attach_rules(context, id, &params),
         "rill_spend" => spend(context, id, &params),
         "rill_swap" => swap(context, id, &params),
+        "rill_stake" => stake(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
@@ -656,6 +657,59 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(Ok(result)) => tool_ok(id, result),
         Ok(Err(failure)) => failure_response(context, id, "swap_failed", &failure),
         Err(e) => failure_response(context, id, "swap_failed", &Failure::Failed(e)),
+    }
+}
+
+/// A Haedal liquid stake the wallet pays for, under its own rules.
+fn stake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so nothing can be signed.".to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    if context.network == "mainnet" && !context.mainnet_allowed {
+        let reason = rill_core::mainnet::mainnet_refusal();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "mainnet_not_opted_in", &reason);
+    }
+    let missing: Vec<&str> = ["wallet", "cap", "amount"]
+        .into_iter()
+        .filter(|name| argument(params, name).is_none_or(str::is_empty))
+        .collect();
+    if !missing.is_empty() {
+        return tool_error(
+            id,
+            "bad_request",
+            &format!("missing: {}", missing.join(", ")),
+        );
+    }
+    let get = |name: &str| argument(params, name).unwrap_or_default().to_string();
+    let validator = match get("validator") {
+        v if v.is_empty() => "0x0".to_string(),
+        v => v,
+    };
+    let args = crate::stake_cmd::StakeArgs {
+        package_id: package_id(),
+        version_id: version_id(),
+        wallet_id: get("wallet"),
+        cap_id: get("cap"),
+        haedal_package_id: std::env::var("HAEDAL_PACKAGE_ID")
+            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_HAEDAL_PACKAGE.to_string()),
+        staking_object_id: std::env::var("HAEDAL_STAKING_ID")
+            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_HAEDAL_STAKING.to_string()),
+        validator,
+        spend: get("amount"),
+        gas_budget: TOOL_GAS_BUDGET,
+        dry_run: false,
+    };
+    match block_on(crate::stake_cmd::stake_json(
+        &endpoint(context),
+        keystore,
+        &args,
+    )) {
+        Ok(Ok(result)) => tool_ok(id, result),
+        Ok(Err(failure)) => failure_response(context, id, "stake_failed", &failure),
+        Err(e) => failure_response(context, id, "stake_failed", &Failure::Failed(e)),
     }
 }
 

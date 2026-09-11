@@ -27,6 +27,7 @@ pub mod revoke_cmd;
 pub mod rules_cmd;
 pub mod runset;
 pub mod spend_cmd;
+pub mod stake_cmd;
 pub mod stdio;
 pub mod swap_cmd;
 pub mod verdict;

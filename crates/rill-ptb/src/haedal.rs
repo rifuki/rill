@@ -23,7 +23,10 @@ pub struct Stake {
     pub package_id: Address,
     /// Haedal's shared staking object.
     pub staking_object_id: Address,
-    /// Which validator to delegate to.
+    /// Which validator to delegate to. `0x0` means no preference: the SUI goes into Haedal's vault
+    /// and Haedal delegates it itself. Verified by a dry run against the testnet package, whose
+    /// Staking object delegates to no validator of its own yet, so `0x0` is what a caller who has not
+    /// chosen one should pass.
     pub validator: Address,
     /// How much SUI is being staked, in mist. Used for the floor check; the coin carries the value.
     pub amount_mist: u64,
@@ -90,8 +93,18 @@ pub fn request_stake(
     let staking = tx.object(shared.input(stake.staking_object_id, true)?);
     let validator = tx.pure(&stake.validator);
 
+    // `interface::request_stake`, not `staking::request_stake`. The second is what this adapter
+    // called until something first read the deployed package, and it does not exist there: the
+    // node would have refused every stake with "function not found" the first time anyone
+    // submitted one. `staking::request_stake_coin` takes the same four arguments and returns the
+    // haSUI coin instead; `interface::request_stake` sends it to the sender and returns nothing,
+    // which is the contract this function documents.
     tx.move_call(
-        Function::new(stake.package_id, ident("staking")?, ident("request_stake")?),
+        Function::new(
+            stake.package_id,
+            ident("interface")?,
+            ident("request_stake")?,
+        ),
         vec![system_state, staking, sui_coin, validator],
     );
     Ok(())
@@ -99,5 +112,5 @@ pub fn request_stake(
 
 /// The target a stake emits, for the signer's pinned sequence.
 pub fn expected_stake_targets(package_id: Address) -> Vec<String> {
-    vec![format!("{package_id}::staking::request_stake")]
+    vec![format!("{package_id}::interface::request_stake")]
 }
