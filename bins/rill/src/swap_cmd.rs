@@ -44,6 +44,22 @@ pub struct SwapArgs {
     pub a2b: bool,
     /// The SUI to release from the wallet and swap, in decimal SUI.
     pub spend: String,
+    /// The least the bought coin may hold for this swap to be allowed to land, in that coin's base
+    /// units.
+    ///
+    /// Base units rather than a decimal string, unlike `spend`: the bought coin's decimals are a
+    /// property of a token this command never reads, and a decimal floor would have to guess them.
+    /// Guessing nine where the token uses six states a floor a thousand times too low and reads as
+    /// protection.
+    pub min_out_base_units: String,
+    /// The deployed `rill_guard` package that carries `assert_min_value`.
+    pub guard_package_id: String,
+    /// Send the swap with no floor at all, accepting whatever the pool returns.
+    ///
+    /// Exists so that an unprotected swap is a thing a caller said rather than a thing that happens
+    /// when a field is left out. The report names it, so the absence of protection is visible after
+    /// the fact and not only before it.
+    pub accept_any_output: bool,
     pub gas_budget: u64,
     pub dry_run: bool,
 }
@@ -59,6 +75,7 @@ pub fn expected_targets(
     package_id: Address,
     rule_modules: &[String],
     integrate_package_id: Address,
+    guard: Option<Address>,
 ) -> Vec<String> {
     let mut targets = vec![format!("{package_id}::agent_wallet::request_spend")];
     for module in rule_modules {
@@ -66,6 +83,11 @@ pub fn expected_targets(
     }
     targets.push(format!("{package_id}::agent_wallet::confirm_spend"));
     targets.extend(rill_ptb::cetus::expected_swap_targets(integrate_package_id));
+    // Last, because the floor reads the coin the swap produced. `transfer_objects` follows it and is
+    // not a Move call, so nothing comes after this in the target list.
+    if let Some(guard) = guard {
+        targets.push(rill_ptb::guard::guard_target(guard));
+    }
     targets
 }
 
@@ -107,6 +129,33 @@ pub async fn swap_json_on(
 
     let spend_mist = rill_core::amounts::decimal_to_base_units(&args.spend, 9)
         .map_err(|e| format!("the spend amount: {e}"))?;
+
+    // The floor, resolved before any object is read, so a swap that was never going to be allowed
+    // costs no round trips. Zero is not a floor: the guard would emit nothing and the transaction
+    // would carry no bound, which is the one outcome a caller must not reach by omission.
+    let min_out = rill_core::amounts::parse_u64_string(&args.min_out_base_units)
+        .map_err(|e| format!("the minimum output: {e}"))?;
+    if min_out == 0 && !args.accept_any_output {
+        // `Failed`, not `Refused`: `Refused` means a rule on the wallet stopped this, and an agent
+        // that cannot tell a missing argument from a policy decision retries the policy decision.
+        return Err(Failure::Failed(
+            "minOut is zero, so this swap would accept any output including none. The wallet's \
+             rules bound what goes into the swap and nothing bounds what comes back, so a thin pool \
+             or a sandwich returns dust and the transaction still succeeds. Set minOut to the least \
+             the bought coin may hold, in that coin's base units, or pass acceptAnyOutput to send it \
+             unprotected on purpose."
+                .to_string(),
+        ));
+    }
+    let guard_package: Option<Address> = if min_out == 0 {
+        None
+    } else {
+        Some(
+            args.guard_package_id
+                .parse()
+                .map_err(|_| "the guard package id is not an address".to_string())?,
+        )
+    };
 
     // Every shared object this touches, at the initial version the node reports. Read, never assumed.
     let mut shared = SharedObjects::new();
@@ -234,6 +283,24 @@ pub async fn swap_json_on(
     )
     .map_err(|e| e.to_string())?;
 
+    // The floor, on the coin the swap bought, before it goes anywhere. The wallet's rules bound what
+    // entered the swap; nothing in them bounds what came back out, and `sqrt_price_limit` cannot:
+    // the only value that does not abort inside Cetus on the funded side is the extreme one. So this
+    // is the bound, and it is a Move call the node enforces rather than a check in this process.
+    let bought_type = if args.a2b {
+        &args.coin_type_b
+    } else {
+        &args.coin_type_a
+    };
+    let floor = rill_ptb::guard::assert_min_value(
+        &mut tx,
+        guard_package,
+        out.output(),
+        bought_type,
+        min_out,
+    )
+    .map_err(|e| e.to_string())?;
+
     // Both, to the agent. The output is what it bought; the residual is what the swap did not spend,
     // and leaving either aborts the transaction.
     let to = tx.pure(&sender);
@@ -256,12 +323,23 @@ pub async fn swap_json_on(
         "pool": args.pool_id,
         "a2b": args.a2b,
         "rulesProved": modules,
+        "minOutBaseUnits": min_out.to_string(),
+        // From the builder's own return rather than from `min_out`, so the report cannot say
+        // "enforced" about a call that was not emitted.
+        "slippageFloor": match floor {
+            rill_ptb::guard::GuardOutcome::Enforced => "enforced",
+            rill_ptb::guard::GuardOutcome::NotRequested => "none",
+        },
         "callSequence": expected_targets(
             args.package_id
                 .parse()
                 .map_err(|_| "the package id is not an address".to_string())?,
             &modules,
             integrate,
+            match floor {
+                rill_ptb::guard::GuardOutcome::Enforced => guard_package,
+                rill_ptb::guard::GuardOutcome::NotRequested => None,
+            },
         ),
         "simulation": { "ok": true, "gasEstimate": simulated.gas_used_mist },
     });

@@ -299,6 +299,15 @@ fn version_id() -> String {
         .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET_VERSION.to_string())
 }
 
+/// The deployed `rill_guard` package, which carries the slippage floor every swap passes through.
+///
+/// Defaulted like the pair above rather than asked for: a caller that had to supply it could supply
+/// nothing, and a swap with no floor is exactly the outcome the floor exists to prevent.
+fn guard_package_id() -> String {
+    std::env::var("RILL_GUARD_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_RILL_GUARD.to_string())
+}
+
 /// Milliseconds since the epoch, for an expiry the contract compares against its own clock.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -517,6 +526,14 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         coin_type_b: get("coinTypeB"),
         a2b: a2b.unwrap_or(false),
         spend: get("amount"),
+        min_out_base_units: get("minOut"),
+        guard_package_id: guard_package_id(),
+        // Absent is false, so an unprotected swap needs the caller to have said the word.
+        accept_any_output: params
+            .get("arguments")
+            .and_then(|a| a.get("acceptAnyOutput"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         gas_budget: TOOL_GAS_BUDGET,
         dry_run: false,
     };

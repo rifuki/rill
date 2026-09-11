@@ -353,8 +353,27 @@ budget, the per-transaction cap, the rate limit and the time window are held by 
 and proved on chain against the real transaction. Nothing on chain checks a destination, a
 protocol, an asset, or a recipient: protocol scope, asset scope and recipient allowlist are
 pre-flight, enforced by this signer refusing to sign, and they exist only where a run-set gives it
-something to refuse against. The slippage floor is enforced by the signer refusing to sign an
-envelope whose guard call does not match, and by the chain aborting when the floor is breached.
+something to refuse against. The slippage floor is enforced by the chain: `rill_swap` emits
+`rill_guard::guard::assert_min_value` on the coin the swap bought, before that coin goes anywhere, so
+a fill below `minOut` aborts the whole transaction and the wallet keeps its SUI. The signer's pinned
+sequence carries that call too, so an envelope that dropped it does not match.
+
+`minOut` is required rather than defaulted. A swap with no floor is possible, by passing
+`acceptAnyOutput`, and the report then records the swap as unprotected: the wallet's rules cap what
+goes into a swap and nothing in them caps what comes back, so an omitted floor is the one outcome
+that must not be reachable by leaving a field out. Demonstrated on testnet against the same pool, the
+same 0.001 SUI, minutes apart as the pool moved under the trades:
+
+| `minOut` | fill | outcome |
+|---|---|---|
+| 1 | 2385069108722 | landed, [`9dxeS1ar`](https://suiscan.xyz/testnet/tx/9dxeS1arroyDjUtViug2eUHT4VqjALoDW7Sk3fbqBdnj) |
+| 1192534554361 | 1788988573564 | landed, [`7UnEyZLA`](https://suiscan.xyz/testnet/tx/7UnEyZLAMxoR2u4ii9pRb6D7oBbyDshT1awRwptm49VA) |
+| 1900000000000 | would have been ~1.79e12 | refused, `E_SLIPPAGE` at the guard |
+| 23850691087220 | n/a | refused, `E_SLIPPAGE` at the guard |
+
+The third row is the one worth reading: a floor six percent above the fill that actually cleared is
+refused, so the floor discriminates at the margin a sandwich works in and not only at absurd
+values.
 Every rule the wallet read returns carries its layer, computed per rule by the one producer
 (`RuleKind::enforcement` in `rill-core`) and never written as a constant; a test reads the source
 and fails if one appears.

@@ -23,6 +23,7 @@ const WALLET: &str = "0x00000000000000000000000000000000000000000000000000000000
 const CAP: &str = "0x0000000000000000000000000000000000000000000000000000000000000cab";
 const COIN: &str = "0x000000000000000000000000000000000000000000000000000000000000000a";
 const INTEGRATE: &str = "0x00000000000000000000000000000000000000000000000000000000000000ce";
+const GUARD: &str = "0x000000000000000000000000000000000000000000000000000000000000dead";
 const GLOBAL_CONFIG: &str = "0x0000000000000000000000000000000000000000000000000000000000000030";
 const POOL: &str = "0x0000000000000000000000000000000000000000000000000000000000000031";
 // The id the code asks for, literally. `rill_ptb::spend::CLOCK_ID` is "0x6", and the fake matches
@@ -121,6 +122,9 @@ fn args(spend: &str, a2b: bool) -> SwapArgs {
         coin_type_b: COIN_B.into(),
         a2b,
         spend: spend.into(),
+        min_out_base_units: "1".into(),
+        guard_package_id: GUARD.into(),
+        accept_any_output: false,
         gas_budget: 50_000_000,
         dry_run: false,
     }
@@ -135,6 +139,7 @@ fn the_call_sequence_is_the_gated_spend_then_the_swap() {
         PACKAGE.parse().expect("a package id"),
         &["budget".to_string(), "per_tx".to_string()],
         INTEGRATE.parse().expect("an integrate id"),
+        Some(GUARD.parse().expect("a guard id")),
     );
     assert_eq!(
         targets,
@@ -146,6 +151,10 @@ fn the_call_sequence_is_the_gated_spend_then_the_swap() {
             "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero"
                 .to_string(),
             format!("{INTEGRATE}::router::swap"),
+            // The floor reads the coin the swap produced, so it is last. A sequence that ended at
+            // the swap would be one where the agent's SUI is gone and nothing checked what replaced
+            // it.
+            format!("{GUARD}::guard::assert_min_value"),
         ]
     );
 }
@@ -387,4 +396,142 @@ fn no_gated_path_can_spend_from_a_wallet_with_no_rules() {
     let mut tx = TransactionBuilder::new();
     build_gated_spend_for_modules(&mut tx, &binding, 1_000_000, &["budget"], &shared)
         .expect("one attached rule builds");
+}
+
+/// A swap sends the bought coin through `assert_min_value` before it goes anywhere, and the proof
+/// is the transaction, not the report.
+///
+/// Decoded from the bytes the signer actually handed over. An earlier version of this test asserted
+/// the target appeared in `expected_targets`, and it passed with the emission deleted: a pure
+/// function describing a transaction is not the transaction. So is the report, whose `slippageFloor`
+/// is computed from the same value it is supposed to be evidence for.
+#[test]
+fn the_transaction_really_carries_the_floor_after_the_swap() {
+    let agent = key(12);
+    let chain = chain(&agent, &["budget"]);
+    let report = run(swap_json_on(&chain, &agent, &args("0.001", false)))
+        .expect("the swap builds and submits");
+    assert_eq!(report["submitted"], true);
+
+    let submitted = chain.submitted();
+    let bytes = submitted.first().expect("one transaction was submitted");
+    let decoded = rill_policy::decode::decode(bytes).expect("the submitted bytes decode");
+
+    let guard = format!("{GUARD}::guard::assert_min_value");
+    let at = decoded
+        .targets
+        .iter()
+        .position(|t| *t == guard)
+        .unwrap_or_else(|| panic!("no floor in the transaction itself: {:?}", decoded.targets));
+    let swap_at = decoded
+        .targets
+        .iter()
+        .position(|t| t.ends_with("::router::swap"))
+        .expect("the swap is in the transaction");
+    assert!(
+        at > swap_at,
+        "the floor must read the coin the swap produced, so it comes after it: {:?}",
+        decoded.targets
+    );
+}
+
+/// The sequence the signer pins is the sequence the transaction contains, exactly.
+///
+/// This is the assertion that makes `expected_targets` worth having: it is a second derivation of
+/// the same fact, and two derivations are only useful while they agree. A drift between them means
+/// the signer pins a call the transaction does not make, or misses one it does.
+#[test]
+fn the_pinned_sequence_equals_what_the_transaction_actually_calls() {
+    let agent = key(12);
+    let chain = chain(&agent, &["budget", "per_tx"]);
+    let report = run(swap_json_on(&chain, &agent, &args("0.001", false)))
+        .expect("the swap builds and submits");
+
+    let claimed: Vec<String> = report["callSequence"]
+        .as_array()
+        .expect("a sequence")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    let submitted = chain.submitted();
+    let decoded = rill_policy::decode::decode(submitted.first().expect("a transaction"))
+        .expect("the submitted bytes decode");
+    assert_eq!(
+        claimed, decoded.targets,
+        "the pinned sequence and the transaction must not drift"
+    );
+}
+
+/// A swap with no floor and no explicit acceptance of that is refused before anything is built.
+#[test]
+fn a_swap_with_no_floor_is_refused_rather_than_sent_unprotected() {
+    let agent = key(7);
+    let chain = chain(&agent, &["budget"]);
+    let mut a = args("0.001", false);
+    a.min_out_base_units = "0".into();
+    let err = run(swap_json_on(&chain, &agent, &a)).expect_err("a floorless swap must be refused");
+    let said = format!("{err:?}");
+    assert!(
+        said.contains("minOut") || said.contains("min-out") || said.contains("floor"),
+        "the refusal must name the floor so a caller knows what to set: {said}"
+    );
+    assert!(
+        chain.submitted().is_empty(),
+        "and it must refuse before submitting, not after"
+    );
+}
+
+/// The opt-out works, the transaction really carries no floor, and the report says so.
+///
+/// Refusing outright would make the tool unusable against a pool whose output decimals a caller
+/// cannot determine. Reporting "none" while emitting a guard, or the reverse, would be worse than
+/// either: both halves are checked against the bytes.
+#[test]
+fn an_explicitly_unprotected_swap_is_allowed_and_is_really_unprotected() {
+    let agent = key(7);
+    let chain = chain(&agent, &["budget"]);
+    let mut a = args("0.001", false);
+    a.min_out_base_units = "0".into();
+    a.accept_any_output = true;
+    let report =
+        run(swap_json_on(&chain, &agent, &a)).expect("an acknowledged floorless swap runs");
+    assert_eq!(
+        report["slippageFloor"],
+        serde_json::json!("none"),
+        "an unprotected swap must be legible as one in its own report: {report}"
+    );
+
+    let submitted = chain.submitted();
+    let decoded = rill_policy::decode::decode(submitted.first().expect("a transaction"))
+        .expect("the submitted bytes decode");
+    assert!(
+        !decoded
+            .targets
+            .iter()
+            .any(|t| t.contains("assert_min_value")),
+        "no floor was asked for, so none may be in the transaction: {:?}",
+        decoded.targets
+    );
+    let claimed: Vec<String> = report["callSequence"]
+        .as_array()
+        .expect("a sequence")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        claimed, decoded.targets,
+        "and the pinned sequence must match the unprotected transaction too"
+    );
+}
+
+/// A floor that is set is reported with the value that was asked for.
+#[test]
+fn the_floor_value_is_reported_as_given() {
+    let agent = key(7);
+    let chain = chain(&agent, &["budget"]);
+    let mut a = args("0.001", false);
+    a.min_out_base_units = "12345".into();
+    let report = run(swap_json_on(&chain, &agent, &a)).expect("a floored swap runs");
+    assert_eq!(report["slippageFloor"], serde_json::json!("enforced"));
+    assert_eq!(report["minOutBaseUnits"], serde_json::json!("12345"));
 }

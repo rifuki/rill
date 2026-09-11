@@ -325,7 +325,10 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                  returns two coins, the one it bought and whatever it did not spend, and both are \
                  sent to this signer. The price bound is derived from the direction rather than \
                  taken from you: a bound on the wrong side aborts inside Cetus with a code that \
-                 names nothing. Do not retry a success: a second call swaps again.",
+                 names nothing. minOut is the bound that matters and you must supply it: the \
+                 wallet's rules cap what goes into the swap and nothing in them caps what comes \
+                 back, so without a floor a thin pool or a sandwich returns dust and the \
+                 transaction still succeeds. Do not retry a success: a second call swaps again.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -346,9 +349,17 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         "a2b": {
                             "type": "boolean",
                             "description": "True to spend coin A and buy B. The wallet releases SUI, so set this to whichever side SUI is not."
+                        },
+                        "minOut": {
+                            "type": "string",
+                            "description": "The least the bought coin may hold for this swap to land, in that coin's BASE UNITS, as text. Base units and not a decimal, because the bought token's decimals are not read here: \"1000000\" is 1.0 of a six-decimal token and 0.001 of a nine-decimal one. An on-chain assertion checks the coin against this after the swap, so a worse fill aborts the whole transaction and the wallet keeps its SUI. Compute it from the quote you priced the swap against, minus the slippage you are willing to accept."
+                        },
+                        "acceptAnyOutput": {
+                            "type": "boolean",
+                            "description": "Send the swap with no floor at all, accepting whatever the pool returns. Only with minOut \"0\", and only when you mean it: the report records the swap as unprotected. Omit it and a zero minOut is refused instead."
                         }
                     },
-                    "required": ["wallet", "cap", "amount", "pool", "integratePackage", "globalConfig", "coinTypeA", "coinTypeB", "a2b"],
+                    "required": ["wallet", "cap", "amount", "pool", "integratePackage", "globalConfig", "coinTypeA", "coinTypeB", "a2b", "minOut"],
                     "additionalProperties": false
                 })),
             ),
