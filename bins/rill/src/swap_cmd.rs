@@ -349,7 +349,17 @@ pub async fn swap_json_on(
                 rill_ptb::guard::GuardOutcome::NotRequested => None,
             },
         ),
-        "simulation": { "ok": true, "gasEstimate": simulated.gas_used_mist },
+        "simulation": {
+            "ok": true,
+            "gasEstimate": simulated.gas_used_mist,
+            // What the node says this swap produces, from running Cetus's own code rather than
+            // approximating it here. This is the figure a floor should be derived from.
+            "balanceChanges": simulated
+                .balance_changes
+                .iter()
+                .map(|c| json!({ "coinType": c.coin_type, "amount": c.amount }))
+                .collect::<Vec<Value>>(),
+        },
     });
 
     if args.dry_run {

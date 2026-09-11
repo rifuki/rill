@@ -22,6 +22,7 @@ pub mod keystore;
 pub mod limits;
 pub mod manager_cmd;
 pub mod order_cmd;
+pub mod quote_cmd;
 pub mod revoke_cmd;
 pub mod rules_cmd;
 pub mod runset;

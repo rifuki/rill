@@ -10,13 +10,15 @@ rill-chain = { workspace = true }
 sui-transaction-builder = { workspace = true }
 sui-sdk-types = { workspace = true }
 thiserror = { workspace = true }
+# The node reports a pool's fields as JSON and `rill-chain` already hands them over as a
+# `serde_json::Value`, so parsing one here adds no dependency the graph did not already carry.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
 # Only the submitting live test signs. A dev dependency, so it stays out of rill-server's production
 # graph, which CI asserts in both directions.
 sui-crypto = { workspace = true }
-serde_json = { workspace = true }
 bcs = "0.1"
 tokio = { workspace = true, features = ["macros", "rt"] }
 rill-chain = { workspace = true }

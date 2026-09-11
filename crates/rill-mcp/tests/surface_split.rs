@@ -79,9 +79,37 @@ fn every_signing_tool_is_on_the_signer_and_none_on_the_builder() {
         .collect();
     assert_eq!(
         other,
-        vec!["rill_status".to_string(), "rill_wallet".to_string()],
-        "the signer's non-signing tools are status and the wallet read; a new name here is either a \
-         signing tool missing from SIGNING_TOOLS or a capability the builder should also expose"
+        vec![
+            "rill_quote".to_string(),
+            "rill_status".to_string(),
+            "rill_wallet".to_string()
+        ],
+        "the signer's non-signing tools are status, the wallet read and the swap quote; a new name \
+         here is either a signing tool missing from SIGNING_TOOLS or a capability the builder should \
+         also expose"
+    );
+}
+
+/// `rill_quote` is on the signer and deliberately not on the builder.
+///
+/// It needs no key, so keylessness is not the reason. The reason is that it exists to answer
+/// `rill_swap`'s `minOut`, `rill_swap` is on the signer, and the builder does not build swaps at all:
+/// it builds DeepBook orders, whose price is the order's own. Offering the quote there would
+/// advertise a number for a call that transport cannot make. If the builder ever gains a swap, this
+/// test is the place that says to move it.
+#[test]
+fn the_quote_sits_with_the_swap_it_answers_for() {
+    let wallet = by_name(Surface::Wallet);
+    let actions = by_name(Surface::Actions);
+    assert!(wallet.contains_key("rill_quote"));
+    assert!(wallet.contains_key("rill_swap"));
+    assert!(
+        !actions.contains_key("rill_quote"),
+        "the builder has no swap to quote for"
+    );
+    assert!(
+        !actions.contains_key("rill_swap"),
+        "and the premise of that is that the swap is not there either"
     );
 }
 

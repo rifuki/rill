@@ -21,6 +21,16 @@ use crate::{
 pub enum SimulationBehavior {
     /// Succeeds, reporting this gas cost.
     Succeeds { gas_used_mist: u64 },
+    /// Succeeds and reports these balance changes.
+    ///
+    /// A separate variant rather than a field on `Succeeds`, which every other test constructs and
+    /// none of them cares about balances. It exists because a simulation's balance changes are not a
+    /// detail of one report: `rill_quote` derives a swap's whole expected output from them, so a fake
+    /// that could not express them left that path testable only against a live node.
+    SucceedsWithBalances {
+        gas_used_mist: u64,
+        balance_changes: Vec<BalanceDelta>,
+    },
     /// Fails with this error, classified the way the real classifier would classify it.
     Fails { error: String },
     /// The node read the transaction and refused to run it: a gas coin at a version that has
@@ -260,6 +270,18 @@ impl SuiRead for FakeSui {
                 error: None,
                 gas_used_mist,
                 balance_changes: Vec::new(),
+                command_output_count: 0,
+                command_returns: Vec::new(),
+            }),
+            SimulationBehavior::SucceedsWithBalances {
+                gas_used_mist,
+                balance_changes,
+            } => Ok(SimulationOutcome {
+                ok: true,
+                verification: Verification::Verified,
+                error: None,
+                gas_used_mist,
+                balance_changes,
                 command_output_count: 0,
                 command_returns: Vec::new(),
             }),

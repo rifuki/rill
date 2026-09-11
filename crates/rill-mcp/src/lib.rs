@@ -204,15 +204,53 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                  scope and recipient allowlist are pre-flight rules: this signer enforces them by \
                  refusing to sign, and they are listed from the loaded run-set, if one is loaded. \
                  Nothing on the chain checks a destination, a protocol, an asset or a recipient. \
-                 The slippage floor is pre-flight too, and enforced twice: this signer refuses to \
-                 sign an envelope whose guard call does not match, and the chain aborts if the \
-                 floor is breached once it runs.",
+                 A swap's slippage floor is neither: rill_swap emits it as a Move call on the coin \
+                 the swap bought, so the chain aborts on a bad fill. Read largestSpendNow first: it \
+                 is the biggest single spend this wallet allows right now and names the limit \
+                 holding it, so a spend that would be refused need not be attempted.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
                         "wallet": { "type": "string", "description": "The AgentWallet object id." }
                     },
                     "required": ["wallet"],
+                    "additionalProperties": false
+                })),
+            ),
+            // The read that makes rill_swap's minOut answerable.
+            //
+            // Requiring a floor and leaving a caller no way to compute one is how a required field
+            // becomes a guess. An agent has no price source of its own, so without this the honest
+            // choices were to guess the floor or escape it with acceptAnyOutput, and the second is
+            // the outcome the floor exists to prevent.
+            read_only(
+                "rill_quote",
+                "What a swap would return at the pool's price right now, and the minOut to pass to \
+                 rill_swap. Call this immediately before rill_swap: it reads the pool, so it also \
+                 answers the things you would otherwise have to be told, and `swapArguments` in the \
+                 result is the rest of that call ready to pass through. The coin types and the \
+                 direction come from the pool itself, so they cannot be given the wrong way round. \
+                 The estimate is the price at a single tick: a swap large enough to cross a tick \
+                 boundary fills worse, and a pool that moves between this read and the swap fills \
+                 differently again, which is what the floor is for. If a swap is refused with \
+                 E_SLIPPAGE, widen slippageBps and quote again; do not remove the floor. This reads \
+                 only and submits nothing.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "wallet": { "type": "string", "description": "The AgentWallet that would fund the swap. A quote simulates the gated spend, so it needs this." },
+                        "cap": { "type": "string", "description": "The AgentCap this signer holds for that wallet." },
+                        "pool": { "type": "string", "description": "The Cetus pool object id. One side of it must be SUI, since that is what an agent wallet releases. The coin types and the direction are read from the pool, so you do not supply them." },
+                        "amount": {
+                            "type": "string",
+                            "description": "Decimal SUI to be released and swapped, as text, never a number. \"0.001\", not 0.001."
+                        },
+                        "slippageBps": {
+                            "type": "string",
+                            "description": "How far below the quote the floor should sit, in basis points, as text. \"100\" is one percent. Defaults to \"100\". Widen it for a thin pool or a large trade rather than dropping the floor."
+                        }
+                    },
+                    "required": ["wallet", "cap", "pool", "amount"],
                     "additionalProperties": false
                 })),
             ),
@@ -341,9 +379,9 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         "pool": { "type": "string", "description": "The Cetus pool object id." },
                         "integratePackage": {
                             "type": "string",
-                            "description": "Cetus's integrate package, where router::swap lives."
+                            "description": "Optional. Cetus's integrate package, where router::swap lives. Defaults to the deployment for this network, so omit it unless you are pointing at another one."
                         },
-                        "globalConfig": { "type": "string", "description": "Cetus's GlobalConfig object id." },
+                        "globalConfig": { "type": "string", "description": "Optional. Cetus's GlobalConfig object id. Defaults like integratePackage." },
                         "coinTypeA": { "type": "string", "description": "The pool's coin A type, in the pool's own order." },
                         "coinTypeB": { "type": "string", "description": "The pool's coin B type." },
                         "a2b": {
@@ -359,7 +397,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                             "description": "Send the swap with no floor at all, accepting whatever the pool returns. Only with minOut \"0\", and only when you mean it: the report records the swap as unprotected. Omit it and a zero minOut is refused instead."
                         }
                     },
-                    "required": ["wallet", "cap", "amount", "pool", "integratePackage", "globalConfig", "coinTypeA", "coinTypeB", "a2b", "minOut"],
+                    "required": ["wallet", "cap", "amount", "pool", "coinTypeA", "coinTypeB", "a2b", "minOut"],
                     "additionalProperties": false
                 })),
             ),

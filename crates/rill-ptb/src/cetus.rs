@@ -255,6 +255,85 @@ pub fn swap(
 }
 
 /// The target a swap emits, for the signer's pinned sequence.
+/// The two coin types out of a pool's own object type.
+///
+/// `0x5372...::pool::Pool<0xbcd2...::h::H, 0x2::sui::SUI>` yields those two in the pool's own order,
+/// which is the order every Cetus argument wants them in. Reading them from the pool means a caller
+/// does not have to know them, and cannot get them the wrong way round: a swap with the types
+/// transposed aborts inside Cetus with a type-mismatch that names neither coin.
+pub fn pool_coin_types(object_type: &str) -> Option<(String, String)> {
+    let inner = object_type.split_once('<')?.1.strip_suffix('>')?;
+    // Split on the top-level comma only. A coin type can itself be generic, so counting depth is the
+    // difference between two types and a mangled pair.
+    let mut depth = 0usize;
+    for (i, c) in inner.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                let (a, b) = (inner[..i].trim(), inner[i + 1..].trim());
+                if a.is_empty() || b.is_empty() {
+                    return None;
+                }
+                return Some((a.to_string(), b.to_string()));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A pool's own state: the context a caller needs about where it is trading.
+///
+/// Not a quote. An earlier version of this file computed one from `current_sqrt_price` with a
+/// constant-price formula, and it was measured against real fills on testnet at 11% high, then 36%
+/// high once the pool had moved. The number a floor is derived from comes from simulating the actual
+/// swap, which runs Cetus's own code and matched a real fill exactly, to the base unit. These fields
+/// are still worth reading: they say whether the pool is paused, how much liquidity is behind the
+/// price, and what fee it charges, none of which a simulation reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolState {
+    /// Q64.64 square root of the price of A in terms of B.
+    pub current_sqrt_price: u128,
+    /// Cetus's fee, in millionths: 2500 is 0.25%.
+    pub fee_rate: u64,
+    pub liquidity: u128,
+    /// A paused pool refuses every swap, so a quote from one is an answer to a question that cannot
+    /// be asked.
+    pub is_paused: bool,
+}
+
+/// A pool's state out of the object fields the node returned.
+///
+/// Every integer arrives as text, for the same reason every other u64 here does. `tick_spacing` and
+/// `current_tick_index` come back as JSON numbers and are not read: nothing in a quote needs them,
+/// and a field this does not use is a field it cannot misparse.
+pub fn pool_state(fields: &serde_json::Value) -> Result<PoolState, String> {
+    let u128_at = |key: &str| -> Result<u128, String> {
+        match fields.get(key) {
+            Some(serde_json::Value::String(s)) => s
+                .parse()
+                .map_err(|_| format!("the pool's `{key}` is not an integer: {s}")),
+            Some(serde_json::Value::Number(n)) => n
+                .as_u64()
+                .map(u128::from)
+                .ok_or_else(|| format!("the pool's `{key}` is not a whole number: {n}")),
+            Some(other) => Err(format!("the pool's `{key}` is not a number: {other}")),
+            None => Err(format!("the pool object has no `{key}` field")),
+        }
+    };
+    Ok(PoolState {
+        current_sqrt_price: u128_at("current_sqrt_price")?,
+        fee_rate: u64::try_from(u128_at("fee_rate")?)
+            .map_err(|_| "the pool's `fee_rate` does not fit a u64".to_string())?,
+        liquidity: u128_at("liquidity")?,
+        is_paused: fields
+            .get("is_pause")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or("the pool object has no `is_pause` field")?,
+    })
+}
+
 pub fn expected_swap_targets(integrate_package_id: Address) -> Vec<String> {
     vec![
         "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero"

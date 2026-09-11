@@ -230,12 +230,110 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     match name {
         "rill_status" => status(context, id),
         "rill_wallet" => wallet(context, id, &params),
+        "rill_quote" => quote(context, id, &params),
         "rill_create_wallet" => create_wallet(context, id, &params),
         "rill_attach_rules" => attach_rules(context, id, &params),
         "rill_spend" => spend(context, id, &params),
         "rill_swap" => swap(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
+    }
+}
+
+/// What a swap would return, and the floor to ask for.
+///
+/// A read: no key, no transaction, nothing submitted. It exists because `rill_swap` requires
+/// `minOut` and a caller with no price source would otherwise have to guess it or escape it.
+fn quote(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let pool = match argument(params, "pool") {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => {
+            return tool_error(
+                id,
+                "bad_request",
+                "pool is required: the Cetus pool object id to quote against.",
+            )
+        }
+    };
+    let amount = match argument(params, "amount") {
+        Some(a) if !a.is_empty() => a.to_string(),
+        _ => {
+            return tool_error(
+                id,
+                "bad_request",
+                "amount is required: decimal SUI to be released and swapped, as text.",
+            )
+        }
+    };
+    // One percent unless asked otherwise. A default is right here and would be wrong for `minOut`
+    // itself: a default floor would be a number nobody chose applied to a real trade, whereas a
+    // default tolerance is a starting point the caller can see in the result and widen.
+    let slippage_bps = match argument(params, "slippageBps") {
+        Some(raw) if !raw.is_empty() => match raw.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                return tool_error(
+                    id,
+                    "bad_request",
+                    &format!(
+                        "slippageBps must be a whole number of basis points, as text: {raw:?}"
+                    ),
+                )
+            }
+        },
+        _ => 100,
+    };
+
+    // The signer's own key is the sender of the simulated transaction, so a quote needs one for the
+    // same reason a swap does: the gated spend it simulates is the agent's.
+    let Some(keystore) = context.keystore.as_ref() else {
+        let reason = "No signing key is configured, so the gated swap a quote simulates has no \
+                      sender."
+            .to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "no_key", &reason);
+    };
+    let Some(wallet) = argument(params, "wallet").filter(|w| !w.is_empty()) else {
+        return tool_error(
+            id,
+            "bad_request",
+            "wallet is required: a quote simulates the gated spend, so it needs the wallet that \
+             would fund it.",
+        );
+    };
+    let Some(cap) = argument(params, "cap").filter(|c| !c.is_empty()) else {
+        return tool_error(
+            id,
+            "bad_request",
+            "cap is required: the AgentCap this signer holds for that wallet.",
+        );
+    };
+
+    let args = crate::quote_cmd::QuoteArgs {
+        package_id: package_id(),
+        version_id: version_id(),
+        wallet_id: wallet.to_string(),
+        cap_id: cap.to_string(),
+        // Cetus's own ids, defaulted for the same reason the wallet package is: an agent given a
+        // pool id cannot invent them, and a caller that had to supply them could supply the wrong
+        // ones.
+        integrate_package_id: cetus_integrate(),
+        global_config_id: cetus_global_config(),
+        pool_id: pool,
+        spend: amount,
+        slippage_bps,
+        gas_budget: TOOL_GAS_BUDGET,
+    };
+    match block_on(crate::quote_cmd::quote_json(
+        &endpoint(context),
+        keystore,
+        &args,
+    )) {
+        Ok(Ok(result)) => tool_ok(id, result),
+        Ok(Err(e)) | Err(e) => {
+            context.last_rejection = Some(e.clone());
+            tool_error(id, "quote_failed", &e)
+        }
     }
 }
 
@@ -303,6 +401,18 @@ fn version_id() -> String {
 ///
 /// Defaulted like the pair above rather than asked for: a caller that had to supply it could supply
 /// nothing, and a swap with no floor is exactly the outcome the floor exists to prevent.
+/// Cetus's router package, where `router::swap` lives.
+fn cetus_integrate() -> String {
+    std::env::var("CETUS_INTEGRATE_PACKAGE_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_CETUS_INTEGRATE.to_string())
+}
+
+/// Cetus's `GlobalConfig`, which every swap reads.
+fn cetus_global_config() -> String {
+    std::env::var("CETUS_GLOBAL_CONFIG_ID")
+        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_CETUS_GLOBAL_CONFIG.to_string())
+}
+
 fn guard_package_id() -> String {
     std::env::var("RILL_GUARD_PACKAGE_ID")
         .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_RILL_GUARD.to_string())
@@ -478,16 +588,10 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         return tool_error(id, "mainnet_not_opted_in", &reason);
     }
 
-    let required = [
-        "wallet",
-        "cap",
-        "amount",
-        "pool",
-        "integratePackage",
-        "globalConfig",
-        "coinTypeA",
-        "coinTypeB",
-    ];
+    // Cetus's two ids are no longer required: they are the same on every call against this network,
+    // an agent cannot invent them, and a caller forced to supply them could supply the wrong ones. A
+    // caller that does pass them still wins, which is what a non-testnet deployment needs.
+    let required = ["wallet", "cap", "amount", "pool", "coinTypeA", "coinTypeB"];
     let mut missing = Vec::new();
     for name in required {
         if argument(params, name).is_none() {
@@ -519,8 +623,14 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         version_id: version_id(),
         wallet_id: get("wallet"),
         cap_id: get("cap"),
-        integrate_package_id: get("integratePackage"),
-        global_config_id: get("globalConfig"),
+        integrate_package_id: match get("integratePackage") {
+            given if !given.is_empty() => given,
+            _ => cetus_integrate(),
+        },
+        global_config_id: match get("globalConfig") {
+            given if !given.is_empty() => given,
+            _ => cetus_global_config(),
+        },
         pool_id: get("pool"),
         coin_type_a: get("coinTypeA"),
         coin_type_b: get("coinTypeB"),

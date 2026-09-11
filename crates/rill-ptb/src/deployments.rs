@@ -51,6 +51,24 @@ pub const TESTNET_AGENT_WALLET_SUPERSEDED: &str =
 pub const TESTNET_RILL_GUARD: &str =
     "0xadec99557cf7771bce94737fdd3ea0bcc989d81e0860f3e69af55433dae8c034";
 
+/// Cetus's `integrate` package on testnet, which is where `router::swap` lives.
+///
+/// Defaulted rather than asked for, like the wallet package above. An agent given a pool id and
+/// nothing else cannot invent this, and a caller that had to supply it would be a caller who could
+/// supply the wrong one: a swap routed through a package that is not Cetus's router fails in a way
+/// that names neither the package nor the pool. Verified on chain as a package, immutable.
+pub const TESTNET_CETUS_INTEGRATE: &str =
+    "0xab2d58dd28ff0dc19b18ab2c634397b785a38c342a8f5065ade5f53f9dbffa1c";
+
+/// Cetus's `GlobalConfig` on testnet, which every swap reads.
+///
+/// Shared, and owned by the CLMM package rather than by `integrate`: its type is
+/// `0x5372d555…::config::GlobalConfig`, and `0x5372d555…` is also the package in every pool's own
+/// type. That is the check worth making if this ever has to be replaced, because a config from a
+/// different CLMM deployment parses as an address and aborts on use.
+pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
+    "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a";
+
 /// Whether an address is the superseded deployment, so a caller can say so plainly instead of
 /// letting a Move abort explain it.
 pub fn is_superseded(package_id: &str) -> bool {
