@@ -193,9 +193,15 @@ jobs:
           tags: rill-server:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # A container binds every interface or nothing outside it can connect, and the server refuses a
+      # wide bind unless that is stated. `compose.yaml` states it for a real deployment; this states
+      # it for the same reason, and the flag being needed here is the check working rather than an
+      # inconvenience. The port is published only to this runner.
       - name: The container must start and answer /health
         run: |
-          docker run -d --name rill -p 3939:3939 rill-server:ci
+          docker run -d --name rill -p 3939:3939 \
+            -e RILL_ALLOW_OPEN_AUTHORIZATION=1 \
+            rill-server:ci
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:3939/health > /dev/null; then
               echo "healthy after ${i}s"; docker logs rill; exit 0
@@ -203,3 +209,23 @@ jobs:
             sleep 1
           done
           echo "::error::the container never became healthy"; docker logs rill; exit 1
+      # The acknowledgement above is load-bearing, so check it is. Without it the container must
+      # refuse rather than start, or the boot check has stopped doing anything and this job would be
+      # the last place to notice.
+      - name: Without the acknowledgement the container refuses to start
+        run: |
+          set +e
+          output=$(docker run --rm --name rill-unack rill-server:ci 2>&1)
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::a wide bind with no acknowledgement started anyway"
+            printf '%s\n' "$output"
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -q "no consent step" || {
+            echo "::error::it refused, but not for the reason this check exists for"
+            printf '%s\n' "$output"
+            exit 1
+          }
+          echo "refused, naming the reason."

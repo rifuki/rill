@@ -482,7 +482,7 @@ export PUBLIC_BASE_URL=https://whatever-address-clients-will-use
 docker compose up --build
 ```
 
-Three things about it are load-bearing:
+Four things about it are load-bearing:
 
 - **One replica.** The server holds its state in a file it rewrites whole, so two replicas would each
   hold half the authorization codes and reject the other's. There is no clustering story here and
@@ -494,6 +494,14 @@ Three things about it are load-bearing:
   hands agents. Set it to the address clients will actually use. A trailing slash is fine; seven
   places read it and they all agree, which `bins/rill-server/tests/base_url.rs` holds by minting a
   token on a trailing-slash deployment and presenting it back.
+- **`RILL_ALLOW_OPEN_AUTHORIZATION=1` is an acknowledgement, not a switch to flip past.** A container
+  has to bind every interface or nothing outside it can connect, and the server refuses a wide bind
+  without this. What it acknowledges: `/oauth/authorize` has no consent step, registration is open,
+  and a public client presents no credential, so whoever can reach the published port can mint an
+  access token for the build surface and read this owner's published actions. They cannot sign, because
+  the key lives in the local `rill-wallet` binary and never in the container, and that is what bounds
+  this rather than removing it. Publish the port to a network you control. On a laptop, set
+  `BIND_ADDRESS=127.0.0.1` instead and drop the flag.
 
 Without `RILL_OAUTH_SECRET` compose refuses to start rather than generate a per-boot secret, because
 a server that quietly regenerates it invalidates every token on restart and tells nobody.
