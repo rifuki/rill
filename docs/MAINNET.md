@@ -50,17 +50,17 @@ Two things, and both are reasons rather than justifications.
 | 9 | Every build path refuses a lockfile change | `bins/rill/tests/supply_chain.rs` | green |
 | 10 | A new build script in the dependency tree fails the build | `scripts/audit-build-scripts.sh` against its baseline | green, 40 on the reviewed list |
 | 11 | The release workflow produces three assets and six files | `workflow_dispatch` dry run | green, run 34505161179 |
-| 12 | A published checksum verifies against a published asset | the same two commands the README gives a reader | **not green: no release is published.** Needs a `rill-wallet-v*` tag, which is a publication decision |
+| 12 | A published checksum verifies against a published asset | the Install block in `README.md`, produced by `.github/workflows/release.yaml` | green, `rill-wallet-v0.3.0`, all three assets verified and a tampered file rejected |
 | 13 | The mainnet refusal names what the override asserts | `crates/rill-core/src/mainnet.rs` tests | green |
 | 14 | A long-lived credential is revocable, and revoking stops the next call | `crates/rill-auth/tests/long_lived_token.rs` | green |
 | 15 | The hosted endpoint answers from outside this network | `GET /health` against the deployed host | **not green: there is no host.** `api.rill.naisu.one` has no DNS record and its droplet is unreachable |
 | 16 | A Move audit has been funded and its findings closed | a report from the firm | **not green, and not a test** |
 | 17 | A named person authorises the cutover | this document | **not green: nobody is named** |
 
-Thirteen of seventeen are green. The four that are not divide cleanly: two need a decision that costs
-money (16, and the host behind 15), one needs a publication (12), and one needs a person to put their
-name to it (17). None of them can be closed by writing more code, which is the useful thing this
-table says.
+Fourteen of seventeen are green. The three that are not need a decision rather than code: a Move
+audit has to be funded (16), a host has to exist (15), and a person has to put their name to the
+cutover (17). Row 12 closed when `rill-wallet-v0.3.0` was tagged and its checksums verified, which
+was the one of the four that only needed doing.
 
 ## What does not change at cutover
 
