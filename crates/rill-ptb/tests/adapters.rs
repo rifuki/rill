@@ -48,7 +48,15 @@ fn a_swap(a2b: bool, amount: u64) -> Swap {
         a2b,
         by_amount_in: true,
         amount,
-        sqrt_price_limit: 79_226_673_515_401_279_992_447_579_055,
+        // The bound that leaves the swap open, which is direction-dependent: a floor of zero going
+        // A to B, the maximum going B to A. This fixture used the maximum in both directions, which
+        // is the value that made the first real swap abort in the pool, so the fixture was building
+        // a swap no chain would run.
+        sqrt_price_limit: if a2b {
+            0
+        } else {
+            rill_ptb::cetus::MAX_SQRT_PRICE
+        },
     }
 }
 
@@ -58,7 +66,7 @@ fn a_swap_builds_into_a_real_transaction() {
     let coin = a_coin(&mut tx, 1_000_000);
     let out = swap(&mut tx, &a_swap(true, 1_000_000), coin, &resolved()).expect("should build");
     let recipient = tx.pure(&addr(9));
-    tx.transfer_objects(vec![out], recipient);
+    tx.transfer_objects(out.both().to_vec(), recipient);
     tx.try_build().expect("valid transaction");
 }
 
@@ -71,7 +79,7 @@ fn both_swap_directions_build() {
         let out = swap(&mut tx, &a_swap(a2b, 1_000_000), coin, &resolved())
             .unwrap_or_else(|e| panic!("a2b={a2b}: {e}"));
         let recipient = tx.pure(&addr(9));
-        tx.transfer_objects(vec![out], recipient);
+        tx.transfer_objects(out.both().to_vec(), recipient);
         tx.try_build().unwrap_or_else(|e| panic!("a2b={a2b}: {e}"));
     }
 }
@@ -154,11 +162,112 @@ fn the_stake_sequence_is_one_call() {
 }
 
 /// The composed flow the reference supports: swap output funds the stake.
+///
+/// And the residual has to go somewhere. The swap returns both sides, the stake takes the one that
+/// was bought, and the funded side comes back holding whatever the swap did not spend. `Coin` has no
+/// `drop`, so leaving it aborts with `UnusedValueWithoutDrop`: the composition is only legal once
+/// both are placed, which is the thing returning a single argument hid.
 #[test]
 fn a_swap_can_fund_a_stake_in_one_transaction() {
     let mut tx = funded();
     let coin = a_coin(&mut tx, 2_000_000_000);
     let swapped = swap(&mut tx, &a_swap(false, 2_000_000_000), coin, &resolved()).expect("swap");
-    request_stake(&mut tx, &a_stake(MIN_STAKE_MIST), swapped, &resolved()).expect("stake");
+    request_stake(
+        &mut tx,
+        &a_stake(MIN_STAKE_MIST),
+        swapped.output(),
+        &resolved(),
+    )
+    .expect("stake");
+    let to = tx.pure(&addr(9));
+    tx.transfer_objects(vec![swapped.residual()], to);
     tx.try_build().expect("the composed flow must build");
+}
+
+/// The output is the side that was not funded, in both directions.
+///
+/// Reading the wrong one would stake the change rather than what was bought, and the types are the
+/// same shape so nothing would complain until the amounts were looked at.
+#[test]
+fn the_output_is_the_side_that_was_not_funded() {
+    let mut tx = funded();
+    let coin = a_coin(&mut tx, 1_000_000);
+    let a2b = swap(&mut tx, &a_swap(true, 1_000_000), coin, &resolved()).expect("swap");
+    // `Argument` is not PartialEq, so the debug rendering stands in. It carries the nested index,
+    // which is the whole of what distinguishes the two results.
+    assert_eq!(
+        format!("{:?}", a2b.output()),
+        format!("{:?}", a2b.coin_b),
+        "funding A buys B, so B is the output"
+    );
+    assert_eq!(format!("{:?}", a2b.residual()), format!("{:?}", a2b.coin_a));
+
+    let mut tx = funded();
+    let coin = a_coin(&mut tx, 1_000_000);
+    let b2a = swap(&mut tx, &a_swap(false, 1_000_000), coin, &resolved()).expect("swap");
+    assert_eq!(
+        format!("{:?}", b2a.output()),
+        format!("{:?}", b2a.coin_a),
+        "funding B buys A, so A is the output"
+    );
+    assert_eq!(format!("{:?}", b2a.residual()), format!("{:?}", b2a.coin_b));
+    assert_ne!(
+        format!("{:?}", b2a.coin_a),
+        format!("{:?}", b2a.coin_b),
+        "the two results must be distinct arguments, or this is one result read twice"
+    );
+}
+
+/// A price bound on the wrong side of the direction is refused here, not by the pool.
+///
+/// The first swap this adapter ever built for real failed in the pool with
+/// `MoveAbort(... flash_swap_internal, 11)`, which names neither the value nor the field. The value
+/// was a zero bound on a B to A swap, where the price moves up and zero is already breached. A
+/// refusal that names both numbers is the difference between a one-line fix and reading Cetus's
+/// source.
+#[test]
+fn a_price_bound_on_the_wrong_side_is_refused_by_name() {
+    use rill_ptb::cetus::{MAX_SQRT_PRICE, MIN_SQRT_PRICE};
+
+    // Funding B buys A and pushes the price up, so the bound is a ceiling and zero is breached.
+    let mut tx = funded();
+    let coin = a_coin(&mut tx, 1_000_000);
+    let mut spec = a_swap(false, 1_000_000);
+    spec.sqrt_price_limit = 0;
+    let err = swap(&mut tx, &spec, coin, &resolved()).expect_err("zero is the wrong side here");
+    let said = err.to_string();
+    assert!(said.contains("pushes the price up"), "{said}");
+    assert!(
+        said.contains(&MAX_SQRT_PRICE.to_string()),
+        "the refusal must name the value that would leave it open: {said}"
+    );
+    assert!(
+        said.contains("flash_swap_internal"),
+        "and the abort it prevents, so the next reader connects the two: {said}"
+    );
+
+    // And the mirror: funding A pushes the price down, so a ceiling is the wrong side.
+    let mut tx = funded();
+    let coin = a_coin(&mut tx, 1_000_000);
+    let mut spec = a_swap(true, 1_000_000);
+    spec.sqrt_price_limit = MAX_SQRT_PRICE;
+    let said = swap(&mut tx, &spec, coin, &resolved())
+        .expect_err("a ceiling is the wrong side for a2b")
+        .to_string();
+    assert!(said.contains("pushes the price down"), "{said}");
+    assert!(said.contains("Use 0"), "{said}");
+
+    // The open values in each direction build.
+    for (a2b, limit) in [
+        (true, 0u128),
+        (false, MAX_SQRT_PRICE),
+        (false, MIN_SQRT_PRICE),
+    ] {
+        let mut tx = funded();
+        let coin = a_coin(&mut tx, 1_000_000);
+        let mut spec = a_swap(a2b, 1_000_000);
+        spec.sqrt_price_limit = limit;
+        swap(&mut tx, &spec, coin, &resolved())
+            .unwrap_or_else(|e| panic!("a2b={a2b} limit={limit} must build: {e}"));
+    }
 }

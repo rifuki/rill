@@ -1322,6 +1322,8 @@ dependencies = [
  "rill-chain",
  "rill-core",
  "rill-policy",
+ "serde_json",
+ "sui-crypto",
  "sui-sdk-types",
  "sui-transaction-builder",
  "thiserror 2.0.20",
