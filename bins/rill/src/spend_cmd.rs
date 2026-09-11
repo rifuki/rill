@@ -63,7 +63,7 @@ pub async fn spend(endpoint: &str, keystore: &Keystore, args: &SpendArgs) -> Res
         render(result.get("gasUsed").unwrap_or(&serde_json::Value::Null))
     );
     if args.dry_run {
-        println!("\ndry run — nothing signed. Re-run with --submit.");
+        println!("\ndry run, nothing signed. Re-run with --submit.");
         return Ok(());
     }
     println!(

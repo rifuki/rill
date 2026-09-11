@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(
             classify_failure("MoveAbort(.., 5)"),
             Verification::Verified,
-            "a real abort is a real answer — the simulation worked, the transaction would not"
+            "a real abort is a real answer: the simulation worked, the transaction would not"
         );
     }
 
@@ -363,7 +363,7 @@ pub mod aborts {
             match (self.module.as_str(), self.code) {
                 // Amount limits. A smaller number is a real answer here.
                 ("budget", _) | ("per_tx", _) | ("rate_limit", _) => {
-                    "The limit is on chain, not in this client — raising it here changes nothing, \
+                    "The limit is on chain, not in this client. Raising it here changes nothing, \
                      and neither will retrying with the same amount. Spend less, or have the \
                      wallet's owner attach different rules."
                 }
@@ -380,10 +380,10 @@ pub mod aborts {
                      the agent does will."
                 }
                 ("agent_wallet", 1) => {
-                    "This call is owner-only. Sign it with the owner's key — `--as <owner>`."
+                    "This call is owner-only. Sign it with the owner's key: `--as <owner>`."
                 }
                 ("agent_wallet", 7) => {
-                    "This call is the agent's. Sign it with the agent's key — `--as <agent>`."
+                    "This call is the agent's. Sign it with the agent's key: `--as <agent>`."
                 }
                 ("agent_wallet", 10) => {
                     "The prove calls did not match the wallet's live policy. Read what it actually \
@@ -428,7 +428,7 @@ pub mod aborts {
             }
             ("time_window", 1) => "the wallet is outside the window it is permitted to spend in",
             ("time_window", 2) => {
-                "the time window itself is invalid — not_before is not before \
+                "the time window itself is invalid: not_before is not before \
                                    not_after"
             }
             // agent_wallet's codes, transcribed from its own source and pinned by a test that

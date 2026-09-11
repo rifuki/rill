@@ -140,7 +140,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         "actionId": { "type": "string" },
                         "sender": {
                             "type": "string",
-                            "description": "The agent's Sui address. Public — never a key."
+                            "description": "The agent's Sui address. Public, never a key."
                         },
                         // Public object ids only. The keyless guard refuses anything key-shaped in
                         // here, however it is spelled.
@@ -164,7 +164,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         },
                         "params": {
                             "type": "object",
-                            "description": "Runtime values. Amounts are decimal STRINGS, never numbers — a JSON number would put a float on the money path."
+                            "description": "Runtime values. Amounts are decimal STRINGS, never numbers: a JSON number would put a float on the money path."
                         }
                     },
                     "required": ["actionId", "sender", "agentWallet", "params"],
@@ -304,7 +304,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         "cap": { "type": "string", "description": "The AgentCap this signer holds." },
                         "amount": {
                             "type": "string",
-                            "description": "Decimal SUI, as text — never a number. \"0.01\", not 0.01."
+                            "description": "Decimal SUI, as text, never a number. \"0.01\", not 0.01."
                         },
                         "to": {
                             "type": "string",

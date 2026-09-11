@@ -280,7 +280,7 @@ impl std::fmt::Display for ManifestError {
             Self::BadAmount { field, source } => write!(f, "{field}: {source}"),
             Self::EmptyScope { kind } => write!(
                 f,
-                "rules[{}] declares an empty scope, which makes nothing reachable — list at least \
+                "rules[{}] declares an empty scope, which makes nothing reachable. List at least \
                  one entry, or omit the rule entirely",
                 kind.as_str()
             ),

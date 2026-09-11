@@ -93,7 +93,7 @@ fn amount_at(value: &Value, path: &str) -> Result<String, RequestError> {
         }
         Value::Number(_) => Err(RequestError::at(
             path,
-            "must be a decimal string, not a number — a JSON number is a float by the time it \
+            "must be a decimal string, not a number: a JSON number is a float by the time it \
              reaches here, and an amount must never have been one",
         )),
         _ => Err(RequestError::at(path, "must be a decimal string")),

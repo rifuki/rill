@@ -183,7 +183,7 @@ mod tests {
                 format!("{}::m::second", addr(0xca)),
                 format!("{}::m::third", addr(0xca)),
             ],
-            "order is the whole point — a set comparison waves through a reordered transaction"
+            "order is the whole point: a set comparison waves through a reordered transaction"
         );
     }
 

@@ -80,7 +80,7 @@ impl std::fmt::Display for RunSetError {
         match self {
             Self::NotConfigured => write!(
                 f,
-                "no run-set is configured. Set {RUN_SET_VAR} to a run-set file — without one there \
+                "no run-set is configured. Set {RUN_SET_VAR} to a run-set file. Without one there \
                  are no pinned limits, and signing against limits nobody set is worse than not \
                  signing."
             ),
@@ -94,7 +94,7 @@ impl std::fmt::Display for RunSetError {
             Self::BadAmount { field, reason } => write!(f, "{field}: {reason}"),
             Self::EmptyTargets => write!(
                 f,
-                "allowedTargets is empty, which would permit no transaction at all — an empty \
+                "allowedTargets is empty, which would permit no transaction at all. An empty \
                  allowlist is a mistake, not a lockdown"
             ),
         }

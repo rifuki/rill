@@ -101,7 +101,7 @@ impl Config {
 
         if !oauth_secret_from_env && network == Network::Testnet {
             eprintln!(
-                "[oauth] RILL_OAUTH_SECRET is unset — using a random per-boot secret. Every issued \
+                "[oauth] RILL_OAUTH_SECRET is unset, so a random per-boot secret is in use. Every issued \
                  token becomes invalid when this process restarts, and connected agents must \
                  re-authorize. Set it for anything longer-lived than local development."
             );

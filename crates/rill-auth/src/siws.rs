@@ -49,7 +49,7 @@ pub fn build_sign_in_message(input: &SignInMessage<'_>) -> String {
         String::new(),
         "This signature is a login only. It moves no funds, approves no transaction, and grants no"
             .into(),
-        "spending authority — every spend is separately bounded by your on-chain agent wallet, and"
+        "spending authority: every spend is separately bounded by your on-chain agent wallet, and"
             .into(),
         "Rill never holds your private key.".into(),
         String::new(),

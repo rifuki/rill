@@ -118,7 +118,7 @@ pub async fn revoke(endpoint: &str, keystore: &Keystore, args: &RevokeArgs) -> R
         });
     }
     if args.dry_run {
-        println!("\ndry run — nothing signed. Re-run with --submit.");
+        println!("\ndry run, nothing signed. Re-run with --submit.");
         return Ok(());
     }
 

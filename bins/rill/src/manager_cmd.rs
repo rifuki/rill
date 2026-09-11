@@ -95,7 +95,7 @@ pub async fn provision(
         ));
     }
     if args.dry_run {
-        println!("\ndry run — nothing signed. Re-run with --submit.");
+        println!("\ndry run, nothing signed. Re-run with --submit.");
         return Ok(());
     }
 

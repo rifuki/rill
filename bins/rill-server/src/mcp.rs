@@ -180,7 +180,7 @@ async fn handle_one(state: &AppState, owner: &str, message: &Value) -> Option<Va
                     "serverInfo": {
                         "name": "rill-actions",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Keyless action builder — returns an unsigned ExecutionEnvelope for local signing."
+                        "description": "Keyless action builder: returns an unsigned ExecutionEnvelope for local signing."
                     }
                 }),
             ))
