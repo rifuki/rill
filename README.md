@@ -9,7 +9,7 @@ two on-chain Move contracts bound every action.
 
 ## Where things stand
 
-The workspace builds and 409 Rust tests pass. Another 39, which need a live fullnode, are
+The workspace builds and 567 Rust tests pass. Another 51, which need a live fullnode, are
 `#[ignore]` and run explicitly (see [Build](#build)). The two Move packages pass their own 37
 and 2.
 
@@ -26,6 +26,10 @@ What is proven, on testnet, each with its digest recorded in this repository:
 | `rill_execute` running the whole path: validate, byte-pin, re-simulate, sign, submit | commit `06df501` |
 | owner revokes; the agent's next spend, same key, same capability, is refused | `7b6xSFWQuJW3fRpZ77een1KuuwEnmzSfKspzFeUWdr15` |
 | a gated spend flowing into a DeepBook order, in one agent-signed transaction | `GiL7unaYVnx7TF9QDtpUgc3nFSdWxVgkLb6sMDQfCm77` |
+| the same path built by the keyless server and signed locally, over MCP | `dxzyeAfW5eRdGUobBNUGeu2mnmaN4xyzY7J8dZxL5fZ` |
+| a gated spend swapped on Cetus, by `rill_swap` over MCP | `8M5VjFgZ9Gx2N2CVq6MrUSnmNmq3ZVWqHLCvsFTDTYsZ` |
+| the same swap, run through the published binary a stranger downloads | `AXxZMPVruaCAVoFXZwRjncseuS8e9Tedu6uBcbvYLN6K` |
+| a swap over the per-transaction cap | refused, and the refusal names `per_tx` |
 
 The sequence that produced each digest is in the commit that records it. The first three are no
 longer a record to be trusted, either: `cargo test -p rill --test delegation_live -- --ignored`
@@ -366,6 +370,34 @@ prompt that fires on everything is one people learn to click through.
 The surface is `rill_status` (can this signer act), `rill_wallet` (what does this wallet permit),
 `rill_spend`, `rill_execute`. One question each, rather than one tool with a switch: an answer whose
 shape depends on which argument was passed is an answer an agent has to discover by trying it.
+
+## Swapping, under the wallet's rules
+
+A swap from the signer's own coins is an ordinary swap with extra steps. What this does instead is
+release the SUI from the agent wallet first, against the rules attached to it on chain, so the agent
+swaps money it does not own and cannot swap more than the owner allowed.
+
+One transaction, six calls:
+
+```
+request_spend -> budget::prove -> per_tx::prove -> confirm_spend -> coin::zero -> router::swap
+```
+
+Over MCP that is `rill_swap`, and the refusal works the same way as every other: 0.09 SUI against a
+0.05 per-transaction cap comes back `rule_refused`, `rule: per_tx`, with the reminder that the limit
+is on chain and raising it in the client changes nothing.
+
+Two things about the Cetus path are worth knowing, because both cost a real transaction to learn:
+
+- **`router::swap` returns two coins**, and the builder hands back one `Argument` for the whole
+  return tuple. Returning that as the output coin is accepted by `try_build` and refused by the VM
+  with `InvalidResultArity`, so the swap could not execute at all until both were taken. Arity is not
+  a thing a build can check, which is why `crates/rill-ptb/tests/cetus_swap_live.rs` reproduces the
+  refusal against a node before showing the fix.
+- **The price bound has a side.** Funding A pushes the price down so the bound is a floor; funding B
+  pushes it up so it is a ceiling. A bound on the wrong side aborts in `flash_swap_internal` with a
+  bare 11 that names neither the value nor the field, so the adapter derives it from the direction and
+  refuses a caller's wrong-sided bound by name.
 
 ## Integrating a protocol without an SDK
 
