@@ -66,7 +66,17 @@ fn unauthorized(state: &AppState, description: &str) -> Response {
 /// The error side is a fully-formed `Response` rather than an error code, because a 401 here has
 /// to carry the `WWW-Authenticate` discovery header and only this function knows the base URL to
 /// build it from. Boxed to keep the `Result` small.
-fn authenticate(state: &AppState, authorization: Option<&str>) -> Result<String, Box<Response>> {
+/// The owner behind a bearer, or the response to send instead.
+///
+/// Shared with the skills API rather than duplicated there: a publish route with its own copy of
+/// this would be a second place the scope check, the agent-credential narrowing and the revocation
+/// lookup could drift out of step, and the drift would be invisible until one of them let something
+/// through. The owner a publish records has to be the same owner a catalogue is read by, or the
+/// boundary `SkillStore::list_by_owner` documents is not a boundary.
+pub(crate) fn authenticate(
+    state: &AppState,
+    authorization: Option<&str>,
+) -> Result<String, Box<Response>> {
     let Some(token) = bearer_from_header(authorization) else {
         return Err(Box::new(unauthorized(
             state,
@@ -259,6 +269,35 @@ async fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Va
                         "name": skill.name,
                         "description": skill.description,
                         "network": state.config.network.as_str(),
+                        // The one thing this tool exists to answer and did not. It used to return
+                        // the three lines above and two rule sentences, so an agent reading "this
+                        // describes an action's parameters" learned none of them and had to be told
+                        // the shape out of band. The list comes from the parser's own constant, and
+                        // a test removes each entry in turn to keep the two from drifting.
+                        "requiredArguments": crate::request::REQUIRED_BUILD_FIELDS,
+                        "argumentNotes": {
+                            "amounts": "Decimal strings, never JSON numbers: a number is a float by \
+                                        the time it reaches here, and a float has no place on a money \
+                                        path. params.spendAmountMist is base units as text.",
+                            "objectReferences": "Each of capId, tradeCapId, depositCapId and \
+                                                 gasObjectId needs its version and digest beside it. \
+                                                 Read them from the chain immediately before \
+                                                 building: a stale version is refused by the node, \
+                                                 not silently accepted.",
+                            "capabilityManifest": "The wallet's rules, as the signer's run-set \
+                                                   carries them. It is validated here, so a manifest \
+                                                   with no rules is refused before a transaction \
+                                                   exists rather than producing a spend nothing \
+                                                   gates."
+                        },
+                        "callSequence": "agent_wallet::request_spend, one prove per attached rule in \
+                                         manifest order, agent_wallet::confirm_spend, then the \
+                                         DeepBook deposit and order. The signer re-derives this list \
+                                         from the same manifest and refuses to sign a transaction \
+                                         that does not match it.",
+                        "buildsWhatExactly": "A DeepBook limit order. This endpoint builds one shape; \
+                                              a published action names a grant to build it, and its \
+                                              stored flow is not read when building.",
                         "simulationRule": "Rill Cloud and rill both require a verified, successful simulation.",
                         "signingRule": "Only the local rill may validate, re-simulate, sign, and submit."
                     }),

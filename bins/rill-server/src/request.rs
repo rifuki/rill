@@ -100,6 +100,52 @@ fn amount_at(value: &Value, path: &str) -> Result<String, RequestError> {
     }
 }
 
+/// Every argument a build refuses to proceed without, as the dotted path a refusal names.
+///
+/// # Why this is a constant and not prose
+///
+/// `rill_describe_action` advertises that it describes "an action's parameters", and it used to
+/// return a name, a description and two sentences about signing: an agent reading it learned nothing
+/// about what to pass to `rill_build_action`, which is the one thing the tool exists to answer. The
+/// shape lived only inside [`parse_build_request`], where a caller cannot see it, so every agent had
+/// to be told it out of band.
+///
+/// Listing it here rather than writing it into the describe handler keeps the two from drifting: a
+/// test removes each path in turn and asserts the parser refuses and names it, so a field added to
+/// the parser and not to this list fails, and a field listed here that the parser does not actually
+/// require fails too. `params.payWithDeep` is deliberately absent, because it defaults rather than
+/// being required.
+pub const REQUIRED_BUILD_FIELDS: &[&str] = &[
+    "sender",
+    "agentWallet.packageId",
+    "agentWallet.walletId",
+    "agentWallet.versionId",
+    "agentWallet.capId",
+    "agentWallet.capVersion",
+    "agentWallet.capDigest",
+    "agentWallet.capabilityManifest",
+    "params.poolId",
+    "params.baseCoinType",
+    "params.quoteCoinType",
+    "params.baseScalar",
+    "params.quoteScalar",
+    "params.balanceManagerId",
+    "params.tradeCapId",
+    "params.tradeCapVersion",
+    "params.tradeCapDigest",
+    "params.depositCapId",
+    "params.depositCapVersion",
+    "params.depositCapDigest",
+    "params.gasObjectId",
+    "params.gasObjectVersion",
+    "params.gasObjectDigest",
+    "params.clientOrderId",
+    "params.price",
+    "params.quantity",
+    "params.isBid",
+    "params.spendAmountMist",
+];
+
 /// Parse a `rill_build_action` argument object.
 ///
 /// No gas price is taken, from the caller or from anywhere else: the build reads the network's
