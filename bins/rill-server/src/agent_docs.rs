@@ -21,6 +21,19 @@
 //! So the generator lives beside the configuration and the producers it has to agree with, and the
 //! server serves what it generates.
 //!
+//! # The grant table is pre-wired, and nothing reaches it yet
+//!
+//! Two branches render a wallet's rules: one when a capability manifest is in hand, which prints
+//! each rule with the label [`RuleKind::enforcement`] computes for it, and one when there is none,
+//! which says no agent wallet is bound. Every document this server can serve takes the second.
+//!
+//! That is not a bug and it is worth stating plainly, because the first branch has a test and a
+//! reader can easily mistake a tested path for a live one. The reason is upstream:
+//! [`rill_store::PublishedSkill`] has nowhere to carry a manifest, so `skill_instructions` passes
+//! `None` and always will until an owner's grant is recorded against a published action. When that
+//! arrives, the rendering is already here and already covered; what is missing is the producer, not
+//! the consumer.
+//!
 //! # Nothing here is typed out twice
 //!
 //! Every load-bearing string is read from the one thing that owns it: URLs from
@@ -40,7 +53,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use rill_core::manifest::{to_declaration, CapabilityManifest, RuleKind};
-use rill_core::release::{CHECKSUM_SUFFIX, LATEST_DOWNLOAD_URL, RELEASE_REPO, WALLET_ASSETS};
+use rill_core::release::{
+    CHECKSUM_SUFFIX, LATEST_DOWNLOAD_URL, RELEASES_URL, RELEASE_REPO, WALLET_ASSETS,
+};
 use rill_mcp::{Surface, Tool};
 use rill_store::{PublishedSkill, SkillStore};
 
@@ -203,6 +218,17 @@ fn install_step() -> Option<Step> {
                  it gets right, and there are such lines in circulation."
             ),
             String::new(),
+            // The honest caveat, because the alternative is a reader meeting a 404 with nothing to
+            // go on. Those two curl lines resolve only once a tag has been pushed, and none has.
+            // Naming the releases page gives them somewhere to look instead of concluding the
+            // download is broken, and it costs nothing once a release does exist.
+            format!(
+                "If those downloads answer 404, no release has been published yet: the workflow \
+                 that produces them runs on a tag and the releases are listed at {RELEASES_URL}. \
+                 Until one exists, build it instead with `cargo build --release --locked -p rill`, \
+                 which produces the same binary at `target/release/{binary}`."
+            ),
+            String::new(),
             format!(
                 "`--status` prints `{binary}` and then whether it can sign. With no key it says \
                  `not ready` and exits 1, which is the expected answer on a fresh machine rather \
@@ -298,22 +324,47 @@ fn tool_order_step(skill: Option<&PublishedSkill>) -> Option<Step> {
     lines.push("Local, on the signer, which holds the key:".into());
     lines.push(String::new());
 
+    // Which calls sign is read off the annotation, not asserted.
+    //
+    // This said "Only this call produces a signature" of the hand-off tool, and in the no-hand-off
+    // case "no other tool anywhere can produce a signature". Both were false: four tools on the
+    // signer are marked destructive and four of them submit, and one of them, `rill_spend`, says so
+    // in its own description. A document that tells an agent a second signing path does not exist is
+    // worse than one that omits it, because an agent acts on what it was told. That is the defect
+    // class this whole unit exists to remove, reproduced inside the remover.
+    //
+    // The annotation is the producer, so the sentence is derived from it and the test below asserts
+    // the two agree.
+    let signing: Vec<&Tool> = local
+        .iter()
+        .filter(|tool| {
+            tool.annotations
+                .as_ref()
+                .and_then(|a| a.destructive_hint)
+                .unwrap_or(false)
+        })
+        .collect();
+
     match hand_off {
         Some(tool) => {
             step += 1;
-            lines.push(format!(
-                "{step}. `{}`: {} Only this call produces a signature.",
-                tool.name,
-                summary(tool)
-            ));
+            lines.push(format!("{step}. `{}`: {}", tool.name, summary(tool)));
         }
         // Rendering a step that names nothing would be worse than leaving it out: an agent cannot
         // call a tool the document failed to name, and the test asserts the step is here.
-        None => lines.push(
-            "The signer takes the envelope and submits it. Its tool list is below; no other tool \
-             anywhere can produce a signature."
-                .into(),
-        ),
+        None => lines
+            .push("The signer takes the envelope and submits it. Its tool list is below.".into()),
+    }
+
+    if !signing.is_empty() {
+        lines.push(String::new());
+        let names: Vec<String> = signing.iter().map(|t| format!("`{}`", t.name)).collect();
+        lines.push(format!(
+            "Every call that produces a signature is on the signer, and these are all of them: {}. \
+             Each one moves money or changes what the agent may spend, and none of them can be \
+             undone.",
+            names.join(", ")
+        ));
     }
 
     let rest: Vec<&Tool> = local

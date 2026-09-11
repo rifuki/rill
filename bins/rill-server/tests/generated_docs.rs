@@ -143,7 +143,11 @@ fn urls(document: &str) -> Vec<String> {
             let end = candidate
                 .find(|c: char| c.is_whitespace() || "\"'`,)<>".contains(c))
                 .unwrap_or(candidate.len());
-            found.push(candidate[..end].to_owned());
+            // Trailing sentence punctuation is not part of the URL. Without this, a URL that ends
+            // a sentence is collected with its full stop attached and then fails the allowlist for
+            // a reason that has nothing to do with its host.
+            let url = candidate[..end].trim_end_matches(['.', ';', ':', '!', '?']);
+            found.push(url.to_owned());
             rest = &candidate[end..];
         } else {
             rest = &candidate["http".len()..];
@@ -172,8 +176,13 @@ fn a_generated_document_interpolates_the_configured_base_url_and_no_other() {
             "no URL in the document belongs to the configured deployment:\n{doc}"
         );
         for url in found {
+            // The releases page as well as the download path. It is the same origin and strictly
+            // broader: rill_core::release asserts LATEST_DOWNLOAD_URL is under RELEASES_URL, and
+            // the document names the page so a reader whose download 404s has somewhere to look
+            // rather than concluding the binary is broken.
             let allowed = url.starts_with(base)
                 || url.starts_with(LATEST_DOWNLOAD_URL)
+                || url.starts_with(rill_core::release::RELEASES_URL)
                 || ALLOWED_FOREIGN_URLS.contains(&url.as_str());
             assert!(
                 allowed,
@@ -708,4 +717,190 @@ fn the_reference_generators_still_emit_the_sections_the_fixture_pins() {
              fixtures/reference-doc-sections.json"
         );
     }
+}
+
+// ── What the document claims about signing, and where it got it ──────────────────────────────────
+
+/// The set of tools the document calls signing is exactly the set marked destructive.
+///
+/// The sentence this replaces said "Only this call produces a signature" of one tool, and in the
+/// other branch "no other tool anywhere can produce a signature". Four tools on the signer are
+/// marked destructive and four of them submit, one of which says so in its own description. An
+/// agent acting on a document that denies a second signing path exists is the defect class this
+/// unit was written to remove, reproduced inside the remover.
+#[test]
+fn the_document_names_every_signing_tool_and_claims_no_exclusivity() {
+    let doc = rill_server::agent_docs::agent_instructions(&config(BASES[0]), None, None);
+
+    let destructive: Vec<String> = rill_mcp::tools(rill_mcp::Surface::Wallet)
+        .into_iter()
+        .filter(|t| {
+            t.annotations
+                .as_ref()
+                .and_then(|a| a.destructive_hint)
+                .unwrap_or(false)
+        })
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        destructive.len() > 1,
+        "this asserts nothing unless more than one tool signs; found {destructive:?}"
+    );
+
+    for name in &destructive {
+        assert!(
+            doc.contains(name),
+            "{name} is marked destructive and the document does not name it, so an agent reading \
+             this believes one fewer call can move money"
+        );
+    }
+    for claim in [
+        "Only this call produces a signature",
+        "no other tool anywhere can produce a signature",
+    ] {
+        assert!(
+            !doc.contains(claim),
+            "the document claims exclusivity it does not have: {claim:?}"
+        );
+    }
+    assert!(
+        doc.contains("Every call that produces a signature is on the signer"),
+        "and it must say what is true instead"
+    );
+}
+
+/// Every URL in the document is this deployment's, including the ones a plain scheme check misses.
+///
+/// The existing source check skipped any line without "://" and the collector only gathered
+/// candidates beginning with http:// or https://, so a literal `api.rill.naisu.one/mcp` in the
+/// connect step passed all thirteen tests: the document then handed every reader a connect command
+/// pointing at the dead host the plan's Open Questions is still about. Dotted hosts are matched now,
+/// scheme or no scheme.
+#[test]
+fn no_dotted_host_appears_in_the_document_that_is_not_this_deployments() {
+    let doc = rill_server::agent_docs::agent_instructions(&config(BASES[0]), None, None);
+    let base = config(BASES[0]).base().to_string();
+
+    // Hosts this document is allowed to name: its own, the release origin (a deployment-independent
+    // fact with its own test), Sui's own endpoints, and whatever ALLOWED_FOREIGN_URLS already
+    // declares. That constant exists so a reviewer has one place to ask "which other servers does
+    // our documentation send people to", and this reuses it rather than starting a second list.
+    let mut permitted = vec![
+        base.replace("https://", "").replace("http://", ""),
+        "github.com".to_string(),
+        "sui.io".to_string(),
+    ];
+    permitted.extend(ALLOWED_FOREIGN_URLS.iter().map(|url| {
+        url.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or(url)
+            .to_string()
+    }));
+
+    for (index, line) in doc.lines().enumerate() {
+        for token in line.split([' ', '"', '`', '(', ')', '<', '>', ',']) {
+            let host = token
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("");
+            // A filename is dotted too, and the document names several. Excluded by their
+            // extension, which no host ends in.
+            const FILE_EXTENSIONS: [&str; 10] = [
+                "json", "toml", "md", "rs", "sh", "yaml", "yml", "lock", "txt", "log",
+            ];
+            if host
+                .rsplit('.')
+                .next()
+                .is_some_and(|ext| FILE_EXTENSIONS.contains(&ext))
+            {
+                continue;
+            }
+            // A dotted label with a plausible TLD, which is what a host looks like and a version
+            // number does not.
+            let looks_like_a_host = host.matches('.').count() >= 1
+                && host.rsplit('.').next().is_some_and(|tld| {
+                    tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+                })
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            if !looks_like_a_host {
+                continue;
+            }
+            assert!(
+                permitted.iter().any(|p| host == p || host.ends_with(p)),
+                "line {} names the host {host:?}, which is neither this deployment nor a permitted \
+                 one: {line}",
+                index + 1
+            );
+        }
+    }
+}
+
+/// The redirect that makes GET /mcp useful is held by two literals with nothing coupling them.
+///
+/// The route is declared in one place and the Location header built in another. Renaming the route
+/// leaves /mcp advertising a 404, which is exactly the R7 failure this unit closes, and nothing
+/// tested it: the redirect was verified once by hand with curl. So follow it.
+#[tokio::test]
+async fn the_redirect_from_mcp_leads_somewhere_that_answers() {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    let app = rill_server::routes::router(rill_server::state::AppState::new(config(BASES[0])));
+    let redirected = app
+        .clone()
+        .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        redirected.status().is_redirection(),
+        "GET /mcp should point a browser at the instructions, got {}",
+        redirected.status()
+    );
+    let location = redirected
+        .headers()
+        .get(header::LOCATION)
+        .expect("a redirect names where it goes")
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // The path, because the host in that header is this deployment's and the router serves paths.
+    let path = location
+        .split_once("://")
+        .map(|(_, rest)| {
+            rest.split_once('/')
+                .map(|(_, p)| format!("/{p}"))
+                .unwrap_or_default()
+        })
+        .unwrap_or(location.clone());
+    assert!(
+        !path.is_empty(),
+        "the Location header has no path: {location}"
+    );
+
+    let followed = app
+        .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        followed.status(),
+        StatusCode::OK,
+        "the redirect from /mcp leads to {path}, which answers {} rather than the instructions",
+        followed.status()
+    );
+    let body = followed.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("# Rill"),
+        "what the redirect leads to is not the instructions document: {}",
+        &text[..text.len().min(120)]
+    );
 }
