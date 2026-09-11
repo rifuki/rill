@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const DOCKERFILE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Dockerfile"));
+/// The install instructions a stranger pastes. Read here because the chain they form is the thing
+/// that stops an unverified file being made executable.
+const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
 const CI: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../.github/workflows/ci.yaml"
@@ -149,12 +152,24 @@ fn pinned_toolchain() -> &'static str {
         .trim_matches('"')
 }
 
-/// Every toolchain the workflows install, read out of the `uses:` ref.
+/// Every toolchain the workflows install, read out of the `uses:` line.
+///
+/// Two shapes, and both are deliberate. A ref (`@1.96.0`) names the version directly. A commit
+/// (`@ebb3d16... # 1.96.0`) pins the action's own code as well, and then the version lives in the
+/// trailing comment, which is the only place a reviewer can read it: a bare forty-character hash
+/// says nothing about what it is supposed to be. Release does the second, because every action in
+/// that job runs with write access to the asset a stranger downloads.
 fn installed_toolchains(workflow: &'static str) -> Vec<&'static str> {
     workflow
         .lines()
         .filter_map(|line| line.trim().strip_prefix("- uses: dtolnay/rust-toolchain@"))
-        .map(str::trim)
+        .map(|rest| {
+            let rest = rest.trim();
+            match rest.split_once('#') {
+                Some((_, comment)) => comment.trim(),
+                None => rest,
+            }
+        })
         .collect()
 }
 
@@ -623,4 +638,322 @@ fn step_script(workflow: &'static str, name: &str) -> String {
         .take_while(|line| line.trim().is_empty() || line.len() - line.trim_start().len() > indent)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ── The toolchain check, run rather than read ────────────────────────────────────────────────────
+
+/// The pinned-toolchain step must actually fail when the toolchain is wrong.
+///
+/// Its only test asserted that the step's script contains the strings `rust-toolchain.toml`,
+/// `rustc`, `cargo`, `--version` and `::error::`. Replacing the comparison with a bare
+/// `echo "::error:: $tool is $got, rust-toolchain.toml, --version"` keeps every one of those words,
+/// prints an annotation, never exits non-zero, and left the suite green: CI's only runtime pin was
+/// disarmed and the test that guards it could not tell. Keyword presence is not behaviour.
+///
+/// So the step is extracted and run, with `rustc` and `cargo` stubs on PATH reporting whatever this
+/// test wants them to. The same shape as the release smoke step's harness and the audit script's.
+fn run_toolchain_step(reported_version: &str) -> std::process::Output {
+    let scratch = std::env::temp_dir().join(format!(
+        "rill-toolchain-step-{}-{}",
+        std::process::id(),
+        reported_version.replace('.', "-")
+    ));
+    let bin = scratch.join("bin");
+    fs::create_dir_all(&bin).expect("a scratch bin directory");
+
+    // `rustc --version` prints "rustc 1.2.3 (hash date)", and the step takes field two.
+    for tool in ["rustc", "cargo"] {
+        let path = bin.join(tool);
+        fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"{tool} {reported_version} (stub)\"\n"),
+        )
+        .expect("write a stub");
+        let mut perms = fs::metadata(&path).expect("stat the stub").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("make the stub executable");
+    }
+
+    // The step reads rust-toolchain.toml from the working directory, so it runs in a scratch copy
+    // rather than the repository: a test that wrote there would be editing the thing under test.
+    fs::write(scratch.join("rust-toolchain.toml"), TOOLCHAIN).expect("copy the toolchain file");
+    let script = scratch.join("step.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n{}\n",
+            step_script(CI, "The pinned toolchain is the one that runs")
+        ),
+    )
+    .expect("write the step");
+
+    let out = Command::new("bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            script.to_str().expect("a utf-8 path"),
+        ])
+        .current_dir(&scratch)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .output()
+        .expect("bash must be present");
+    let _ = fs::remove_dir_all(&scratch);
+    out
+}
+
+#[test]
+fn the_toolchain_step_passes_when_the_running_compiler_is_the_pinned_one() {
+    let out = run_toolchain_step(pinned_toolchain());
+    assert!(
+        out.status.success(),
+        "the step must pass when rustc and cargo report the pinned version:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(pinned_toolchain()),
+        "and it must say which version it found"
+    );
+}
+
+/// The case that matters: a compiler that is not the pinned one has to fail the job, not annotate it.
+#[test]
+fn the_toolchain_step_fails_when_the_running_compiler_is_not_the_pinned_one() {
+    let wrong = "1.70.0";
+    assert_ne!(
+        wrong,
+        pinned_toolchain(),
+        "the fixture must actually differ"
+    );
+    let out = run_toolchain_step(wrong);
+    assert!(
+        !out.status.success(),
+        "a compiler that is not the pinned one must fail the job. An annotation without a non-zero \
+         exit is a green run that built with the wrong compiler:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("::error::") && said.contains(wrong) && said.contains(pinned_toolchain()),
+        "the failure must name both versions, or nobody can tell what outranked the file: {said}"
+    );
+}
+
+// ── The lists above are hand-written, so this is what notices a new one ──────────────────────────
+
+/// Every workflow in the directory is one of the workflows these checks read.
+///
+/// `build_paths()` and the toolchain check both name their files by hand, which is the same shape of
+/// omission that let the Dockerfile keep an unlocked build while the release had one. Adding
+/// `.github/workflows/nightly.yaml` with an unlocked `cargo build` and a floating toolchain ref left
+/// the whole suite green, because nothing reads the directory.
+///
+/// This does not check the new file's contents: it fails, and names it, so whoever added it adds it
+/// to the lists. A check that tried to guess what a new workflow should contain would be a check
+/// nobody could add a workflow past.
+#[test]
+fn no_workflow_exists_that_these_checks_do_not_read() {
+    let dir = repo(".github/workflows");
+    let mut present: Vec<String> = fs::read_dir(&dir)
+        .expect("the workflows directory")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".yaml") || name.ends_with(".yml"))
+        .collect();
+    present.sort();
+
+    let mut read: Vec<String> = build_paths()
+        .iter()
+        .map(|(path, _)| path.to_string())
+        .filter(|path| path.starts_with(".github/workflows/"))
+        .map(|path| path.trim_start_matches(".github/workflows/").to_string())
+        .collect();
+    read.sort();
+
+    assert!(
+        !present.is_empty(),
+        "no workflows found, so this check is looking in the wrong place: {}",
+        dir.display()
+    );
+    assert_eq!(
+        present, read,
+        "a workflow exists that the --locked and toolchain checks do not read. Add it to \
+         build_paths() and to every_workflow_installs_exactly_the_pinned_toolchain, or those checks \
+         silently stop covering the build."
+    );
+}
+
+/// The release build is gated on the supply-chain audit, and the gate is an edge nothing asserted.
+///
+/// The audit step's presence in both workflows was checked; that the job carrying it gates the build
+/// was not. Deleting `needs: supply-chain` from release.yaml left the suite green, so the published
+/// binary could be built without the audit having run, which is the whole point of having one.
+#[test]
+fn the_release_build_waits_for_the_supply_chain_audit() {
+    assert!(
+        RELEASE.contains("needs: supply-chain"),
+        "release.yaml's build job must declare `needs: supply-chain`, or the asset a stranger \
+         downloads is built without the build-script audit having run"
+    );
+    // And the audit job must not be skippable, or the edge leads to a job that did nothing.
+    let audit_job = RELEASE
+        .split("\n  supply-chain:")
+        .nth(1)
+        .or_else(|| CI.split("\n  supply-chain:").nth(1))
+        .expect("a supply-chain job in one of the workflows");
+    let body: String = audit_job
+        .lines()
+        .take_while(|line| {
+            line.trim().is_empty() || line.starts_with("    ") || line.starts_with("      ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !body.contains("if:"),
+        "the supply-chain job carries an `if:`, so the gate can be skipped and the build proceeds \
+         anyway:\n{body}"
+    );
+}
+
+/// The image's compiler is the pinned one, by its tag rather than by an accident of precedence.
+///
+/// `FROM rust:1.96-slim` is a floating tag: any 1.96.x, re-pushed at will. The toolchain check read
+/// only `uses: dtolnay/rust-toolchain@` lines, so nothing tied the image's compiler to
+/// rust-toolchain.toml, and because the Dockerfile copies that file in, the version was resolved by
+/// rustup's directory override. That is the accident CI was changed to stop relying on, left alive in
+/// the one build path that produces the hosted server.
+#[test]
+fn the_image_builds_with_exactly_the_pinned_compiler() {
+    let from = DOCKERFILE
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("FROM rust:"))
+        .expect("the Dockerfile must build from a rust image");
+    let tag = from.split_whitespace().next().unwrap_or(from);
+    let version = tag.split('-').next().unwrap_or(tag);
+    assert_eq!(
+        version,
+        pinned_toolchain(),
+        "the image builds on rust:{tag} while rust-toolchain.toml pins {}. A floating tag means the \
+         hosted server's compiler is whatever the registry had that day.",
+        pinned_toolchain()
+    );
+    assert_eq!(
+        version.matches('.').count(),
+        2,
+        "the tag must name all three numbers: {tag}"
+    );
+}
+
+/// The install block verifies before it makes anything executable, and the chain is what enforces it.
+///
+/// U6's README change was exactly this: `shasum -c && chmod +x && mv` on one chain, so a file that
+/// does not match its checksum is never made executable and never run. Nothing asserted it. Reverting
+/// the three commands to separate lines, which is how they were before, left the suite green: the
+/// defect the unit fixed could come back and only a reader would notice.
+#[test]
+fn every_install_block_verifies_before_it_makes_anything_executable() {
+    let blocks: Vec<&str> = README
+        .split("```sh")
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .filter(|block| block.contains("shasum -a 256 -c") || block.contains("sha256sum -c"))
+        .filter(|block| block.contains("chmod +x"))
+        .collect();
+    assert!(
+        blocks.len() >= 3,
+        "expected one install block per platform carrying both a checksum and a chmod, found {}",
+        blocks.len()
+    );
+
+    for block in blocks {
+        // The checksum, the chmod and the mv must be one chain. A newline between them is a file
+        // made executable whatever the checksum said.
+        let chain: Vec<&str> = block
+            .lines()
+            .map(str::trim)
+            .skip_while(|line| {
+                !(line.contains("shasum -a 256 -c") || line.contains("sha256sum -c"))
+            })
+            .take_while(|line| !line.is_empty())
+            .collect();
+        assert!(
+            !chain.is_empty(),
+            "no checksum line found in a block that contains one:\n{block}"
+        );
+        let joined = chain.join(" ");
+        assert!(
+            joined.contains("&&"),
+            "the checksum and what follows it are not chained, so a file that fails the check is \
+             still made executable:\n{}",
+            chain.join("\n")
+        );
+        let checksum_at = joined
+            .find("-c ")
+            .expect("the checksum command is in this chain");
+        let chmod_at = joined
+            .find("chmod +x")
+            .unwrap_or_else(|| panic!("no chmod in:\n{}", chain.join("\n")));
+        assert!(
+            checksum_at < chmod_at,
+            "the chmod runs before the checksum, which verifies nothing:\n{}",
+            chain.join("\n")
+        );
+        if let Some(mv_at) = joined.find("mv ") {
+            assert!(
+                chmod_at < mv_at,
+                "the move runs before the chmod:\n{}",
+                chain.join("\n")
+            );
+        }
+    }
+}
+
+/// The release workflow pins third-party actions to commits, not to refs.
+///
+/// `dtolnay/rust-toolchain@1.96.0` looks exact and is not: `git ls-remote` shows 1.96, 1.96.0 and
+/// 1.96.1 are all live maintained branches, so that ref pins which Rust gets installed and says
+/// nothing about the action's code. Every action in this workflow runs with write access to the job
+/// that produces the binary a stranger downloads and verifies a checksum against, which is the one
+/// place a mutable reference is least defensible. The report for this unit claimed these refs were
+/// exact; they were not.
+#[test]
+fn the_release_workflow_pins_every_third_party_action_to_a_commit() {
+    let uses: Vec<&str> = RELEASE
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            line.strip_prefix("- uses: ")
+                .or_else(|| line.strip_prefix("uses: "))
+        })
+        .collect();
+    assert!(
+        uses.len() >= 6,
+        "expected the release workflow to use several actions, found {}",
+        uses.len()
+    );
+
+    for entry in uses {
+        let (reference, comment) = entry.split_once('#').unwrap_or((entry, ""));
+        let reference = reference.trim();
+        let at = reference
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("{reference} names no ref at all"))
+            .1;
+        assert_eq!(
+            at.len(),
+            40,
+            "{reference} is pinned to a ref rather than a commit. A ref is mutable, and this \
+             workflow produces the asset a stranger downloads."
+        );
+        assert!(
+            at.chars().all(|c| c.is_ascii_hexdigit()),
+            "{reference} does not look like a commit hash"
+        );
+        assert!(
+            !comment.trim().is_empty(),
+            "{reference} has no trailing comment saying which version it is, and a bare hash tells \
+             a reviewer nothing"
+        );
+    }
 }

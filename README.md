@@ -103,9 +103,11 @@ release attaches a `.sha256` beside every asset, and it is one line, `<hex>  <as
 checker finds the asset, so download both into the same directory and verify before renaming
 anything.
 
-Pick the tool your machine actually has. macOS ships `shasum` and no `sha256sum`; Linux distributions
-ship `sha256sum` from coreutils and carry `shasum` only with the full perl package, which a slim
-container image usually lacks. Both read the same file, so either works wherever both exist:
+Pick the tool your machine actually has. `shasum` is present on macOS and on any Linux with the full
+perl package, which a slim container image usually lacks; `sha256sum` comes from coreutils on Linux
+and, on recent macOS, ships as an Apple-signed binary in `/sbin` (an earlier version of this sentence
+said macOS has no `sha256sum`, which was simply wrong). Both read the same file, so on a machine with
+both, either works:
 
 ```sh
 shasum -a 256 -c rill-wallet-darwin-arm64.sha256   # macOS

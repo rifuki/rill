@@ -78,7 +78,15 @@ pub enum BookError {
     /// The simulation ran but returned nothing to read.
     NoReturnValue,
     /// The bytes were not the u64 the function is declared to return.
-    UnreadableValue,
+    /// A return value that is not the type it was read as, and which call produced it.
+    ///
+    /// The call site is carried because two readers share this parser: the mid-price read and the
+    /// pool-parameter read. Without it, a pool-parameter value of the wrong length told a `rill
+    /// order` user that "the mid-price call returned something that is not a u64", a read they never
+    /// made, which is the misattribution this module's own comments condemn one function further up.
+    UnreadableValue {
+        call: &'static str,
+    },
     /// `pool_book_params` is declared to return three u64s and returned a different number of them.
     WrongParameterCount {
         found: usize,
@@ -95,9 +103,9 @@ impl std::fmt::Display for BookError {
                 "the mid-price simulation returned no value; the pool may not be registered on \
                  this network"
             ),
-            Self::UnreadableValue => write!(
+            Self::UnreadableValue { call } => write!(
                 f,
-                "the mid-price call returned something that is not a u64; refusing to guess at it"
+                "{call} returned something that is not a u64; refusing to guess at it"
             ),
             Self::WrongParameterCount { found } => write!(
                 f,
@@ -268,9 +276,9 @@ pub fn parse_book_params(returned: &[&[u8]]) -> Result<BookParams, BookError> {
         });
     }
     let values = [
-        parse_u64_return(returned[0])?,
-        parse_u64_return(returned[1])?,
-        parse_u64_return(returned[2])?,
+        parse_u64_return_from(POOL_PARAMS_CALL, returned[0])?,
+        parse_u64_return_from(POOL_PARAMS_CALL, returned[1])?,
+        parse_u64_return_from(POOL_PARAMS_CALL, returned[2])?,
     ];
     Ok(BookParams {
         tick_size: values[0],
@@ -279,13 +287,23 @@ pub fn parse_book_params(returned: &[&[u8]]) -> Result<BookParams, BookError> {
     })
 }
 
+/// The Move call the pool-parameter read makes, named once so a refusal and the code agree.
+const POOL_PARAMS_CALL: &str = "pool_book_params";
+
 /// Read a u64 out of a command's BCS return value.
 ///
 /// BCS encodes a u64 as eight little-endian bytes and nothing else, so anything of a different
 /// length is a different type — and reading it anyway would produce a plausible number from the
 /// wrong bytes, which is worse than refusing.
 pub fn parse_u64_return(bytes: &[u8]) -> Result<u64, BookError> {
-    let eight: [u8; 8] = bytes.try_into().map_err(|_| BookError::UnreadableValue)?;
+    parse_u64_return_from("the mid-price call", bytes)
+}
+
+/// The same read, told which call produced the bytes so a refusal can name it.
+pub fn parse_u64_return_from(call: &'static str, bytes: &[u8]) -> Result<u64, BookError> {
+    let eight: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| BookError::UnreadableValue { call })?;
     Ok(u64::from_le_bytes(eight))
 }
 
@@ -387,11 +405,15 @@ mod tests {
     fn a_return_value_of_the_wrong_size_is_refused() {
         assert!(matches!(
             parse_u64_return(&[1, 2, 3]),
-            Err(BookError::UnreadableValue)
+            Err(BookError::UnreadableValue {
+                call: "the mid-price call"
+            })
         ));
         assert!(matches!(
             parse_u64_return(&[0u8; 16]),
-            Err(BookError::UnreadableValue)
+            Err(BookError::UnreadableValue {
+                call: "the mid-price call"
+            })
         ));
     }
 
@@ -493,7 +515,12 @@ mod tests {
         let short = [1u8, 2, 3];
         assert_eq!(
             parse_book_params(&[&good, &short, &good]),
-            Err(BookError::UnreadableValue)
+            // Named for the read that actually made the call. This asserted "the mid-price call"
+            // until the variant started carrying its call site, which is to say it asserted the
+            // misattribution rather than catching it.
+            Err(BookError::UnreadableValue {
+                call: POOL_PARAMS_CALL
+            })
         );
     }
 
@@ -521,5 +548,44 @@ mod tests {
             ),
             "the parameter read references the same pool and must refuse on the same ground"
         );
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    /// A refusal must name the call that produced the bytes, not a call the reader never made.
+    ///
+    /// Three readers share this error: the mid-price read, the pool-parameter read, and the rule-list
+    /// read in `policy_read`. The message was fixed text about the mid-price call, so a pool
+    /// parameter of the wrong length told a `rill order` user their mid-price read had failed. That
+    /// sends them to look at a call they did not make, which is the misattribution this module
+    /// objects to elsewhere in its own comments.
+    #[test]
+    fn a_pool_parameter_of_the_wrong_length_blames_the_pool_parameter_read() {
+        let short = 7u32.to_le_bytes();
+        let eight = 10_000_000u64.to_le_bytes();
+        let err = parse_book_params(&[&short[..], &eight[..], &eight[..]])
+            .expect_err("four bytes is not a u64");
+        let said = err.to_string();
+        assert!(
+            said.contains(POOL_PARAMS_CALL),
+            "the refusal must name the pool-parameter read: {said}"
+        );
+        assert!(
+            !said.contains("mid-price"),
+            "and must not blame a call the reader never made: {said}"
+        );
+    }
+
+    /// The mid-price read keeps its own wording, so naming the call did not simply move the problem.
+    #[test]
+    fn a_mid_price_value_of_the_wrong_length_still_blames_the_mid_price_call() {
+        let said = parse_u64_return(&[1, 2, 3])
+            .expect_err("three bytes is not a u64")
+            .to_string();
+        assert!(said.contains("mid-price"), "{said}");
+        assert!(!said.contains(POOL_PARAMS_CALL), "{said}");
     }
 }

@@ -82,12 +82,19 @@ pub fn policy_rules_transaction(
     Ok(built)
 }
 
+/// The Move call this module reads, named once so a refusal says which read failed.
+///
+/// `BookError::UnreadableValue` is shared with the mid-price and pool-parameter reads in `book.rs`.
+/// Without a name, a malformed rule list told a reader that the mid-price call had failed, a call
+/// they never made.
+const POLICY_RULES_CALL: &str = "the policy_rules read";
+
 /// Decode `vector<TypeName>` from a command's BCS return value.
 ///
 /// A `TypeName` is a struct holding one `String`, and BCS encodes both transparently: the vector's
 /// ULEB128 length, then each string's ULEB128 length and its bytes. Anything that does not decode
-/// cleanly is refused rather than partially read — a half-decoded rule list would produce a prove
-/// sequence that aborts at the last command, which is the failure this exists to prevent.
+/// cleanly is refused rather than partially read, because a half-decoded rule list would produce a
+/// prove sequence that aborts at the last command, which is the failure this exists to prevent.
 pub fn parse_type_names(bytes: &[u8]) -> Result<Vec<String>, BookError> {
     let mut cursor = 0usize;
     let count = read_uleb128(bytes, &mut cursor)?;
@@ -97,15 +104,25 @@ pub fn parse_type_names(bytes: &[u8]) -> Result<Vec<String>, BookError> {
         let length = read_uleb128(bytes, &mut cursor)? as usize;
         let end = cursor
             .checked_add(length)
-            .ok_or(BookError::UnreadableValue)?;
-        let raw = bytes.get(cursor..end).ok_or(BookError::UnreadableValue)?;
-        names.push(String::from_utf8(raw.to_vec()).map_err(|_| BookError::UnreadableValue)?);
+            .ok_or(BookError::UnreadableValue {
+                call: POLICY_RULES_CALL,
+            })?;
+        let raw = bytes.get(cursor..end).ok_or(BookError::UnreadableValue {
+            call: POLICY_RULES_CALL,
+        })?;
+        names.push(
+            String::from_utf8(raw.to_vec()).map_err(|_| BookError::UnreadableValue {
+                call: POLICY_RULES_CALL,
+            })?,
+        );
         cursor = end;
     }
 
     if cursor != bytes.len() {
         // Trailing bytes mean this was not the type it was read as.
-        return Err(BookError::UnreadableValue);
+        return Err(BookError::UnreadableValue {
+            call: POLICY_RULES_CALL,
+        });
     }
     Ok(names)
 }
@@ -114,17 +131,23 @@ fn read_uleb128(bytes: &[u8], cursor: &mut usize) -> Result<u64, BookError> {
     let mut value = 0u64;
     let mut shift = 0u32;
     loop {
-        let byte = *bytes.get(*cursor).ok_or(BookError::UnreadableValue)?;
+        let byte = *bytes.get(*cursor).ok_or(BookError::UnreadableValue {
+            call: POLICY_RULES_CALL,
+        })?;
         *cursor += 1;
         value |= u64::from(byte & 0x7f)
             .checked_shl(shift)
-            .ok_or(BookError::UnreadableValue)?;
+            .ok_or(BookError::UnreadableValue {
+                call: POLICY_RULES_CALL,
+            })?;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
         shift += 7;
         if shift > 63 {
-            return Err(BookError::UnreadableValue);
+            return Err(BookError::UnreadableValue {
+                call: POLICY_RULES_CALL,
+            });
         }
     }
 }
@@ -180,7 +203,9 @@ mod tests {
         let full = encode(&["b02f39d6::budget::Rule"]);
         assert!(matches!(
             parse_type_names(&full[..full.len() - 3]),
-            Err(BookError::UnreadableValue)
+            Err(BookError::UnreadableValue {
+                call: POLICY_RULES_CALL
+            })
         ));
     }
 
@@ -190,7 +215,9 @@ mod tests {
         bytes.push(0);
         assert!(matches!(
             parse_type_names(&bytes),
-            Err(BookError::UnreadableValue)
+            Err(BookError::UnreadableValue {
+                call: POLICY_RULES_CALL
+            })
         ));
     }
 

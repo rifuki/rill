@@ -130,8 +130,12 @@ impl GrpcSui {
             .into_inner();
 
         // A node that answers without the bytes is not the same thing as a node that says the
-        // digest is unknown, but both leave the caller with nothing to decode, and decoding an
-        // empty buffer would report "this transaction called nothing", a false acquittal.
+        // digest is unknown, and it used to share NotFound with it. Callers handle pruning by moving
+        // on, which is right for a digest the node does not have and wrong for a response missing
+        // what the read mask asked for: the second is a fault here, and a caller that moves on has
+        // turned it into a test that passes by skipping. Reducing the mask to ["digest"] made a live
+        // test do exactly that, which is how this was found. Decoding an empty buffer would be worse
+        // again, reporting "this transaction called nothing", a false acquittal.
         let bytes = response
             .transaction
             .as_ref()
@@ -139,9 +143,9 @@ impl GrpcSui {
             .and_then(|t| t.bcs.as_ref())
             .and_then(|b| b.value.as_ref())
             .ok_or_else(|| {
-                ChainError::NotFound(format!(
-                    "the node returned no transaction bytes for {digest}; it may not have that \
-                     transaction, or it may be pruned"
+                ChainError::Malformed(format!(
+                    "the node answered for {digest} but carried no transaction bytes, so the read \
+                     mask did not ask for them"
                 ))
             })?;
 

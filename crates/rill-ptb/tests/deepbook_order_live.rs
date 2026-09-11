@@ -155,6 +155,11 @@ async fn owned(chain: &GrpcSui, id: &str, label: &str) -> ObjectInput {
 async fn landed_bytes(chain: &GrpcSui, digest: &str) -> Option<String> {
     match chain.landed_transaction_base64(digest).await {
         Ok(b64) => Some(b64),
+        // Pruning only. A node that answers without the bytes the read mask asked for used to share
+        // this variant, so reducing the mask made this test pass by skipping every digest: a fault
+        // in the request read as a condition of the chain. That is ChainError::Malformed now and
+        // falls to the arm below, which is the difference between a test that skips and one that
+        // fails.
         Err(rill_chain::ChainError::NotFound(reason)) => {
             println!("  pruned from this fullnode: {reason}");
             None

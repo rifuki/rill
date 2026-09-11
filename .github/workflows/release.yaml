@@ -1,5 +1,17 @@
 name: Release
 
+# Third-party actions are pinned to commits, not to refs.
+#
+# `dtolnay/rust-toolchain@1.96.0` looks exact and is not: `git ls-remote` shows 1.96, 1.96.0 and
+# 1.96.1 are all live maintained branches, so the ref pins which Rust the action installs and says
+# nothing about the action's own code. Every action here runs with write access to the job that
+# produces the binary a stranger downloads, which is the one place a mutable ref is least
+# acceptable. The version each commit corresponds to is in the trailing comment, because a bare
+# forty-character hash tells a reviewer nothing about what it is supposed to be.
+#
+# Updating one: resolve the tag with `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`, read
+# what changed, then change both the hash and the comment in the same commit.
+
 # The asset names are a contract, not a convention. README.md's Install section hands users a curl
 # command pointing at these exact filenames, and bins/rill/tests/release_contract.rs asserts that
 # the names here, the names in the README, and the name the binary prints are one and the same.
@@ -40,8 +52,8 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@ebb3d1676050bfd0971c36c1e215b5751473994d # 1.96.0
       - name: Cargo.lock is already what the manifests resolve to
         run: cargo metadata --format-version 1 --locked > /dev/null
       - name: No dependency gained a build script without review
@@ -72,16 +84,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset: rill-wallet-linux-x64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@ebb3d1676050bfd0971c36c1e215b5751473994d # 1.96.0
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
 
       - name: protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -120,7 +132,7 @@ jobs:
           cp target/${{ matrix.target }}/release/rill-wallet "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -135,13 +147,13 @@ jobs:
     # and then silently attaches them to nothing.
     if: startsWith(github.ref, 'refs/tags/rill-wallet-v') || startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
       # Checksums ship alongside the binaries. A user handed a curl command has no other way to
       # tell whether what arrived is what was built.
       - name: Attach every asset to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             rill-wallet-darwin-arm64

@@ -4,7 +4,14 @@
 # node_modules, and needed the repository root as build context because the backend imported a
 # sibling package by relative path. A static binary needs neither.
 
-FROM rust:1.96-slim AS builder
+# The exact version rust-toolchain.toml pins, not the 1.96 line.
+#
+# A floating minor tag is any 1.96.x, re-pushed at will, so the image's compiler was decided by
+# whatever Docker Hub had that day. Worse, this file copies rust-toolchain.toml in, so the version
+# resolved through rustup's directory override: the same accident CI was changed to stop relying on,
+# still live in the one build path that produces the hosted server. supply_chain.rs asserts this tag
+# equals the pinned channel.
+FROM rust:1.96.0-slim AS builder
 WORKDIR /build
 
 # protoc is needed to build the Sui gRPC bindings; pkg-config and libssl for the TLS stack.

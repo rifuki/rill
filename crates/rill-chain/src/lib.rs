@@ -128,6 +128,16 @@ pub enum ChainError {
     /// The node answered, and the answer was a refusal.
     Rejected(String),
     NotFound(String),
+    /// The node answered about a thing that exists, and the answer was missing the part that was
+    /// asked for.
+    ///
+    /// Distinct from [`NotFound`](Self::NotFound) because the two call for opposite responses and a
+    /// caller cannot tell them apart once they share a variant. A digest the node does not have is a
+    /// chain condition, and a caller that handles pruning by moving on is right to. A response that
+    /// arrives without the bytes the read mask asked for is a fault in the request, and a caller
+    /// that moves on has turned a bug in its own code into a silently skipped test: reducing the
+    /// mask to `["digest"]` made a live test pass by skipping, which is how this was found.
+    Malformed(String),
 }
 
 impl std::fmt::Display for ChainError {
@@ -136,6 +146,11 @@ impl std::fmt::Display for ChainError {
             Self::Transport(m) => write!(f, "could not reach the Sui node: {m}"),
             Self::Rejected(m) => write!(f, "the Sui node refused the request: {m}"),
             Self::NotFound(m) => write!(f, "not found on chain: {m}"),
+            Self::Malformed(m) => write!(
+                f,
+                "the Sui node answered but the answer was not usable, which is a fault in the \
+                 request rather than a condition of the chain: {m}"
+            ),
         }
     }
 }
@@ -697,5 +712,43 @@ mod advice_tests {
         let advice = refusal("time_window", 1).advice();
         assert!(advice.contains("time bound"));
         assert!(!advice.to_lowercase().contains("spend less"));
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::ChainError;
+
+    /// A missing digest and a missing field are different conditions and must not share a variant.
+    ///
+    /// They did. Callers handle pruning by moving on, which is right for a digest the node does not
+    /// have and wrong for an answer that arrived without what the read mask asked for: the second is
+    /// a fault in the request, and moving on turns it into a test that passes by skipping. Reducing
+    /// a read mask to `["digest"]` made a live test skip every digest it was written to check.
+    #[test]
+    fn an_answer_missing_its_bytes_is_not_the_same_error_as_a_digest_the_node_lacks() {
+        let absent = ChainError::NotFound("no such digest".into());
+        let empty = ChainError::Malformed("answered without the bytes".into());
+        assert_ne!(absent, empty);
+        assert!(
+            !matches!(empty, ChainError::NotFound(_)),
+            "a caller matching NotFound to handle pruning must not also catch this"
+        );
+    }
+
+    /// And the two must read differently, because the reader decides what to do next from the words.
+    #[test]
+    fn the_two_say_which_one_happened() {
+        let absent = ChainError::NotFound("x".into()).to_string();
+        let empty = ChainError::Malformed("x".into()).to_string();
+        assert!(absent.contains("not found on chain"), "{absent}");
+        assert!(
+            empty.contains("fault in the request rather than a condition of the chain"),
+            "the message has to place the blame, or a reader retries against a healthy node: {empty}"
+        );
+        assert!(
+            !empty.contains("not found on chain"),
+            "and it must not read as absence: {empty}"
+        );
     }
 }
