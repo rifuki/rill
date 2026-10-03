@@ -262,6 +262,18 @@ async fn handle_tool_call(state: &AppState, owner: &str, id: Value, message: &Va
         "rill_describe_action" => {
             let wanted = arguments.get("actionId").and_then(Value::as_str);
             match wanted.and_then(|w| catalogue.iter().find(|s| s.id == w)) {
+                Some(skill) if skill.flow.get("studio").and_then(Value::as_bool) == Some(true) => {
+                    tool_ok(
+                        id,
+                        json!({
+                            "actionId": skill.id, "name": skill.name, "description": skill.description,
+                            "network": state.config.network.as_str(), "flow": skill.flow,
+                            "requiredArguments": ["sender", "agentWallet"],
+                            "tool": crate::studio_api::tool_definition(skill),
+                            "buildsWhatExactly": "The stored Studio graph, funded by the supplied agent wallet. The server never signs."
+                        }),
+                    )
+                }
                 Some(skill) => tool_ok(
                     id,
                     json!({
@@ -400,6 +412,16 @@ async fn build_action(
             "action_unavailable",
             "Action is not available from this endpoint.",
         );
+    }
+
+    if let Some(skill) = catalogue
+        .iter()
+        .find(|s| s.id == action_id && s.flow.get("studio").and_then(Value::as_bool) == Some(true))
+    {
+        return match crate::studio_api::build_published(state, skill, arguments).await {
+            Ok(envelope) => tool_ok(id, envelope),
+            Err(reason) => tool_error(id, "build_refused", &reason),
+        };
     }
 
     let Some(deepbook) = state.deepbook_package_id.as_deref() else {

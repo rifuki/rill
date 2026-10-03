@@ -7,7 +7,7 @@
 //!
 //! Three checks, in descending order of how hard they are to fake:
 //!
-//! 1. The crate links no signing library. A binary without one cannot sign whatever its code says.
+//! 1. The crate links no Sui transaction-signing library. Wallet login uses verification primitives.
 //! 2. No source file under the server reaches for a key, a keypair, or a signing call.
 //! 3. What it returns over HTTP is an unsigned transaction and carries no signature field.
 //!

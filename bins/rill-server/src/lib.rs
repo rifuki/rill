@@ -11,3 +11,10 @@ pub mod oauth_routes;
 pub mod request;
 pub mod routes;
 pub mod state;
+pub mod studio_auth;
+pub mod studio_compile;
+
+pub mod studio_api;
+pub mod studio_setup;
+
+pub mod studio_manifest;

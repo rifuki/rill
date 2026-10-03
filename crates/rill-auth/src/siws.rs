@@ -77,6 +77,120 @@ pub fn sanitize_client_name(raw: &str) -> Option<String> {
     (!bounded.is_empty()).then_some(bounded)
 }
 
+/// A stable rejection for malformed, unsupported, or invalid wallet signatures.
+#[derive(Debug, thiserror::Error)]
+pub enum SignInError {
+    #[error("Signature verification failed.")]
+    InvalidSignature,
+    #[error(
+        "This signature scheme is not supported. Use Ed25519, Secp256k1, Secp256r1, or multisig."
+    )]
+    UnsupportedScheme,
+}
+
+/// Verify the exact stored message using Sui's personal-message intent and derive its signer.
+/// No address provided by the caller participates in authentication.
+pub fn verify_sign_in_signature(message: &str, encoded: &str) -> Result<String, SignInError> {
+    use sui_sdk_types::{PersonalMessage, UserSignature};
+    let signature =
+        UserSignature::from_base64(encoded.trim()).map_err(|_| SignInError::InvalidSignature)?;
+    let digest = PersonalMessage(message.as_bytes().into()).signing_digest();
+    match &signature {
+        UserSignature::Simple(simple) => verify_simple(&digest, simple)?,
+        UserSignature::Multisig(multisig) => verify_multisig(&digest, multisig)?,
+        _ => return Err(SignInError::UnsupportedScheme),
+    }
+    Ok(signature.derive_address().to_string())
+}
+
+fn verify_simple(
+    digest: &[u8],
+    signature: &sui_sdk_types::SimpleSignature,
+) -> Result<(), SignInError> {
+    use k256::ecdsa::signature::Verifier as _;
+    use sui_sdk_types::SimpleSignature;
+    let invalid = |_| SignInError::InvalidSignature;
+    match signature {
+        SimpleSignature::Ed25519 {
+            signature,
+            public_key,
+        } => {
+            let key =
+                ed25519_dalek::VerifyingKey::from_bytes(public_key.inner()).map_err(invalid)?;
+            key.verify_strict(
+                digest,
+                &ed25519_dalek::Signature::from_bytes(signature.inner()),
+            )
+            .map_err(invalid)
+        }
+        SimpleSignature::Secp256k1 {
+            signature,
+            public_key,
+        } => {
+            let key =
+                k256::ecdsa::VerifyingKey::from_sec1_bytes(public_key.inner()).map_err(invalid)?;
+            let signature =
+                k256::ecdsa::Signature::from_slice(signature.inner()).map_err(invalid)?;
+            key.verify(digest, &signature).map_err(invalid)
+        }
+        SimpleSignature::Secp256r1 {
+            signature,
+            public_key,
+        } => {
+            let key =
+                p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key.inner()).map_err(invalid)?;
+            let signature =
+                p256::ecdsa::Signature::from_slice(signature.inner()).map_err(invalid)?;
+            key.verify(digest, &signature).map_err(invalid)
+        }
+        _ => Err(SignInError::UnsupportedScheme),
+    }
+}
+
+fn verify_multisig(
+    digest: &[u8],
+    signature: &sui_sdk_types::MultisigAggregatedSignature,
+) -> Result<(), SignInError> {
+    use sui_sdk_types::{
+        MultisigMemberPublicKey as Key, MultisigMemberSignature as Sig, SimpleSignature,
+    };
+    let committee = signature.committee();
+    if !committee.is_valid()
+        || signature.signatures().len() != signature.bitmap().count_ones() as usize
+    {
+        return Err(SignInError::InvalidSignature);
+    }
+    let indices = (0..16).filter(|i| signature.bitmap() & (1 << i) != 0);
+    let mut weight = 0u16;
+    for (index, member_signature) in indices.zip(signature.signatures()) {
+        let member = committee
+            .members()
+            .get(index)
+            .ok_or(SignInError::InvalidSignature)?;
+        let simple = match (member.public_key(), member_signature) {
+            (Key::Ed25519(public_key), Sig::Ed25519(signature)) => SimpleSignature::Ed25519 {
+                public_key: *public_key,
+                signature: *signature,
+            },
+            (Key::Secp256k1(public_key), Sig::Secp256k1(signature)) => SimpleSignature::Secp256k1 {
+                public_key: *public_key,
+                signature: *signature,
+            },
+            (Key::Secp256r1(public_key), Sig::Secp256r1(signature)) => SimpleSignature::Secp256r1 {
+                public_key: *public_key,
+                signature: *signature,
+            },
+            _ => return Err(SignInError::UnsupportedScheme),
+        };
+        verify_simple(digest, &simple)?;
+        weight += u16::from(member.weight());
+    }
+    if weight < committee.threshold() {
+        return Err(SignInError::InvalidSignature);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

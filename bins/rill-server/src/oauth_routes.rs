@@ -1,37 +1,23 @@
-//! The four OAuth 2.1 endpoints the discovery document promises.
-//!
-//! # Advertising an endpoint that does not exist is worse than not advertising it
-//!
-//! `/.well-known/oauth-authorization-server` told every client where to register, authorize and get
-//! tokens, and all four addresses returned 404. An MCP client that respects discovery — which is
-//! the point of discovery — could not connect at all, and the failure looked like a broken server
-//! rather than a missing one. Nine hundred lines of working auth logic sat behind routes nobody had
-//! written.
-//!
-//! # What is deliberately not here
-//!
-//! No client secret. Dynamic registration issues a public client, and the security comes from PKCE
-//! plus an exact redirect-URI match rather than from a shared secret an MCP client would have to
-//! store somewhere a model can read.
-//!
-//! No consent screen. `/oauth/authorize` here binds an authorization code to a subject the operator
-//! configures; a hosted deployment puts a human in front of it. That difference is stated in the
-//! response rather than hidden, so nobody mistakes this for an approval flow it is not.
+//! OAuth 2.1 registration, wallet-backed authorization, token exchange, and revocation.
 
 use axum::extract::{Query, State};
-use axum::response::Response;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use rill_auth::oauth::{
     check_redirect_uri_registered, is_allowed_redirect_uri, is_valid_pkce_value,
     narrow_to_build_surface, normalize_scope, resolve_resource, verify_pkce,
 };
+use rill_auth::siws::sanitize_client_name;
 use rill_auth::tokens::{
     bearer_from_header, random_id, secret_matches, sign_token, verify_token, Expectation,
     TokenClaims, TokenKind,
 };
-use rill_store::{AgentHandle, AuthorizationCode, OAuthClient, OAuthStore, RefreshHandle};
+use rill_store::{
+    AgentHandle, AuthorizationRequest, OAuthClient, OAuthStore, RefreshHandle, RequestKind,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use url::Url;
 
 use crate::envelope::{oauth_err, oauth_ok};
 use crate::state::AppState;
@@ -62,10 +48,6 @@ pub const AGENT_TOKEN_GRANT: &str = "urn:rill:params:oauth:grant-type:agent-toke
 /// is the point. A fixed, recognisable id names the path the credential came from, so a handle in
 /// the store says how it was minted rather than naming a client that does not exist.
 pub const AGENT_CLIENT_ID: &str = "rill-agent-credential";
-
-/// How long an authorization code lives. Long enough to redirect, short enough to be useless if
-/// it leaks into a log or a referrer header.
-const CODE_TTL_MS: u64 = 60 * 1000;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -119,7 +101,10 @@ pub async fn register(
 
     let client = OAuthClient {
         client_id: random_id(),
-        client_name: request.client_name,
+        client_name: request
+            .client_name
+            .as_deref()
+            .and_then(sanitize_client_name),
         redirect_uris: request.redirect_uris,
         scope,
         created_at: chrono_now(),
@@ -156,6 +141,7 @@ fn chrono_now() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
+    pub response_type: Option<String>,
     pub client_id: String,
     pub redirect_uri: String,
     pub code_challenge: String,
@@ -165,11 +151,7 @@ pub struct AuthorizeQuery {
     pub resource: Option<String>,
 }
 
-/// Issue an authorization code bound to a PKCE challenge.
-///
-/// Returns the code as JSON rather than redirecting. A redirect is what a browser flow needs and
-/// this deployment has no consent screen to redirect back from — pretending otherwise would give a
-/// client a code it did not have a human approve.
+/// Park an authorization request and redirect the user to Studio for wallet consent.
 pub async fn authorize(
     State(state): State<AppState>,
     Query(query): Query<AuthorizeQuery>,
@@ -182,9 +164,16 @@ pub async fn authorize(
         return bad_request(e.code, &e.description);
     }
 
+    if query.response_type.as_deref() != Some("code") {
+        return bad_request(
+            "unsupported_response_type",
+            "Only response_type=code is supported",
+        );
+    }
+
     // S256 only. `plain` is in the spec and defeats the purpose — an interceptor who has the
     // challenge has the verifier.
-    if query.code_challenge_method.as_deref().unwrap_or("S256") != "S256" {
+    if query.code_challenge_method.as_deref() != Some("S256") {
         return bad_request(
             "invalid_request",
             "only S256 is accepted; plain PKCE offers no protection against an interceptor",
@@ -213,34 +202,58 @@ pub async fn authorize(
         Err(e) => return bad_request(e.code, &e.description),
     };
 
-    let code = AuthorizationCode {
-        code: random_id(),
-        client_id: client.client_id.clone(),
-        redirect_uri: query.redirect_uri.clone(),
-        code_challenge: query.code_challenge,
-        // The subject this deployment issues for. A hosted one puts a human here.
-        sub: format!("client:{}", client.client_id),
-        scope,
-        resource,
-        expires_at: now_ms() + CODE_TTL_MS,
+    let expires_at = now_ms() + crate::studio_auth::REQUEST_TTL_MS;
+    let client_name = client.client_name.as_deref().and_then(sanitize_client_name);
+    let message = match crate::studio_auth::message(
+        &state,
+        client_name.as_deref().unwrap_or("an AI agent"),
+        &resource,
+        &scope,
+        expires_at,
+    ) {
+        Ok(message) => message,
+        Err(error) => {
+            return oauth_err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                error,
+            )
+        }
     };
-
-    if let Err(e) = state.oauth.save_code(code.clone()) {
+    let request = AuthorizationRequest {
+        request_id: random_id(),
+        kind: RequestKind::Agent,
+        client_id: client.client_id,
+        client_name,
+        redirect_uri: query.redirect_uri,
+        state: query.state.map(|value| value.chars().take(512).collect()),
+        scope,
+        code_challenge: query.code_challenge,
+        resource,
+        message,
+        expires_at,
+    };
+    let mut consent_url = match Url::parse(&state.config.consent_url) {
+        Ok(url) => url,
+        Err(_) => {
+            return oauth_err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "RILL_CONSENT_URL must be a valid URL",
+            )
+        }
+    };
+    consent_url
+        .query_pairs_mut()
+        .append_pair("request", &request.request_id);
+    if let Err(error) = state.oauth.save_request(request) {
         return oauth_err(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
-            e.to_string(),
+            error.to_string(),
         );
     }
-
-    oauth_ok(json!({
-        "code": code.code,
-        "state": query.state,
-        "redirect_uri": code.redirect_uri,
-        "expires_in": CODE_TTL_MS / 1000,
-        "note": "This deployment has no consent screen: the code is returned directly rather than \
-                 redirected. A hosted deployment puts a human in front of this endpoint."
-    }))
+    Redirect::to(consent_url.as_str()).into_response()
 }
 
 fn now_ms() -> u64 {
@@ -414,13 +427,8 @@ async fn refresh_token_grant(state: AppState, request: TokenRequest) -> Response
 /// - **The scope is narrowed and refused, not dropped.** Anything outside the build surface is a
 ///   named refusal, per [`narrow_to_build_surface`].
 ///
-/// # The gap this leaves, stated rather than hidden
-///
-/// A configured shared secret is the only owner identity this repository has today: `rill-auth`'s
-/// Sign-In With Sui module builds the message a wallet signs but nothing here verifies a signature,
-/// so there is no way to prove control of an address over HTTP yet. That makes this an
-/// operator-level credential rather than a wallet-level one, and it is why the address is pinned in
-/// configuration instead of taken from the request.
+/// This operator grant remains separate from wallet login: its address and revocation policy
+/// come from deployment configuration, while interactive tokens derive their subject from a wallet.
 fn agent_token_grant(
     state: AppState,
     owner_credential: Option<&str>,

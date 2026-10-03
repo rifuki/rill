@@ -7,6 +7,41 @@ wallet. The server builds and simulates transactions **without ever holding a ke
 binary holds the key and trusts nothing the server sends without re-deriving it independently;
 two on-chain Move contracts bound every action.
 
+## Studio development
+
+The TypeScript Studio in the sibling `rill-ts/rill-frontend` directory connects directly to this Rust server. The TypeScript backend is not part of this local stack.
+
+```sh
+# In this repository. Keep generated local OAuth state outside the checkout.
+BIND_ADDRESS=127.0.0.1 \
+SKILLS_STORE_PATH=/tmp/rill-studio/skills.json \
+OAUTH_STORE_PATH=/tmp/rill-studio/oauth.json \
+RILL_CONSENT_URL=http://localhost:5173/authorize \
+cargo run --locked -p rill-server
+
+# In ../rill-ts
+bun install --frozen-lockfile
+cd rill-frontend
+bun run dev
+```
+
+Open `http://localhost:5173/builder`. The default API is `http://localhost:3939/api`; set `VITE_RILL_API_URL` to use another Rust deployment and set `RILL_CONSENT_URL` on that server to the Studio `/authorize` page.
+
+Studio uses `/api/protocols`, `/introspect`, `/resolve`, `/compile`, `/simulate`, `/publish`, `/skills`, `/capabilities/preview`, and `/setup/{prepare,attach}`. Compile and setup return base64 BCS `TransactionKind`; the browser wallet supplies sender and gas. Published action execution returns a full unsigned transaction envelope for the Rust local signer.
+
+Wallet login and connector consent verify the server's exact personal message and derive the Sui address from the signature. The old `RILL_ALLOW_OPEN_AUTHORIZATION` setting is no longer needed: all interactive authorization requires signed consent, regardless of bind address. Deployment may still set the flag for compatibility, but it does not bypass consent.
+
+Preview simulation intentionally disables ownership and gas checks and always reports `verification: unverified`, including successful previews. Published builds independently select real gas and require a successful, verified simulation; the local signer repeats its own validation and simulation.
+
+Onboarding uses two owner approvals: first create an **empty** wallet (and DeepBook capabilities when needed), then attach its rules and fund it atomically. Cancelling the second approval leaves no funds exposed in an unbounded wallet. Pending receipts and confirmed artifacts are saved per backend and owner in this browser. An uncertain submitted transaction is checked again instead of submitted twice. After success, download the run set and build arguments separately. Set `RILL_RUN_SET_PATH` for `rill-wallet`, pass the build-arguments JSON to `rill_build_action`, and hand its envelope to local `rill_execute`. Build arguments contain public object IDs only; do not put wallet keys in either file.
+
+A smoke check uses a fresh in-memory wallet for login, reads testnet, publishes to the local store, and inspects unsigned setup bytes. It never signs or submits a transaction:
+
+```sh
+# In ../rill-ts/rill-frontend, with the Rust server running
+bun scripts/rust-smoke.ts
+```
+
 ## Where things stand
 
 The workspace builds and 567 Rust tests pass. Another 51, which need a live fullnode, are
@@ -494,14 +529,7 @@ Four things about it are load-bearing:
   hands agents. Set it to the address clients will actually use. A trailing slash is fine; seven
   places read it and they all agree, which `bins/rill-server/tests/base_url.rs` holds by minting a
   token on a trailing-slash deployment and presenting it back.
-- **`RILL_ALLOW_OPEN_AUTHORIZATION=1` is an acknowledgement, not a switch to flip past.** A container
-  has to bind every interface or nothing outside it can connect, and the server refuses a wide bind
-  without this. What it acknowledges: `/oauth/authorize` has no consent step, registration is open,
-  and a public client presents no credential, so whoever can reach the published port can mint an
-  access token for the build surface and read this owner's published actions. They cannot sign, because
-  the key lives in the local `rill-wallet` binary and never in the container, and that is what bounds
-  this rather than removing it. Publish the port to a network you control. On a laptop, set
-  `BIND_ADDRESS=127.0.0.1` instead and drop the flag.
+- **`RILL_CONSENT_URL` points at Studio's `/authorize` page.** Public clients must complete wallet-signature consent before they receive an authorization code. Wallet signing keys remain in the local signer, outside this container.
 
 Without `RILL_OAUTH_SECRET` compose refuses to start rather than generate a per-boot secret, because
 a server that quietly regenerates it invalidates every token on restart and tells nobody.

@@ -33,6 +33,7 @@ fn config_with(base: &str) -> Config {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     Config {
+        consent_url: "http://localhost:5173/authorize".into(),
         port: 3939,
         network: Network::Testnet,
         public_base_url: base.into(),
@@ -42,8 +43,6 @@ fn config_with(base: &str) -> Config {
         guard_package_id: Some("0xguard".into()),
         owner_secret: None,
         owner_address: None,
-        // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
-        // tests are about the routes, not about where the socket is.
         bind_address: "127.0.0.1".into(),
         open_authorization_acknowledged: false,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
@@ -213,12 +212,7 @@ async fn a_token_minted_on_a_trailing_slash_deployment_is_accepted_at_its_own_en
         )
         .await
         .unwrap();
-    let bytes = authorized.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    let code = body["code"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a code, got {body}"))
-        .to_owned();
+    let code = complete_wallet_consent(&app, authorized).await;
 
     let exchanged = app
         .clone()
@@ -266,4 +260,66 @@ async fn a_token_minted_on_a_trailing_slash_deployment_is_accepted_at_its_own_en
         answer["result"]["tools"].is_array(),
         "the call must reach the tool surface: {answer}"
     );
+}
+
+/// Follow the same wallet-consent exchange used by Studio before a client receives its code.
+async fn complete_wallet_consent(
+    router: &axum::Router,
+    authorized: axum::response::Response,
+) -> String {
+    use sui_crypto::SuiSigner as _;
+    assert!(
+        authorized.status().is_redirection(),
+        "authorize must require wallet consent"
+    );
+    let location =
+        url::Url::parse(authorized.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let request_id = location
+        .query_pairs()
+        .find(|(key, _)| key == "request")
+        .expect("consent request id")
+        .1
+        .into_owned();
+    let prompt = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/oauth/consent/{request_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prompt.status(), StatusCode::OK);
+    let bytes = prompt.into_body().collect().await.unwrap().to_bytes();
+    let prompt: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = prompt["data"]["message"]
+        .as_str()
+        .expect("exact server-generated message");
+    let fixture_wallet = sui_crypto::ed25519::Ed25519PrivateKey::new([7; 32]);
+    let signature = fixture_wallet
+        .sign_personal_message(&sui_sdk_types::PersonalMessage(message.as_bytes().into()))
+        .unwrap();
+    let completed = router.clone().oneshot(
+        Request::post("/oauth/consent").header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "requestId": request_id, "signature": signature.to_base64() }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let bytes = completed.into_body().collect().await.unwrap().to_bytes();
+    let completed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        completed["data"]["address"],
+        fixture_wallet.public_key().derive_address().to_string()
+    );
+    let redirect = url::Url::parse(
+        completed["data"]["redirectTo"]
+            .as_str()
+            .expect("client redirect"),
+    )
+    .unwrap();
+    redirect
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .expect("consented code")
+        .1
+        .into_owned()
 }

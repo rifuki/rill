@@ -50,6 +50,17 @@ pub fn build_provision_manager(
     deepbook_package: Address,
     agent: Address,
 ) -> Result<(), ManagerError> {
+    build_provision_manager_with_type_package(tx, deepbook_package, deepbook_package, agent)
+}
+
+/// Provision against an upgraded package while retaining the original Move type identity.
+/// A package upgrade changes call targets, but does not redefine BalanceManager's type.
+pub fn build_provision_manager_with_type_package(
+    tx: &mut TransactionBuilder,
+    deepbook_package: Address,
+    type_package: Address,
+    agent: Address,
+) -> Result<(), ManagerError> {
     let framework: Address = "0x2".parse().expect("0x2 is a valid address");
 
     let manager = tx.move_call(
@@ -81,7 +92,7 @@ pub fn build_provision_manager(
     // Last. A shared object cannot be referenced by a later command in the transaction that shared
     // it, so anything needing `&mut manager` has to be above this line.
     let manager_type: sui_sdk_types::TypeTag =
-        format!("{deepbook_package}::balance_manager::BalanceManager")
+        format!("{type_package}::balance_manager::BalanceManager")
             .parse()
             .map_err(|_| ManagerError::BadIdentifier("BalanceManager".into()))?;
     tx.move_call(
@@ -121,6 +132,30 @@ mod tests {
         tx.set_gas_price(1_000);
         tx.add_gas_objects([ObjectInput::owned(addr(0x0a), 1, Digest::ZERO)]);
         tx
+    }
+
+    #[test]
+    fn an_upgraded_package_keeps_the_original_shared_type() {
+        let mut tx = builder();
+        build_provision_manager_with_type_package(&mut tx, addr(0xde), addr(0xda), addr(7))
+            .unwrap();
+        let built = tx.try_build().unwrap();
+        let sui_sdk_types::TransactionKind::ProgrammableTransaction(ptb) = built.kind else {
+            panic!("expected programmable transaction");
+        };
+        let calls = ptb
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                sui_sdk_types::Command::MoveCall(call) => Some(call),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(calls[..3].iter().all(|call| call.package == addr(0xde)));
+        assert_eq!(
+            calls.last().unwrap().type_arguments[0].to_string(),
+            format!("{}::balance_manager::BalanceManager", addr(0xda))
+        );
     }
 
     #[test]

@@ -153,11 +153,12 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                                 "capId": { "type": "string" },
                                 "capVersion": { "type": "integer" },
                                 "capDigest": { "type": "string" },
+                                "coinType": { "type": "string" },
                                 "versionId": { "type": "string" },
                                 "capabilityManifest": { "type": "object" }
                             },
                             "required": [
-                                "packageId", "walletId", "capId", "capVersion", "capDigest",
+                                "packageId", "walletId", "capId",
                                 "versionId", "capabilityManifest"
                             ],
                             "additionalProperties": false

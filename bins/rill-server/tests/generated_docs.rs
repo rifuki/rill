@@ -61,6 +61,7 @@ fn config(base: &str) -> Config {
     ));
     std::fs::create_dir_all(&dir).expect("create the store directory");
     Config {
+        consent_url: "http://localhost:5173/authorize".into(),
         port: 3939,
         network: Network::Testnet,
         public_base_url: base.into(),

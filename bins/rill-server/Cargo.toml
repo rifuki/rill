@@ -35,7 +35,11 @@ base64 = { workspace = true }
 
 bcs = "0.1"
 
+url = "2"
+
 [dev-dependencies]
+rill = { path = "../rill" }
+sui-crypto = { workspace = true }
 rill-auth = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -49,6 +49,7 @@ fn fresh_dir() -> std::path::PathBuf {
 /// the path before the router exists.
 fn config_in(dir: &std::path::Path) -> Config {
     Config {
+        consent_url: "http://localhost:5173/authorize".into(),
         port: 3939,
         network: Network::Testnet,
         public_base_url: "https://api.rill.test".into(),
@@ -58,8 +59,6 @@ fn config_in(dir: &std::path::Path) -> Config {
         guard_package_id: Some("0xguard".into()),
         owner_secret: None,
         owner_address: None,
-        // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
-        // tests are about the routes, not about where the socket is.
         bind_address: "127.0.0.1".into(),
         open_authorization_acknowledged: false,
         skills_store_path: dir.join("skills.json").to_string_lossy().into(),
@@ -199,10 +198,9 @@ async fn the_protected_resource_points_at_this_deployments_mcp_endpoint() {
     assert_eq!(body["resource"], "https://api.rill.test/mcp");
 }
 
-/// Honest, not unimplemented: there is nothing to introspect, and an empty result would imply the
-/// package had no functions.
+/// Invalid package input is rejected before contacting the chain.
 #[tokio::test]
-async fn introspect_is_a_documented_501() {
+async fn introspect_requires_a_package_address() {
     let response = app()
         .oneshot(
             Request::post("/api/introspect")
@@ -212,7 +210,7 @@ async fn introspect_is_a_documented_501() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 /// A preflight that omits these fails before the request is ever seen, which looks like an
@@ -284,6 +282,7 @@ async fn a_body_above_the_cap_is_refused() {
 
 fn mainnet_config(secret: &str, guard: Option<&str>) -> Config {
     Config {
+        consent_url: "http://localhost:5173/authorize".into(),
         port: 3939,
         network: Network::Mainnet,
         public_base_url: "https://api.rill.test".into(),
@@ -894,7 +893,7 @@ async fn post_raw(path: &str, content_type: &str, body: &str) -> (StatusCode, Va
     )
 }
 
-/// Register a client and walk a PKCE authorization to a code, on one router instance.
+/// Register a client and complete wallet consent for a PKCE-bound code on one router.
 ///
 /// The whole exchange has to happen against the same `app()` because the store lives in that
 /// instance; a second router would not know the code.
@@ -929,9 +928,7 @@ async fn code_for(router: &axum::Router, challenge: &str) -> (String, String) {
         .oneshot(Request::get(&query).body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let bytes = authorized.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    let code = body["code"].as_str().expect("a code").to_owned();
+    let code = complete_wallet_consent(router, authorized).await;
     (client_id, code)
 }
 
@@ -1043,9 +1040,9 @@ async fn the_token_endpoint_still_accepts_json() {
     assert!(body["access_token"].is_string(), "{body}");
 }
 
-/// No `/oauth/*` success may carry the frontend's envelope, whichever endpoint it is.
+/// The RFC revocation endpoint stays flat; Studio wallet and consent endpoints use an envelope.
 #[tokio::test]
-async fn no_oauth_success_carries_the_api_envelope() {
+async fn oauth_revocation_success_stays_in_the_rfc_shape() {
     let (status, body) = post_raw(
         "/oauth/revoke",
         "application/json",
@@ -1615,77 +1612,137 @@ fn a_half_configured_owner_is_refused_at_boot_on_every_network() {
     assert!(err.contains("not a Sui address"), "{err}");
 }
 
-// ── where the socket is, and what that means given there is no consent step ──
+// Wallet consent is mandatory regardless of which interface the server listens on.
 
-/// A wide bind is refused unless the operator says it is intended.
-///
-/// `/oauth/authorize` returns an authorization code to whoever asks: registration is open and a
-/// public client presents no credential. On loopback that is defensible, because reaching the port
-/// already means being on the machine. Bound to every interface it means anyone who can route to the
-/// port can mint a build-surface token and read this owner's published actions. They still cannot
-/// sign, because the key is in another process, which bounds the exposure without removing it.
-///
-/// So it is a decision. This test is the only thing that makes it one.
 #[test]
-fn a_wide_bind_without_acknowledgement_is_refused() {
+fn a_wide_bind_starts_without_the_obsolete_open_authorization_acknowledgement() {
     let mut config = config_in(&fresh_dir());
     config.bind_address = "0.0.0.0".into();
     config.open_authorization_acknowledged = false;
-
-    let refusal = config
-        .boot_check()
-        .expect_err("a wide bind with no consent step must not start silently");
-    assert!(
-        refusal.contains("no consent step"),
-        "the refusal must say why the bind matters: {refusal}"
-    );
-    assert!(
-        refusal.contains("could not sign anything"),
-        "and must not overstate it: the signing key is elsewhere: {refusal}"
-    );
-    assert!(
-        refusal.contains("BIND_ADDRESS=127.0.0.1")
-            && refusal.contains("RILL_ALLOW_OPEN_AUTHORIZATION=1"),
-        "and must name both ways out, since one of them is right for a container: {refusal}"
-    );
+    assert!(config.boot_check().is_ok());
 }
 
-/// Acknowledged, it starts. A container needs a wide bind and the flag is how it says so.
-#[test]
-fn an_acknowledged_wide_bind_starts() {
+#[tokio::test]
+async fn legacy_open_authorization_flag_does_not_bypass_wallet_consent() {
     let mut config = config_in(&fresh_dir());
     config.bind_address = "0.0.0.0".into();
     config.open_authorization_acknowledged = true;
     assert!(config.boot_check().is_ok());
+    let router = routes::router(AppState::new(config));
+    // This helper requires an HTTP consent redirect and a verified wallet signature before a code.
+    let (_, code) = code_for(&router, CHALLENGE).await;
+    assert!(!code.is_empty());
 }
 
-/// Loopback needs no acknowledgement, in either address family and under its usual name.
 #[test]
-fn loopback_needs_no_acknowledgement() {
+fn loopback_still_needs_no_acknowledgement() {
     for address in ["127.0.0.1", "::1", "[::1]", "localhost", "127.0.0.5"] {
         let mut config = config_in(&fresh_dir());
         config.bind_address = address.into();
         config.open_authorization_acknowledged = false;
-        assert!(
-            config.boot_check().is_ok(),
-            "{address} keeps traffic on this machine"
-        );
+        assert!(config.boot_check().is_ok(), "{address}");
     }
 }
 
-/// The unspecified addresses are not loopback, which is the whole point of the check.
-///
-/// `0.0.0.0` and `::` mean every interface. An `is_loopback` that treated them as local because they
-/// contain no routable host would pass exactly the case this refuses.
 #[test]
-fn the_unspecified_addresses_are_not_treated_as_local() {
+fn public_interfaces_use_the_same_wallet_consent_boundary() {
     for address in ["0.0.0.0", "::", "[::]", "192.168.1.10", "example.internal"] {
         let mut config = config_in(&fresh_dir());
         config.bind_address = address.into();
         config.open_authorization_acknowledged = false;
-        assert!(
-            config.boot_check().is_err(),
-            "{address} is reachable from off this machine"
-        );
+        assert!(config.boot_check().is_ok(), "{address}");
     }
+}
+
+#[test]
+fn an_unusable_consent_url_is_refused_before_accepting_requests() {
+    for consent_url in [
+        "",
+        "/authorize",
+        "not a URL",
+        "javascript:alert(1)",
+        "ftp://studio.example/authorize",
+        "https://user:password@studio.example/authorize",
+        "https://studio.example/authorize#fragment",
+    ] {
+        let mut config = config_in(&fresh_dir());
+        config.consent_url = consent_url.into();
+        let error = config.boot_check().expect_err(consent_url);
+        assert!(error.contains("RILL_CONSENT_URL"), "{consent_url}: {error}");
+    }
+}
+
+#[test]
+fn consent_urls_support_hosted_studio_and_local_development() {
+    for consent_url in [
+        "https://studio.example/authorize",
+        "http://localhost:5173/authorize",
+        "http://192.168.1.10:5173/authorize",
+    ] {
+        let mut config = config_in(&fresh_dir());
+        config.consent_url = consent_url.into();
+        assert!(config.boot_check().is_ok(), "{consent_url}");
+    }
+}
+
+/// Follow the same wallet-consent exchange used by Studio before a client receives its code.
+async fn complete_wallet_consent(
+    router: &axum::Router,
+    authorized: axum::response::Response,
+) -> String {
+    use sui_crypto::SuiSigner as _;
+    assert!(
+        authorized.status().is_redirection(),
+        "authorize must require wallet consent"
+    );
+    let location =
+        url::Url::parse(authorized.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let request_id = location
+        .query_pairs()
+        .find(|(key, _)| key == "request")
+        .expect("consent request id")
+        .1
+        .into_owned();
+    let prompt = router
+        .clone()
+        .oneshot(
+            Request::get(format!("/oauth/consent/{request_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prompt.status(), StatusCode::OK);
+    let bytes = prompt.into_body().collect().await.unwrap().to_bytes();
+    let prompt: Value = serde_json::from_slice(&bytes).unwrap();
+    let message = prompt["data"]["message"]
+        .as_str()
+        .expect("exact server-generated message");
+    let fixture_wallet = sui_crypto::ed25519::Ed25519PrivateKey::new([7; 32]);
+    let signature = fixture_wallet
+        .sign_personal_message(&sui_sdk_types::PersonalMessage(message.as_bytes().into()))
+        .unwrap();
+    let completed = router.clone().oneshot(
+        Request::post("/oauth/consent").header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "requestId": request_id, "signature": signature.to_base64() }).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let bytes = completed.into_body().collect().await.unwrap().to_bytes();
+    let completed: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        completed["data"]["address"],
+        fixture_wallet.public_key().derive_address().to_string()
+    );
+    let redirect = url::Url::parse(
+        completed["data"]["redirectTo"]
+            .as_str()
+            .expect("client redirect"),
+    )
+    .unwrap();
+    redirect
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .expect("consented code")
+        .1
+        .into_owned()
 }

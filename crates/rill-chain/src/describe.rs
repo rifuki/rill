@@ -196,6 +196,46 @@ pub async fn describe_function(
     })
 }
 
+/// Read public function descriptors from a deployed package.
+pub async fn describe_package(
+    endpoint: &str,
+    package_id: &str,
+) -> ChainResult<Vec<FunctionSignature>> {
+    use sui_rpc::proto::sui::rpc::v2::{function_descriptor::Visibility, GetPackageRequest};
+    let client =
+        sui_rpc::client::Client::new(endpoint).map_err(|e| ChainError::Transport(e.to_string()))?;
+    let mut request = GetPackageRequest::default();
+    request.package_id = Some(package_id.to_owned());
+    let package = client
+        .clone()
+        .package_client()
+        .get_package(request)
+        .await
+        .map_err(|e| ChainError::Transport(e.message().to_owned()))?
+        .into_inner()
+        .package
+        .ok_or_else(|| ChainError::NotFound(package_id.to_owned()))?;
+    let mut functions = Vec::new();
+    for module in package.modules {
+        for descriptor in module.functions {
+            if descriptor.visibility() != Visibility::Public
+                && !descriptor.is_entry.unwrap_or(false)
+            {
+                continue;
+            }
+            functions.push(FunctionSignature {
+                module: module.name.clone().unwrap_or_default(),
+                name: descriptor.name.clone().unwrap_or_default(),
+                type_parameter_count: descriptor.type_parameters.len(),
+                parameters: descriptor.parameters.iter().map(to_parameter).collect(),
+                returns: descriptor.returns.iter().map(to_parameter).collect(),
+                is_entry: descriptor.is_entry.unwrap_or(false),
+            });
+        }
+    }
+    Ok(functions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

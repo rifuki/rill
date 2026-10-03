@@ -704,6 +704,63 @@ fn decode_transaction(b64: &str) -> ChainResult<sui_rpc::proto::sui::rpc::v2::Tr
     Ok(transaction)
 }
 
+impl GrpcSui {
+    /// Preview a graph without authorizing its sender or paying gas. Never a signing gate.
+    pub async fn simulate_preview(&self, unsigned_tx_b64: &str) -> ChainResult<SimulationOutcome> {
+        let transaction = decode_transaction(unsigned_tx_b64)?;
+
+        let mut request = SimulateTransactionRequest::default();
+        request.transaction = Some(transaction);
+        request.checks = Some(TransactionChecks::Disabled as i32);
+        request.do_gas_selection = Some(false);
+
+        // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
+        // simulation, so a dropped connection can never read as "the transaction would fail" —
+        // or, worse, be smoothed into something a caller treats as a checked result. A refusal
+        // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
+        let response = self
+            .client
+            .clone()
+            .execution_client()
+            .simulate_transaction(request)
+            .await
+            .map_err(refusal_or_transport)?
+            .into_inner();
+
+        let executed = response.transaction.as_ref();
+        let effects = executed.and_then(|t| t.effects.as_ref());
+        let status = effects.and_then(|e| e.status.as_ref());
+        let ok = status.and_then(|s| s.success).unwrap_or(false);
+        let error = status
+            .and_then(|s| s.error.as_ref())
+            .and_then(|e| e.description.clone());
+
+        let verification = Verification::Unverified;
+
+        Ok(SimulationOutcome {
+            ok,
+            verification,
+            error,
+            gas_used_mist: net_gas(effects),
+            balance_changes: executed
+                .map(|t| balance_deltas(&t.balance_changes))
+                .unwrap_or_default(),
+            command_output_count: response.command_outputs.len(),
+            command_returns: response
+                .command_outputs
+                .iter()
+                .map(|c| {
+                    c.return_values
+                        .iter()
+                        .filter_map(|v| v.value.as_ref())
+                        .map(|b| b.value.clone().unwrap_or_default().to_vec())
+                        .collect()
+                })
+                .collect(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

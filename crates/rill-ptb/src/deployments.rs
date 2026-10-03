@@ -92,6 +92,19 @@ pub fn is_superseded(package_id: &str) -> bool {
     package_id.eq_ignore_ascii_case(TESTNET_AGENT_WALLET_SUPERSEDED)
 }
 
+/// Defining package for DeepBook's BalanceManager on testnet, separate from its upgraded call
+/// package in `registry`. The ignored Studio schema probe verifies this against a live object.
+pub const TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE: &str =
+    "0xfb28c4cbc6865bd1c897d26aecbe1f8792d1509a20ffec692c800660cbec6982";
+
+/// TradeCap was introduced alongside BalanceManager and retains the same defining package.
+pub const TESTNET_DEEPBOOK_TRADE_CAP_TYPE_PACKAGE: &str = TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE;
+
+/// DepositCap was introduced in a later upgrade and has its own defining package. Deriving all
+/// type identities from a package's original id would incorrectly reject this live capability.
+pub const TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE: &str =
+    "0x984757fc7c0e6dd5f15c2c66e881dd6e5aca98b725f3dbd83c445e057ebb790a";
+
 #[cfg(test)]
 mod tests {
     use super::*;

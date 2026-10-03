@@ -36,6 +36,7 @@ impl Network {
 const MIN_OWNER_SECRET_CHARS: usize = 32;
 
 pub struct Config {
+    pub consent_url: String,
     pub port: u16,
     pub network: Network,
     pub public_base_url: String,
@@ -136,6 +137,8 @@ impl Config {
         }
 
         Self {
+            consent_url: std::env::var("RILL_CONSENT_URL")
+                .unwrap_or_else(|_| "http://localhost:5173/authorize".into()),
             port,
             network,
             sui_rpc_url: std::env::var("SUI_RPC_URL").unwrap_or_else(|_| match network {
@@ -230,26 +233,18 @@ impl Config {
             }
             (None, None) => {}
         }
-        // `/oauth/authorize` has no consent step: it returns an authorization code to whoever asks,
-        // registration is open, and a public client presents no credential. On loopback that is
-        // defensible, because reaching the port already means being on the machine. Bound wider it
-        // means anyone who can route to this port can mint a token for the build surface and read
-        // the owner's catalogue. What they cannot do is sign: the key is in a separate process and
-        // this one has none, which is what bounds the exposure rather than removing it.
-        //
-        // So the combination is a decision rather than a default. A container legitimately needs a
-        // wide bind, and setting the flag in a compose file is one line; discovering this from the
-        // outside is not.
-        if !is_loopback(&self.bind_address) && !self.open_authorization_acknowledged {
-            return Err(format!(
-                "Refusing to start: BIND_ADDRESS is {} and this deployment has no consent step, so \
-                 anyone who can reach port {} could register a client and mint an access token for \
-                 the build surface. The signing key is not here, so they could not sign anything, \
-                 but they could read this owner's published actions and have envelopes built. Set \
-                 BIND_ADDRESS=127.0.0.1 to keep it on this machine, or \
-                 RILL_ALLOW_OPEN_AUTHORIZATION=1 to say that a wide bind is intended.",
-                self.bind_address, self.port
-            ));
+        let consent = url::Url::parse(&self.consent_url)
+            .map_err(|_| "RILL_CONSENT_URL must be an absolute HTTP(S) URL")?;
+        if !matches!(consent.scheme(), "http" | "https")
+            || consent.host_str().is_none()
+            || !consent.username().is_empty()
+            || consent.password().is_some()
+            || consent.fragment().is_some()
+        {
+            return Err(
+                "RILL_CONSENT_URL must be an absolute HTTP(S) URL without credentials or fragment"
+                    .into(),
+            );
         }
         if self.network != Network::Mainnet {
             return Ok(());
@@ -303,21 +298,6 @@ pub(crate) fn read_or_create_secret(path: &std::path::Path) -> String {
         }
     }
     fresh
-}
-
-/// Whether an address keeps traffic on this machine.
-///
-/// Both families, and the unspecified forms are deliberately **not** loopback: `0.0.0.0` and `::`
-/// mean every interface, which is the case this check exists for.
-fn is_loopback(address: &str) -> bool {
-    let trimmed = address.trim().trim_start_matches('[').trim_end_matches(']');
-    match trimmed.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        // A hostname rather than an address. `localhost` is the one that resolves to loopback on
-        // every machine this runs on; anything else is treated as wide, because guessing that a
-        // name is local is how this check would be bypassed by accident.
-        Err(_) => trimmed.eq_ignore_ascii_case("localhost"),
-    }
 }
 
 #[derive(Clone)]
