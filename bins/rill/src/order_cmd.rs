@@ -18,9 +18,6 @@ use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 use crate::keystore::Keystore;
 use crate::verdict::{no_verdict, submit_failed};
 
-const SUI_COIN_TYPE: &str =
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
-
 pub struct OrderArgs {
     pub package_id: String,
     pub version_id: String,
@@ -187,20 +184,16 @@ pub async fn order(endpoint: &str, keystore: &Keystore, args: &OrderArgs) -> Res
         .map(str::to_owned)
         .collect();
 
-    let gas: Vec<_> = chain
-        .list_owned_objects(&sender.to_string())
+    let gas = rill_chain::gas::sui_gas_coins(&chain, &sender.to_string())
         .await
-        .map_err(|e| format!("listing the sender's objects: {e}"))?
-        .into_iter()
-        .filter(|o| o.object_type.as_deref() == Some(SUI_COIN_TYPE))
-        .collect();
+        .map_err(|e| format!("listing the sender's gas coins: {e}"))?;
     if gas.is_empty() {
         return Err(format!("{sender} holds no SUI to pay for this"));
     }
 
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
-    tx.set_gas_budget(args.gas_budget);
+    tx.set_gas_budget(rill_chain::gas::affordable_budget(args.gas_budget, &gas));
     tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(

@@ -227,15 +227,9 @@ pub async fn swap_json_on(
         .reference_gas_price()
         .await
         .map_err(|e| format!("reading the reference gas price: {e}"))?;
-    let owned = chain
-        .list_owned_objects(&sender.to_string())
+    let gas = rill_chain::gas::sui_gas_coins(chain, &sender.to_string())
         .await
-        .map_err(|e| format!("listing the sender's objects: {e}"))?;
-    let sui_coin = "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
-    let gas: Vec<&rill_chain::ObjectSummary> = owned
-        .iter()
-        .filter(|o| o.object_type.as_deref() == Some(sui_coin))
-        .collect();
+        .map_err(|e| format!("listing the sender's gas coins: {e}"))?;
     if gas.is_empty() {
         return Err(Failure::Failed(format!(
             "{sender} holds no SUI, so it cannot pay for anything"
@@ -244,7 +238,7 @@ pub async fn swap_json_on(
 
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
-    tx.set_gas_budget(args.gas_budget);
+    tx.set_gas_budget(rill_chain::gas::affordable_budget(args.gas_budget, &gas));
     tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(

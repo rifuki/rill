@@ -429,7 +429,7 @@ fn version_id() -> String {
 fn cetus_integrate(context: &WalletContext) -> String {
     std::env::var("CETUS_INTEGRATE_PACKAGE_ID").unwrap_or_else(|_| {
         if context.network == "mainnet" {
-            "0x996c4d9480708fb8b92aa7acf819fb0497b5ec8e65ba06601cae2fb6db3312c3".into()
+            rill_ptb::deployments::MAINNET_CETUS_INTEGRATE.into()
         } else {
             rill_ptb::deployments::TESTNET_CETUS_INTEGRATE.to_string()
         }
@@ -440,7 +440,7 @@ fn cetus_integrate(context: &WalletContext) -> String {
 fn cetus_global_config(context: &WalletContext) -> String {
     std::env::var("CETUS_GLOBAL_CONFIG_ID").unwrap_or_else(|_| {
         if context.network == "mainnet" {
-            "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f".into()
+            rill_ptb::deployments::MAINNET_CETUS_GLOBAL_CONFIG.into()
         } else {
             rill_ptb::deployments::TESTNET_CETUS_GLOBAL_CONFIG.to_string()
         }
@@ -839,10 +839,12 @@ fn create_wallet(context: &mut WalletContext, id: Value, params: &Value) -> Valu
                 id,
                 "created_but_unbounded",
                 &format!(
-                "The wallet {} was created and funded, but its rules were not attached, so it is \
-                 UNBOUNDED right now. Do not hand the cap to anything. Call rill_attach_rules with \
-                 that wallet, budget {budget} and perTx {per_tx}. Why: {why}\n\nWhat was \
-                 created: {created}",
+                "The wallet {} was created EMPTY, and the transaction that attaches its rules and \
+                 adds its funding did not run, so it holds nothing and has no rules: UNBOUNDED, and \
+                 unspendable until it has them. Do not create \
+                 another wallet. Call rill_attach_rules with that wallet, budget {budget}, perTx \
+                 {per_tx} and amount {amount}: it attaches the rules and funds the wallet in one \
+                 transaction. Why: {why}\n\nWhat was created: {created}",
                 wallet_id.as_deref().unwrap_or("(id not readable, see below)")
             ),
             )
@@ -897,11 +899,32 @@ fn attach_rules(context: &mut WalletContext, id: Value, params: &Value) -> Value
         dry_run: false,
     };
 
-    match block_on(crate::rules_cmd::attach_json(
-        &endpoint(context),
-        keystore,
-        &args,
-    )) {
+    // With an amount, the first funding goes in with the rules, in one owner-signed transaction:
+    // the way an empty wallet from rill_create_wallet is finished when that tool's own attach
+    // failed. Without one, this only attaches, and an empty wallet stays empty.
+    let funding = match argument(params, "amount") {
+        None => None,
+        Some(amount) => match rill_core::amounts::decimal_to_base_units(amount, 9) {
+            Ok(mist) => Some(mist),
+            Err(e) => {
+                return tool_error(
+                    id,
+                    "invalid_arguments",
+                    &format!("amount is decimal SUI as text: {e}"),
+                )
+            }
+        },
+    };
+    let endpoint = endpoint(context);
+    let result = block_on(async {
+        match funding {
+            Some(mist) => {
+                crate::rules_cmd::attach_and_fund_json(&endpoint, keystore, &args, mist).await
+            }
+            None => crate::rules_cmd::attach_json(&endpoint, keystore, &args).await,
+        }
+    });
+    match result {
         Ok(Ok(report)) => tool_ok(id, report),
         Ok(Err(failure)) => failure_response(context, id, "attach_failed", &failure),
         Err(e) => failure_response(context, id, "attach_failed", &Failure::Failed(e)),

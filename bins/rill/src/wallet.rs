@@ -30,10 +30,6 @@ use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 use crate::keystore::Keystore;
 use crate::verdict::{did_fail, no_verdict, submit_failed, would_fail, Failure};
 
-/// Fully-expanded SUI, the way the chain writes it in an object type.
-const SUI_COIN_TYPE: &str =
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
-
 /// What a freshly created wallet permits, which is nothing, said where both callers read it.
 const NO_RULES_YET: &str = "This wallet is empty. No funds are exposed before its rules are attached and initial funding is added atomically.";
 
@@ -169,14 +165,9 @@ pub async fn create_json_on(
 
     // Every SUI coin, not the first. A split the first coin alone cannot cover fails with
     // `InsufficientCoinBalance`, which reads like an empty account when it is not.
-    let owned = chain
-        .list_owned_objects(&sender.to_string())
+    let gas = rill_chain::gas::sui_gas_coins(chain, &sender.to_string())
         .await
-        .map_err(|e| format!("listing the sender's objects: {e}"))?;
-    let gas: Vec<_> = owned
-        .iter()
-        .filter(|o| o.object_type.as_deref() == Some(SUI_COIN_TYPE))
-        .collect();
+        .map_err(|e| format!("listing the sender's gas coins: {e}"))?;
     if gas.is_empty() {
         return Err(Failure::Failed(format!(
             "{sender} holds no SUI, so it cannot pay for anything"
@@ -188,7 +179,7 @@ pub async fn create_json_on(
 
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
-    tx.set_gas_budget(args.gas_budget);
+    tx.set_gas_budget(rill_chain::gas::affordable_budget(args.gas_budget, &gas));
     // Read, not assumed. Testnet answers 1000 and mainnet answers 100, so a literal that is right
     // on one network is ten times the price on the other, and a price below the reference is
     // rejected outright rather than merely running slow.

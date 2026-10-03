@@ -54,6 +54,9 @@ struct State {
     /// Per-object countdown of reads that must answer `not found` first.
     not_yet_indexed: HashMap<String, usize>,
     objects: HashMap<String, ObjectSummary>,
+    /// Per-object reference an owner listing reports instead of the current one: the index behind
+    /// `list_owned_objects` trailing the ledger behind `get_object`.
+    listed_behind: HashMap<String, crate::ObjectRef>,
     owned: HashMap<String, Vec<String>>,
     /// Dynamic fields by parent object id.
     dynamic_fields: HashMap<String, Vec<DynamicFieldSummary>>,
@@ -77,6 +80,7 @@ impl Default for State {
         Self {
             objects: HashMap::new(),
             not_yet_indexed: HashMap::new(),
+            listed_behind: HashMap::new(),
             owned: HashMap::new(),
             dynamic_fields: HashMap::new(),
             balances: HashMap::new(),
@@ -170,6 +174,22 @@ impl FakeSui {
         chain
     }
 
+    /// Make owner listings report `object` at an older reference than `get_object` does.
+    ///
+    /// Mainnet did exactly this one transaction after a create: the listing named a gas coin at the
+    /// version before the create spent it, and the node refused the next transaction for it.
+    pub fn with_listing_behind(self, id: &str, version: u64, digest: &str) -> Self {
+        self.state.borrow_mut().listed_behind.insert(
+            id.to_owned(),
+            crate::ObjectRef {
+                id: id.to_owned(),
+                version,
+                digest: digest.to_owned(),
+            },
+        );
+        self
+    }
+
     /// Stage the objects an execution should report as created.
     ///
     /// A multi-step flow cannot continue without them: `create_wallet` shares a wallet and mints a
@@ -236,7 +256,13 @@ impl SuiRead for FakeSui {
             .get(owner)
             .map(|ids| {
                 ids.iter()
-                    .filter_map(|id| s.objects.get(id).cloned())
+                    .filter_map(|id| {
+                        let mut object = s.objects.get(id).cloned()?;
+                        if let Some(behind) = s.listed_behind.get(id) {
+                            object.reference = behind.clone();
+                        }
+                        Some(object)
+                    })
                     .collect()
             })
             .unwrap_or_default())

@@ -1185,6 +1185,47 @@ fn creating_a_wallet_attaches_its_rules_in_a_second_transaction() {
     );
 }
 
+/// Each transaction pays with the gas coin at the version the ledger holds, not the one an owner
+/// listing remembers.
+///
+/// On mainnet the listing still named the owner's coin at the version before the create spent it,
+/// and the node refused the attach for it before anything was submitted. Here the listing trails
+/// by one version; both submitted transactions must name the coin at its current version.
+#[test]
+fn every_transaction_pays_with_the_gas_coin_at_its_ledger_version() {
+    let owner = key(35);
+    let agent = key(36);
+    let chain = chain_for_create_then_attach(&owner, &agent).with_listing_behind(
+        COIN,
+        8,
+        &Digest::ZERO.to_string(),
+    );
+
+    run(rill_cli::wallet::create_and_bound_json_on(
+        &chain,
+        &owner,
+        &create_args(&agent.address().to_string()),
+        now_ms(),
+    ))
+    .expect("the create and the attach both run");
+
+    let submitted = chain.submitted();
+    assert_eq!(submitted.len(), 2, "one create, one attach");
+    for (step, b64) in ["create", "attach"].iter().zip(&submitted) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("base64");
+        let tx: sui_sdk_types::Transaction = bcs::from_bytes(&bytes).expect("a transaction");
+        let versions: Vec<u64> = tx.gas_payment.objects.iter().map(|o| o.version()).collect();
+        assert_eq!(
+            versions,
+            vec![9],
+            "the {step} must pay with the ledger's version"
+        );
+    }
+}
+
 /// When the attach fails, the wallet is reported as created and unbounded, with its id.
 ///
 /// The funds have already moved when the second step fails, so this is not an ordinary error: the

@@ -326,6 +326,10 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                         "perTx": {
                             "type": "string",
                             "description": "Most mist one transaction may release, as text, never a number."
+                        },
+                        "amount": {
+                            "type": "string",
+                            "description": "Optional. Decimal SUI as text to fund the wallet with in the same transaction. Only for a wallet that is still empty, with nothing spent and no funding yet: the way to finish a wallet from rill_create_wallet whose own attach did not run."
                         }
                     },
                     "required": ["wallet", "budget", "perTx"],

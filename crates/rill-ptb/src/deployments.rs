@@ -69,6 +69,21 @@ pub const TESTNET_CETUS_INTEGRATE: &str =
 pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
     "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a";
 
+/// Cetus's `integrate` package on mainnet, at its latest version, which is the call target.
+///
+/// Not the original id `0x996c4d94…`. Cetus checks its own package version on every swap
+/// (`config::checked_package_version`), so a call routed through an older `integrate` aborts with
+/// code 10 before touching the pool. The original id was hardcoded here until a mainnet quote
+/// aborted exactly that way on 2026-10-03; version 17 (`0x9ee0534b…`) simulated cleanly against
+/// the SUI/USDC pool the same day. Cetus upgrades again, so when a swap aborts in
+/// `checked_package_version`, re-read `packageVersions` for `0x996c4d94…` and update this.
+pub const MAINNET_CETUS_INTEGRATE: &str =
+    "0x9ee0534b703b14457aee7698ea3a07a5080f954ed2b7e9910fbb7a55506824fa";
+
+/// Cetus's `GlobalConfig` on mainnet, as Cetus's own CLMM integration guide lists it.
+pub const MAINNET_CETUS_GLOBAL_CONFIG: &str =
+    "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f";
+
 /// Haedal's package on testnet, the latest version and so the call target.
 ///
 /// Not the type-defining package: the `Staking` object's type and haSUI's are both defined at

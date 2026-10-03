@@ -863,8 +863,8 @@ fn cetus_defaults(network: Network) -> (&'static str, &'static str) {
             deployments::TESTNET_CETUS_GLOBAL_CONFIG,
         ),
         Network::Mainnet => (
-            "0x996c4d9480708fb8b92aa7acf819fb0497b5ec8e65ba06601cae2fb6db3312c3",
-            "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f",
+            deployments::MAINNET_CETUS_INTEGRATE,
+            deployments::MAINNET_CETUS_GLOBAL_CONFIG,
         ),
     }
 }

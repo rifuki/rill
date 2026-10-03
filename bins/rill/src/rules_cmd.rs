@@ -28,9 +28,6 @@ use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 use crate::keystore::Keystore;
 use crate::verdict::{did_fail, no_verdict, submit_failed, would_fail, Failure};
 
-const SUI_COIN_TYPE: &str =
-    "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
-
 pub struct RulesArgs {
     pub package_id: String,
     pub version_id: String,
@@ -94,6 +91,17 @@ pub async fn attach_json(
 ) -> Result<Value, Failure> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
     attach_json_on(&chain, keystore, args).await
+}
+
+/// [`attach_and_fund_json_on`] against a live node.
+pub async fn attach_and_fund_json(
+    endpoint: &str,
+    keystore: &Keystore,
+    args: &RulesArgs,
+    funding: u64,
+) -> Result<Value, Failure> {
+    let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
+    attach_and_fund_json_on(&chain, keystore, args, funding).await
 }
 
 /// The attach itself, against any chain.
@@ -192,14 +200,9 @@ async fn attach_impl_on(
         shared.insert(id, initial);
     }
 
-    let owned = chain
-        .list_owned_objects(&sender.to_string())
+    let gas = rill_chain::gas::sui_gas_coins(chain, &sender.to_string())
         .await
-        .map_err(|e| format!("listing the sender's objects: {e}"))?;
-    let gas: Vec<_> = owned
-        .iter()
-        .filter(|o| o.object_type.as_deref() == Some(SUI_COIN_TYPE))
-        .collect();
+        .map_err(|e| format!("listing the sender's gas coins: {e}"))?;
     if gas.is_empty() {
         return Err(Failure::Failed(format!(
             "{sender} holds no SUI to pay for this"
@@ -225,7 +228,7 @@ async fn attach_impl_on(
 
     let mut tx = TransactionBuilder::new();
     tx.set_sender(sender);
-    tx.set_gas_budget(args.gas_budget);
+    tx.set_gas_budget(rill_chain::gas::affordable_budget(args.gas_budget, &gas));
     tx.set_gas_price(gas_price);
     tx.add_gas_objects(gas.iter().map(|c| {
         ObjectInput::owned(

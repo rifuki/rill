@@ -128,8 +128,8 @@ pub async fn protocols(State(state): State<AppState>) -> Response {
         )
     } else {
         (
-            "0x996c4d9480708fb8b92aa7acf819fb0497b5ec8e65ba06601cae2fb6db3312c3",
-            "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f",
+            rill_ptb::deployments::MAINNET_CETUS_INTEGRATE,
+            rill_ptb::deployments::MAINNET_CETUS_GLOBAL_CONFIG,
             "0xb8d7d9e66a60c239e7a60110efcf8de6c705580ed924d0dde141f4a0e2c90105",
             "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
             "0x126e4cfb051cad744706df590ec399e8c02b6feae195c35b8b496280d5442a62",

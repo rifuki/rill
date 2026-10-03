@@ -44,7 +44,7 @@
 
 use sui_crypto::simple::SimpleKeypair;
 use sui_crypto::SuiSigner;
-use sui_sdk_types::{Address, Transaction, UserSignature};
+use sui_sdk_types::{Address, PersonalMessage, Transaction, UserSignature};
 
 /// The environment variable the launching shell or secret manager sets.
 pub const PRIVATE_KEY_VAR: &str = "RILL_SUI_PRIVATE_KEY";
@@ -325,6 +325,17 @@ impl Keystore {
             .sign_transaction(transaction)
             .map_err(|_| KeystoreError::Malformed)
     }
+
+    /// Sign a personal message: a sign-in challenge, never a transaction.
+    ///
+    /// Typed for the same reason [`sign`](Self::sign) is. A `PersonalMessage` is signed under the
+    /// personal-message intent, which a node will not accept as a transaction signature, so this
+    /// cannot be turned into one by choosing the bytes.
+    pub fn sign_personal_message(&self, message: &[u8]) -> Result<UserSignature, KeystoreError> {
+        self.keypair
+            .sign_personal_message(&PersonalMessage(message.into()))
+            .map_err(|_| KeystoreError::Malformed)
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +352,21 @@ mod tests {
         Ed25519PrivateKey::new([seed; 32])
             .to_suiprivkey()
             .expect("encode")
+    }
+
+    /// A sign-in signature verifies as a personal message and not as anything else.
+    #[test]
+    fn a_personal_message_signature_verifies_only_as_a_personal_message() {
+        use sui_crypto::{simple::SimpleVerifier, SuiVerifier};
+        let store = Keystore::from_suiprivkey(&generated_suiprivkey(7)).expect("a key");
+        let message = b"Sign in to Rill: nonce 42";
+        let signature = store.sign_personal_message(message).expect("signed");
+        SimpleVerifier
+            .verify_personal_message(&PersonalMessage(message[..].into()), &signature)
+            .expect("verifies as the message it was given");
+        assert!(SimpleVerifier
+            .verify_personal_message(&PersonalMessage(b"another message"[..].into()), &signature)
+            .is_err());
     }
 
     #[test]

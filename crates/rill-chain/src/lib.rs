@@ -15,6 +15,7 @@
 
 pub mod describe;
 pub mod fake;
+pub mod gas;
 pub mod grpc;
 pub mod settle;
 

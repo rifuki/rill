@@ -80,6 +80,12 @@ pub async fn build_action(
             ));
         }
     }
+    // Everything the sender holds is enough to name as a budget when it is less than the default:
+    // the node refuses a budget above the gas coins outright, whatever the transaction costs, and
+    // the strict simulation below still decides whether this much covers it.
+    if gas_total > 0 && gas_total < u128::from(transaction.gas_payment.budget) {
+        transaction.gas_payment.budget = gas_total as u64;
+    }
     if gas_total < u128::from(transaction.gas_payment.budget) {
         return Err(error(format!(
             "insufficient sender gas: have {gas_total}, need {}",
