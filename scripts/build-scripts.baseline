@@ -12,6 +12,8 @@ getrandom 0.3.4
 getrandom 0.4.3
 httparse 1.10.1
 iana-time-zone-haiku 0.1.2
+icu_normalizer_data 2.3.0
+icu_properties_data 2.3.0
 libc 0.2.189
 num-traits 0.2.19
 portable-atomic 1.15.0
