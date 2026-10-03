@@ -13,9 +13,13 @@
 set -eu
 
 VERSION="0.7.0"
-# One line per released asset: name and sha256. Empty until the release exists, so an unreleased
-# plugin refuses rather than running something unverified.
+# One line per released asset: name and sha256, copied from the release and checked against a
+# local sha256 of each downloaded asset before being written here. A version with no line for a
+# platform refuses rather than running something unverified.
 CHECKSUMS="
+rill-wallet-darwin-arm64 6bb7cd8f5f09b1f86eb5bd498bc3f0b20bf7891ea1e810e895aae828e16258dd
+rill-wallet-darwin-x64 bb2137edc2f3a9d19e4d552c836e6ae47ddfcae6dd2596c289bd89867c248ea2
+rill-wallet-linux-x64 171594cb94b2e6a500e48ce2f3d3be7a4c1fb32c004ded4e8cbf6efef3022e52
 "
 
 say() { printf 'rill-mcp: %s\n' "$*" >&2; }

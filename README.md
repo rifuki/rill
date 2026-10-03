@@ -109,8 +109,8 @@ machine only ever holds the agent key, and the plugin starts the signer without 
 steps: `rill_create_wallet` and `rill_attach_rules` exist only under `rill-wallet mcp --owner`, run
 with the owner's key.
 
-Before a release exists for the pinned version, point the launcher at a local build with
-`RILL_WALLET_BIN=$PWD/target/release/rill-wallet`.
+The launcher pins `rill-wallet-v0.7.0`. To run a local build instead, set
+`RILL_WALLET_BIN=$PWD/target/release/rill-wallet` in the client's environment.
 
 ## Install
 
