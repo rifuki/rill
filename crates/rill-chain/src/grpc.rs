@@ -446,7 +446,7 @@ impl SuiRead for GrpcSui {
         request.checks = Some(TransactionChecks::Enabled as i32);
 
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
-        // simulation, so a dropped connection can never read as "the transaction would fail" —
+        // simulation, so a dropped connection can never read as "the transaction would fail",
         // or, worse, be smoothed into something a caller treats as a checked result. A refusal
         // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
         let response = self
@@ -536,7 +536,7 @@ impl SuiRead for GrpcSui {
         request.do_gas_selection = Some(true);
 
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
-        // simulation, so a dropped connection can never read as "the transaction would fail" —
+        // simulation, so a dropped connection can never read as "the transaction would fail",
         // or, worse, be smoothed into something a caller treats as a checked result. A refusal
         // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
         let response = self
@@ -715,7 +715,7 @@ impl GrpcSui {
         request.do_gas_selection = Some(false);
 
         // A transport failure is NOT a verdict. It is returned as an error rather than as a failed
-        // simulation, so a dropped connection can never read as "the transaction would fail" —
+        // simulation, so a dropped connection can never read as "the transaction would fail",
         // or, worse, be smoothed into something a caller treats as a checked result. A refusal
         // before execution IS a verdict, and is told apart from it: see `refusal_or_transport`.
         let response = self
