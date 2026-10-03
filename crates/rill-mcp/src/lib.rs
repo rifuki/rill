@@ -28,9 +28,20 @@ use std::sync::Arc;
 pub enum Surface {
     /// The keyless builder. Reads and compiles; cannot sign.
     Actions,
-    /// The local signer. Holds the key.
+    /// The local signer as an agent runs it. Holds the agent's key: reads, quotes, spends and
+    /// executes inside the wallet's rules, and offers none of the owner's steps.
     Wallet,
+    /// The local signer started with `--owner`: everything on [`Surface::Wallet`] plus the two
+    /// steps only a wallet's owner can take, minting a wallet and attaching its rules.
+    ///
+    /// Separate because an agent offered `rill_create_wallet` will reach for it. Signed with the
+    /// agent's key it mints a wallet the agent owns and funds from its own gas, so the agent ends up
+    /// holding both halves of a delegation whose point is that it holds one.
+    Owner,
 }
+
+/// The tools only a wallet's owner can use: on [`Surface::Owner`], never on [`Surface::Wallet`].
+pub const OWNER_TOOLS: &[&str] = &["rill_create_wallet", "rill_attach_rules"];
 
 fn object_schema(value: Value) -> Arc<Map<String, Value>> {
     Arc::new(
@@ -114,6 +125,17 @@ pub fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
 
 pub fn tools(surface: Surface) -> Vec<Tool> {
     match surface {
+        Surface::Actions => surface_tools(Surface::Actions),
+        Surface::Owner => surface_tools(Surface::Owner),
+        Surface::Wallet => surface_tools(Surface::Owner)
+            .into_iter()
+            .filter(|t| !OWNER_TOOLS.contains(&t.name.as_ref()))
+            .collect(),
+    }
+}
+
+fn surface_tools(surface: Surface) -> Vec<Tool> {
+    match surface {
         Surface::Actions => vec![
             read_only(
                 "rill_list_actions",
@@ -173,7 +195,7 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                 })),
             ),
         ],
-        Surface::Wallet => vec![
+        Surface::Wallet | Surface::Owner => vec![
             // One tool per question, not one tool with a switch.
             //
             // These two answer different things and need different arguments: whether this signer
@@ -255,13 +277,8 @@ pub fn tools(surface: Surface) -> Vec<Tool> {
                     "additionalProperties": false
                 })),
             ),
-            // The two owner-side steps, which used to be commands a person typed.
-            //
-            // Without them the flow an agent could drive started halfway through: it could spend
-            // from a wallet and could not get one, so every demonstration began with a human at a
-            // terminal. Offering them here does not widen what an agent may do, because the
-            // contract decides that and not this list: `add_rule` asserts the owner, so a signer
-            // launched with the agent's key is refused by name the moment it tries.
+            // The two owner-side steps, which used to be commands a person typed. Offered only on
+            // `Surface::Owner`: see its doc for why an agent's surface leaves them out.
             destructive(
                 "rill_create_wallet",
                 "Mint an agent wallet and the AgentCap that drives it, funded from the key this \
@@ -545,7 +562,7 @@ mod tests {
             "rill_execute",
         ];
 
-        let destructive: Vec<String> = [Surface::Actions, Surface::Wallet]
+        let destructive: Vec<String> = [Surface::Actions, Surface::Owner]
             .into_iter()
             .flat_map(tools)
             .filter(|t| t.annotations.as_ref().unwrap().destructive_hint == Some(true))
@@ -554,7 +571,7 @@ mod tests {
         assert_eq!(destructive, SUBMITS);
 
         // And the inverse: nothing that submits is left unmarked.
-        for tool in [Surface::Actions, Surface::Wallet]
+        for tool in [Surface::Actions, Surface::Owner]
             .into_iter()
             .flat_map(tools)
         {
@@ -575,8 +592,8 @@ mod tests {
     /// spend from a wallet and could not get one. A surface missing either step sends whoever is
     /// checking the claim back to a terminal.
     #[test]
-    fn the_wallet_surface_offers_every_step_from_no_wallet_to_a_bounded_spend() {
-        let names: Vec<String> = tools(Surface::Wallet)
+    fn the_owner_surface_offers_every_step_from_no_wallet_to_a_bounded_spend() {
+        let names: Vec<String> = tools(Surface::Owner)
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
@@ -584,6 +601,30 @@ mod tests {
             assert!(
                 names.contains(&step.to_string()),
                 "{step} is missing, so the flow still needs a human at a terminal: {names:?}"
+            );
+        }
+    }
+
+    /// An agent's surface offers no owner step, and loses nothing else.
+    ///
+    /// Run by an agent, `rill_create_wallet` mints a wallet the agent owns: it holds both halves of
+    /// the delegation. The owner's steps are on `Surface::Owner`, which is a flag somebody passes.
+    #[test]
+    fn the_agent_surface_is_the_owner_surface_without_the_owner_steps() {
+        let wallet: Vec<String> = tools(Surface::Wallet)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let owner: Vec<String> = tools(Surface::Owner)
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|name| !OWNER_TOOLS.contains(&name.as_str()))
+            .collect();
+        assert_eq!(wallet, owner);
+        for step in OWNER_TOOLS {
+            assert!(
+                !wallet.contains(&step.to_string()),
+                "{step} is on the agent's surface"
             );
         }
     }

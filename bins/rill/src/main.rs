@@ -138,12 +138,112 @@ fn load() -> Loaded {
     }
 }
 
+/// Which config file was read, and which settings came from it rather than the environment.
+fn print_config(path: Option<&std::path::Path>, applied: &[&str]) {
+    match path {
+        Some(path) if path.exists() => {
+            println!("  config : {}", path.display());
+            if !applied.is_empty() {
+                println!("           supplies {}", applied.join(", "));
+            }
+        }
+        _ => println!(
+            "  config : none. `rill setup` writes one so an MCP launch needs no variables."
+        ),
+    }
+}
+
+/// `rill setup`: write the config an MCP launch reads, after checking the key it names is here.
+///
+/// The opt-in to sign on mainnet is a flag a person types, `--allow-mainnet`, and it is recorded
+/// in the file rather than implied by choosing the network. Without it a mainnet config still
+/// reads, quotes and reports, and refuses to sign, which is the gate `docs/MAINNET.md` describes.
+fn setup(path: Option<&std::path::Path>) -> i32 {
+    let argv: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| {
+        argv.iter()
+            .position(|a| a == name)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
+    };
+    let Some(path) = path else {
+        eprintln!(
+            "rill: HOME is not set, so there is nowhere to write the config. Set RILL_CONFIG."
+        );
+        return 1;
+    };
+    let mut config = match rill_cli::config::read(path) {
+        Ok(existing) => existing.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("rill: {e}");
+            return 1;
+        }
+    };
+    if let Some(network) = flag("--network") {
+        if !matches!(network.as_str(), "testnet" | "mainnet") {
+            eprintln!("rill: --network must be testnet or mainnet");
+            return 1;
+        }
+        config.network = Some(network);
+    }
+    if let Some(address) = flag("--as") {
+        let parsed = match address.parse::<sui_sdk_types::Address>() {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("rill: --as {address} is not a Sui address");
+                return 1;
+            }
+        };
+        if let Err(e) = Keystore::load_for(parsed) {
+            eprintln!("rill: {e}");
+            return 1;
+        }
+        config.sign_as = Some(parsed.to_string());
+    }
+    if argv.iter().any(|a| a == "--allow-mainnet") {
+        config.allow_mainnet = Some(true);
+    }
+    if argv.iter().any(|a| a == "--no-mainnet") {
+        config.allow_mainnet = None;
+    }
+    if let Some(run_set) = flag("--run-set") {
+        let absolute = std::fs::canonicalize(&run_set).unwrap_or_else(|_| run_set.clone().into());
+        config.run_set = Some(absolute.display().to_string());
+    }
+    if let Some(url) = flag("--rpc") {
+        config.rpc_url = Some(url);
+    }
+    if let Err(e) = rill_cli::config::write(path, &config) {
+        eprintln!("rill: {e}");
+        return 1;
+    }
+    println!("wrote {}", path.display());
+    for (name, value) in config.variables() {
+        println!("  {name}={value}");
+    }
+    if config.network.as_deref() == Some("mainnet") && config.allow_mainnet != Some(true) {
+        println!(
+            "\nmainnet signing is off: this signer will read and quote but refuse to sign. Add \
+             --allow-mainnet once the preconditions in {} hold.",
+            rill_core::mainnet::CUTOVER_CHECKLIST
+        );
+    }
+    0
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     (
         "init",
         "from nothing to a bounded wallet: check the keys, fund, mint, attach rules, write a run-set",
     ),
-    ("mcp", "speak MCP over stdio: this is what an agent runs"),
+    (
+        "mcp",
+        "speak MCP over stdio: this is what an agent runs (--owner adds wallet creation and rules)",
+    ),
+    (
+        "setup",
+        "write ~/.rill/config.json: --network, --as <address>, --allow-mainnet, --run-set, --rpc",
+    ),
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
     ("capabilities", "show what the loaded run-set permits"),
@@ -262,6 +362,18 @@ fn default_wallet_id(network: &str, package: bool) -> String {
 }
 
 fn main() {
+    // Before anything reads the environment, and before any thread exists: the config file fills in
+    // what an MCP launch did not set. A malformed file stops here rather than being skipped, because
+    // a signer that ignored its config would sign as whichever key it found first.
+    let config_path = rill_cli::config::path();
+    let config_applied = match config_path.as_deref().map(rill_cli::config::read) {
+        Some(Ok(Some(config))) => rill_cli::config::apply(&config),
+        Some(Ok(None)) | None => Vec::new(),
+        Some(Err(e)) => {
+            eprintln!("rill: {e}");
+            std::process::exit(1);
+        }
+    };
     if let Ok(network) = std::env::var("SUI_NETWORK") {
         if !matches!(network.as_str(), "testnet" | "mainnet") {
             eprintln!("rill: SUI_NETWORK must be testnet or mainnet");
@@ -286,7 +398,12 @@ fn main() {
             print_commands();
             std::process::exit(code);
         }
-        Some("status") => std::process::exit(status(&loaded)),
+        Some("status") => {
+            let code = status(&loaded);
+            print_config(config_path.as_deref(), &config_applied);
+            std::process::exit(code);
+        }
+        Some("setup") => std::process::exit(setup(config_path.as_deref())),
         Some("help") | Some("--help") | Some("-h") => {
             println!("rill: the local half of Rill. Holds the key, checks the work, signs.");
             print_commands();
@@ -822,9 +939,11 @@ funded."
                     }
                 }
             }
+            let owner_tools = std::env::args().any(|a| a == "--owner");
             let mut context =
                 WalletContext::new(loaded.keystore, loaded.network, loaded.mainnet_allowed)
-                    .with_run_set(loaded.run_set);
+                    .with_run_set(loaded.run_set)
+                    .with_owner_tools(owner_tools);
             if let Err(e) = serve(&mut context, BufReader::new(stdin()), stdout()) {
                 eprintln!("rill: transport stopped: {e}");
                 std::process::exit(1);

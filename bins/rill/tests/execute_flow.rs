@@ -542,7 +542,7 @@ fn a_create_the_chain_would_refuse_is_never_signed() {
 /// stop and ask a human.
 #[test]
 fn the_transport_advertises_the_whole_flow_and_marks_only_the_submitting_tools_destructive() {
-    let mut context = WalletContext::new(None, "testnet".into(), false);
+    let mut context = WalletContext::new(None, "testnet".into(), false).with_owner_tools(true);
     let response = handle(
         &mut context,
         &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
@@ -576,9 +576,48 @@ fn the_transport_advertises_the_whole_flow_and_marks_only_the_submitting_tools_d
     }
 }
 
+/// An agent's launch neither lists the owner's steps nor runs them when named.
+///
+/// A plugin starts the signer for an agent. Offered `rill_create_wallet`, an agent mints a wallet it
+/// owns and funds from its own gas, holding both halves of the delegation. Unlisted is not enough:
+/// a client that cached an older tool list can still call a name, so the call is refused too.
+#[test]
+fn an_agent_launch_neither_lists_nor_runs_the_owner_steps() {
+    let mut context = WalletContext::new(Some(key(7)), "testnet".into(), false);
+    let response = handle(
+        &mut context,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .expect("a request gets a reply");
+    let names: Vec<&str> = response["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    for step in rill_mcp::OWNER_TOOLS {
+        assert!(
+            !names.contains(step),
+            "{step} is listed for an agent: {names:?}"
+        );
+        let response = call(
+            &mut context,
+            step,
+            json!({ "agent": WALLET, "wallet": WALLET, "amount": "0.05", "budget": BUDGET_MIST, "perTx": PER_TX_MIST }),
+        );
+        let out = structured(&response);
+        assert_eq!(out["code"], json!("owner_only"), "{step}: {out}");
+        assert!(
+            out["message"].as_str().unwrap().contains("owner"),
+            "the refusal says whose step it is: {out}"
+        );
+    }
+    assert!(names.contains(&"rill_spend") && names.contains(&"rill_execute"));
+}
+
 #[test]
 fn creating_a_wallet_with_no_key_says_whose_key_is_missing() {
-    let mut context = WalletContext::new(None, "testnet".into(), false);
+    let mut context = WalletContext::new(None, "testnet".into(), false).with_owner_tools(true);
     let response = call(
         &mut context,
         "rill_create_wallet",
@@ -594,7 +633,8 @@ fn creating_a_wallet_with_no_key_says_whose_key_is_missing() {
 
 #[test]
 fn attaching_rules_without_a_wallet_id_says_which_argument_is_missing() {
-    let mut context = WalletContext::new(Some(key(7)), "testnet".into(), false);
+    let mut context =
+        WalletContext::new(Some(key(7)), "testnet".into(), false).with_owner_tools(true);
     let response = call(
         &mut context,
         "rill_attach_rules",
@@ -609,7 +649,8 @@ fn attaching_rules_without_a_wallet_id_says_which_argument_is_missing() {
 /// answer names the argument the caller typed rather than a field from the manifest projection.
 #[test]
 fn a_cap_that_is_not_whole_mist_is_refused_by_the_name_the_caller_used() {
-    let mut context = WalletContext::new(Some(key(7)), "testnet".into(), false);
+    let mut context =
+        WalletContext::new(Some(key(7)), "testnet".into(), false).with_owner_tools(true);
     let response = call(
         &mut context,
         "rill_attach_rules",

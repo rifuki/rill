@@ -69,6 +69,24 @@ pub const TESTNET_CETUS_INTEGRATE: &str =
 pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
     "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a";
 
+/// The `agent_wallet` package on mainnet, published 2026-10-03 in
+/// `9SFxUDKGNKGwKcmKHZ6dQWj91WeYywUqMH2BPTZonZSG`. Its `Publisher` and `UpgradeCap` are held by the
+/// owner/deployer, and `deploy/mainnet.json` records every id the publication created.
+///
+/// Compiled in so that a signer launched by an MCP config needs no environment to find it. An
+/// upgrade keeps this id as the type origin but moves the call target, so after one this becomes
+/// the latest `published-at` and the original stays recorded in `Published.toml`.
+pub const MAINNET_AGENT_WALLET: &str =
+    "0xb8b95f9b43381693c72e3b0b0bae9c52c392492f5a1ce49bbea3ca393b694429";
+
+/// The shared `Version` object [`MAINNET_AGENT_WALLET`] gates itself on.
+pub const MAINNET_AGENT_WALLET_VERSION: &str =
+    "0x86430a8195900cd52d607a81993b6125a51628a9db93e10a1afedd2c5a95ba94";
+
+/// The `rill_guard` package on mainnet, published in `B1VQsDBPNtWE3bShPCNWoRpprB2RGexAF3RbLwx8nWPJ`.
+pub const MAINNET_RILL_GUARD: &str =
+    "0xfa208560e94310fa66c79df8b9aa1a33b5e3601781906833472ef233388e1e43";
+
 /// Cetus's `integrate` package on mainnet, at its latest version, which is the call target.
 ///
 /// Not the original id `0x996c4d94…`. Cetus checks its own package version on every swap
@@ -120,22 +138,31 @@ pub const TESTNET_DEEPBOOK_TRADE_CAP_TYPE_PACKAGE: &str = TESTNET_DEEPBOOK_MANAG
 pub const TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE: &str =
     "0x984757fc7c0e6dd5f15c2c66e881dd6e5aca98b725f3dbd83c445e057ebb790a";
 
-/// Resolve public deployment IDs, with no testnet fallback on mainnet.
+/// Resolve public deployment IDs: the ones given, else the network's own published pair.
+///
+/// Never a testnet id on mainnet, given or defaulted. Half a pair is refused rather than completed,
+/// because a package from one deployment and a `Version` from another fails on first use.
 pub fn wallet_deployment(
     network: rill_core::envelope::Network,
     package: Option<&str>,
     version: Option<&str>,
 ) -> Result<(sui_sdk_types::Address, sui_sdk_types::Address), String> {
     use rill_core::envelope::Network;
-    if network == Network::Mainnet && (package.is_none() || version.is_none()) {
-        return Err("mainnet requires AGENT_WALLET_PACKAGE_ID and AGENT_WALLET_VERSION_ID".into());
+    if package.is_some() != version.is_some() {
+        return Err(
+            "set both AGENT_WALLET_PACKAGE_ID and AGENT_WALLET_VERSION_ID, or neither".into(),
+        );
     }
+    let (default_package, default_version) = match network {
+        Network::Mainnet => (MAINNET_AGENT_WALLET, MAINNET_AGENT_WALLET_VERSION),
+        Network::Testnet => (TESTNET_AGENT_WALLET, TESTNET_AGENT_WALLET_VERSION),
+    };
     let package = package
-        .unwrap_or(TESTNET_AGENT_WALLET)
+        .unwrap_or(default_package)
         .parse::<sui_sdk_types::Address>()
         .map_err(|_| "wallet package is not a Sui address")?;
     let version = version
-        .unwrap_or(TESTNET_AGENT_WALLET_VERSION)
+        .unwrap_or(default_version)
         .parse::<sui_sdk_types::Address>()
         .map_err(|_| "wallet Version object is not a Sui address")?;
     if network == Network::Mainnet
@@ -145,6 +172,17 @@ pub fn wallet_deployment(
         return Err("mainnet cannot use testnet wallet deployment IDs".into());
     }
     Ok((package, version))
+}
+
+/// The `rill_guard` package for a network, unless one is given.
+pub fn guard_package(network: rill_core::envelope::Network, given: Option<&str>) -> String {
+    given.map(str::to_owned).unwrap_or_else(|| {
+        match network {
+            rill_core::envelope::Network::Mainnet => MAINNET_RILL_GUARD,
+            rill_core::envelope::Network::Testnet => TESTNET_RILL_GUARD,
+        }
+        .to_owned()
+    })
 }
 
 #[cfg(test)]

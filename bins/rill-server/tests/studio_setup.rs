@@ -503,7 +503,22 @@ async fn mainnet_setup_uses_explicit_wallet_deployment() {
 
 #[test]
 fn mainnet_never_falls_back_to_testnet_wallet_ids() {
-    assert!(deployments::wallet_deployment(Network::Mainnet, None, None).is_err());
+    let (package, version) = deployments::wallet_deployment(Network::Mainnet, None, None)
+        .expect("mainnet defaults to its own published pair");
+    assert_eq!(package.to_string(), deployments::MAINNET_AGENT_WALLET);
+    assert_eq!(
+        version.to_string(),
+        deployments::MAINNET_AGENT_WALLET_VERSION
+    );
+    assert!(
+        deployments::wallet_deployment(
+            Network::Mainnet,
+            Some(deployments::MAINNET_AGENT_WALLET),
+            None
+        )
+        .is_err(),
+        "half a pair is refused rather than completed"
+    );
     assert!(deployments::wallet_deployment(
         Network::Mainnet,
         Some(deployments::TESTNET_AGENT_WALLET),

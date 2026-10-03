@@ -55,6 +55,10 @@ pub struct WalletContext {
     /// would then fail on chain anyway, as an unexplained stale-object error rather than a named
     /// refusal.
     pub submitted: HashMap<String, Submission>,
+    /// Whether the owner's two steps are offered: `rill mcp --owner`. Off for an agent's launch,
+    /// which is what a plugin starts, so an agent is never handed a tool that would make it the
+    /// owner of a wallet it funds itself.
+    pub owner_tools: bool,
 }
 
 /// One envelope this signer has already handed to the chain.
@@ -75,7 +79,14 @@ impl WalletContext {
             mainnet_allowed,
             last_rejection: None,
             submitted: HashMap::new(),
+            owner_tools: false,
         }
+    }
+
+    /// Offer the owner's steps as well: `rill_create_wallet` and `rill_attach_rules`.
+    pub fn with_owner_tools(mut self, owner_tools: bool) -> Self {
+        self.owner_tools = owner_tools;
+        self
     }
 
     pub fn with_run_set(mut self, run_set: Option<RunSet>) -> Self {
@@ -210,7 +221,12 @@ pub fn handle(context: &mut WalletContext, message: &Value) -> Option<Value> {
         }
         "ping" => Some(rpc_result(id, json!({}))),
         "tools/list" => {
-            let tools: Vec<Value> = rill_mcp::tools(rill_mcp::Surface::Wallet)
+            let surface = if context.owner_tools {
+                rill_mcp::Surface::Owner
+            } else {
+                rill_mcp::Surface::Wallet
+            };
+            let tools: Vec<Value> = rill_mcp::tools(surface)
                 .into_iter()
                 .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
                 .collect();
@@ -227,6 +243,23 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         return rpc_error(id, -32602, "tools/call requires a tool name.");
     };
 
+    // Not offered on an agent's launch, and not reachable by name either: a tool that is merely
+    // unlisted is one a client that cached an older list can still call.
+    if !context.owner_tools && rill_mcp::OWNER_TOOLS.contains(&name) {
+        return tool_error(
+            id,
+            "owner_only",
+            &format!(
+                "{name} is an owner's step, and this signer was started for an agent. The wallet's \
+                 owner creates it, sets its limits and funds it from their own wallet: in Rill \
+                 Studio, or with `rill-wallet mcp --owner` run under the owner's key. Ask the \
+                 owner; do not try another route."
+            ),
+        );
+    }
+
+    // A named pair is checked here, before any chain read, so a testnet id on mainnet is refused by
+    // name. With none named, the published mainnet pair and guard are the defaults.
     if context.network == "mainnet" && !matches!(name, "rill_status" | "rill_execute") {
         let package = std::env::var("AGENT_WALLET_PACKAGE_ID").ok();
         let version = std::env::var("AGENT_WALLET_VERSION_ID").ok();
@@ -236,18 +269,6 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
             version.as_deref(),
         ) {
             return tool_error(id, "not_configured", &reason);
-        }
-        if matches!(name, "rill_swap" | "rill_quote")
-            && std::env::var("RILL_GUARD_PACKAGE_ID")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .is_none()
-        {
-            return tool_error(
-                id,
-                "not_configured",
-                "mainnet swaps require RILL_GUARD_PACKAGE_ID",
-            );
         }
     }
     match name {
@@ -412,13 +433,29 @@ fn count_argument(params: &Value, name: &str) -> Option<u64> {
 /// Three tools need the same pair, and a capability minted against one package cannot authorise a
 /// call in another, so this is read in one place from the environment that a deployment sets.
 fn package_id() -> String {
-    std::env::var("AGENT_WALLET_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string())
+    std::env::var("AGENT_WALLET_PACKAGE_ID").unwrap_or_else(|_| {
+        if on_mainnet() {
+            rill_ptb::deployments::MAINNET_AGENT_WALLET.to_string()
+        } else {
+            rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string()
+        }
+    })
 }
 
 fn version_id() -> String {
-    std::env::var("AGENT_WALLET_VERSION_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET_VERSION.to_string())
+    std::env::var("AGENT_WALLET_VERSION_ID").unwrap_or_else(|_| {
+        if on_mainnet() {
+            rill_ptb::deployments::MAINNET_AGENT_WALLET_VERSION.to_string()
+        } else {
+            rill_ptb::deployments::TESTNET_AGENT_WALLET_VERSION.to_string()
+        }
+    })
+}
+
+/// The network this process was started for, read where every deployment default is chosen so a
+/// mainnet signer can never pick up a testnet id by falling through.
+fn on_mainnet() -> bool {
+    std::env::var("SUI_NETWORK").as_deref() == Ok("mainnet")
 }
 
 /// The deployed `rill_guard` package, which carries the slippage floor every swap passes through.
@@ -448,8 +485,13 @@ fn cetus_global_config(context: &WalletContext) -> String {
 }
 
 fn guard_package_id() -> String {
-    std::env::var("RILL_GUARD_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_RILL_GUARD.to_string())
+    std::env::var("RILL_GUARD_PACKAGE_ID").unwrap_or_else(|_| {
+        if on_mainnet() {
+            rill_ptb::deployments::MAINNET_RILL_GUARD.to_string()
+        } else {
+            rill_ptb::deployments::TESTNET_RILL_GUARD.to_string()
+        }
+    })
 }
 
 /// Milliseconds since the epoch, for an expiry the contract compares against its own clock.
@@ -527,8 +569,7 @@ fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let Some(wallet) = argument(params, "wallet") else {
         return tool_error(id, "invalid_arguments", "wallet is required.");
     };
-    let package = std::env::var("AGENT_WALLET_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_AGENT_WALLET.to_string());
+    let package = package_id();
 
     let local = context
         .run_set

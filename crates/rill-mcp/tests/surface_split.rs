@@ -60,7 +60,8 @@ fn the_surfaces_share_no_tool_name() {
 #[test]
 fn every_signing_tool_is_on_the_signer_and_none_on_the_builder() {
     let actions = by_name(Surface::Actions);
-    let wallet = by_name(Surface::Wallet);
+    // The whole signer: an agent's launch leaves the owner's two steps out, `--owner` adds them.
+    let wallet = by_name(Surface::Owner);
     for signing in SIGNING_TOOLS {
         assert!(
             wallet.contains_key(signing),

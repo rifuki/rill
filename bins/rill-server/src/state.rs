@@ -157,9 +157,14 @@ impl Config {
             bind_address: std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".into()),
             open_authorization_acknowledged: std::env::var("RILL_ALLOW_OPEN_AUTHORIZATION")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            // Mainnet's own published guard when none is named. Testnet keeps its explicit opt-in.
             guard_package_id: std::env::var("RILL_GUARD_PACKAGE_ID")
                 .ok()
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    (network == Network::Mainnet)
+                        .then(|| rill_ptb::deployments::MAINNET_RILL_GUARD.to_owned())
+                }),
             wallet_package_id: trimmed_env("AGENT_WALLET_PACKAGE_ID"),
             wallet_version_id: trimmed_env("AGENT_WALLET_VERSION_ID"),
             owner_secret: trimmed_env("RILL_OWNER_SECRET"),
