@@ -110,6 +110,28 @@ pub async fn attach_json_on(
     keystore: &Keystore,
     args: &RulesArgs,
 ) -> Result<Value, Failure> {
+    attach_impl_on(chain, keystore, args, None).await
+}
+
+/// Attach all rules and add the first funding in the same owner-signed transaction.
+pub async fn attach_and_fund_json_on(
+    chain: &(impl SuiRead + SuiWrite),
+    keystore: &Keystore,
+    args: &RulesArgs,
+    funding: u64,
+) -> Result<Value, Failure> {
+    if funding == 0 {
+        return Err(Failure::Failed("initial funding must be positive".into()));
+    }
+    attach_impl_on(chain, keystore, args, Some(funding)).await
+}
+
+async fn attach_impl_on(
+    chain: &(impl SuiRead + SuiWrite),
+    keystore: &Keystore,
+    args: &RulesArgs,
+    funding: Option<u64>,
+) -> Result<Value, Failure> {
     let sender = keystore.address();
 
     let wallet_id: Address = args
@@ -131,6 +153,39 @@ pub async fn attach_json_on(
             .get_object(raw)
             .await
             .map_err(|e| format!("reading the {label} object: {e}"))?;
+        if funding.is_some() && label == "wallet" {
+            let fields = summary
+                .fields
+                .as_ref()
+                .ok_or("wallet fields are unavailable")?;
+            let units = |name: &str| -> Option<u64> {
+                fields.get(name).and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| v.as_u64())
+                        .or_else(|| {
+                            v.get("value")
+                                .and_then(|n| n.as_str())
+                                .and_then(|s| s.parse().ok())
+                        })
+                })
+            };
+            if units("budget") != Some(0) || units("spent") != Some(0) || fields["revoked"] != false
+            {
+                return Err(Failure::Failed(
+                    "initial funding requires a fresh, empty, unrevoked wallet".into(),
+                ));
+            }
+            if fields["owner"]
+                .as_str()
+                .and_then(|s| s.parse::<Address>().ok())
+                != Some(sender)
+            {
+                return Err(Failure::Failed(
+                    "initial funding requires the wallet owner".into(),
+                ));
+            }
+        }
         let initial = summary
             .shared_initial_version
             .ok_or_else(|| format!("the {label} object {raw} is not shared"))?;
@@ -192,6 +247,24 @@ pub async fn attach_json_on(
     let result = build_reconcile_rules(&mut tx, &target, &module_refs, &shared)
         .map_err(|e| e.to_string())?;
 
+    if let Some(funding) = funding {
+        let amount = tx.pure(&funding);
+        let gas_coin = tx.gas();
+        let funds = tx
+            .split_coins(gas_coin, vec![amount])
+            .into_iter()
+            .next()
+            .ok_or("funding coin missing")?;
+        rill_ptb::lifecycle::build_top_up(
+            &mut tx,
+            package_id,
+            wallet_id,
+            "0x2::sui::SUI",
+            funds,
+            &shared,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let built = tx.try_build().map_err(|e| format!("compiling: {e}"))?;
     let b64 = {
         use base64::Engine as _;
@@ -215,6 +288,9 @@ pub async fn attach_json_on(
         return Err(would_fail(outcome.error));
     }
     report["gasUsed"] = json!(outcome.gas_used_mist);
+    if let Some(funding) = funding {
+        report["fundingBaseUnits"] = json!(funding.to_string());
+    }
 
     if args.dry_run {
         report["note"] = json!("Simulated only. Nothing was signed and nothing was submitted.");
@@ -233,6 +309,9 @@ pub async fn attach_json_on(
     report["submitted"] = json!(true);
     report["digest"] = json!(outcome.digest);
     report["gasUsed"] = json!(outcome.gas_used_mist);
+    if let Some(funding) = funding {
+        report["fundingBaseUnits"] = json!(funding.to_string());
+    }
 
     // The rules this wrote have to be readable before the next step builds anything, and certified
     // is not the same as visible: see [`rill_chain::settle`]. The spend reads a wallet's live policy

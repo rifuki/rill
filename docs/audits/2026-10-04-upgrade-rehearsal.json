@@ -1,0 +1,44 @@
+{
+  "publishDigest": "FXrNydc2XELQT7BokxNnsUuFo131AaAsjbobkVzdoeaa",
+  "upgradeDigest": "FFfydkud866S6BwsY6oV7sXEjNNZWmM4FSbq2fsrv27N",
+  "packageV1": "0x1d08b0e0c81299bc01779ec5ca276ea378c40263edab885febcab516f7afbd93",
+  "packageV2": "0xc1c962f563aae966a78587d57dc37d73bd6305582c143cd84546dee0ad7d554d",
+  "new_before_migrate": {
+    "exit": 0,
+    "status": {
+      "status": "failure",
+      "error": "MoveAbort(MoveLocation { module: ModuleId { address: c1c962f563aae966a78587d57dc37d73bd6305582c143cd84546dee0ad7d554d, name: Identifier(\"version\") }, function: 1, instruction: 8, function_name: Some(\"check_is_valid\") }, 0) in command 0"
+    },
+    "digest": null
+  },
+  "migrate": {
+    "exit": 0,
+    "status": {
+      "status": "success"
+    },
+    "digest": "DqMdjptUNavQcBHxKabhsueAjgEf3LjdjyAK4LgNh25Q"
+  },
+  "new_after_migrate": {
+    "exit": 0,
+    "status": {
+      "status": "success"
+    },
+    "digest": null
+  },
+  "old_after_migrate": {
+    "exit": 0,
+    "status": {
+      "status": "failure",
+      "error": "MoveAbort(MoveLocation { module: ModuleId { address: 1d08b0e0c81299bc01779ec5ca276ea378c40263edab885febcab516f7afbd93, name: Identifier(\"version\") }, function: 1, instruction: 8, function_name: Some(\"check_is_valid\") }, 0) in command 0"
+    },
+    "digest": null
+  },
+  "old_cannot_downgrade": {
+    "exit": 0,
+    "status": {
+      "status": "failure",
+      "error": "MoveAbort(MoveLocation { module: ModuleId { address: 1d08b0e0c81299bc01779ec5ca276ea378c40263edab885febcab516f7afbd93, name: Identifier(\"version\") }, function: 2, instruction: 18, function_name: Some(\"migrate\") }, 2) in command 0"
+    },
+    "digest": null
+  }
+}

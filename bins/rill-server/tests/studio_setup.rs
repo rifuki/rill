@@ -12,6 +12,10 @@ fn addr(s: &str) -> String {
 }
 fn context() -> SetupContext {
     SetupContext {
+        wallet_package_id: None,
+        wallet_version_id: None,
+        wallet_type_package: None,
+        deepbook_type_packages: None,
         network: Network::Testnet,
         guard_package: Some(deployments::TESTNET_RILL_GUARD.parse().unwrap()),
         now_ms: 1000,
@@ -470,4 +474,40 @@ async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
         .await
         .unwrap_err()
         .contains("another balance manager"));
+}
+
+#[tokio::test]
+async fn mainnet_setup_uses_explicit_wallet_deployment() {
+    let mut ctx = context();
+    ctx.network = Network::Mainnet;
+    ctx.wallet_package_id = Some("0x123".into());
+    ctx.wallet_version_id = Some("0x456".into());
+    ctx.wallet_type_package = Some("0x123".into());
+    let c = object(
+        chain("0", "0x1", "0x2"),
+        "0x456",
+        "0x123::version::Version",
+        json!({}),
+        None,
+    );
+    let result = prepare_plan(&body(), &skill(), &addr("0x1"), &ctx, &c)
+        .await
+        .unwrap();
+    assert_eq!(result["walletPackageId"], addr("0x123"));
+    assert_eq!(result["versionId"], addr("0x456"));
+    assert_eq!(
+        result["deepbookPackageId"],
+        rill_ptb::registry::MAINNET_PACKAGE_ID
+    );
+}
+
+#[test]
+fn mainnet_never_falls_back_to_testnet_wallet_ids() {
+    assert!(deployments::wallet_deployment(Network::Mainnet, None, None).is_err());
+    assert!(deployments::wallet_deployment(
+        Network::Mainnet,
+        Some(deployments::TESTNET_AGENT_WALLET),
+        Some(deployments::TESTNET_AGENT_WALLET_VERSION)
+    )
+    .is_err());
 }

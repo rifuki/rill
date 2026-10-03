@@ -214,9 +214,15 @@ fn spend_args(wallet_id: &str, amount: &str) -> SpendArgs {
 /// The wallet is staged as an object too, because a node has it once the transaction lands and the
 /// create waits for exactly that before it promises the id to the next step.
 fn chain_for_create(owner: &Keystore, agent: &Keystore) -> FakeSui {
+    let wallet = ObjectSummary {
+        fields: Some(
+            json!({"owner":owner.address().to_string(),"budget":"0","spent":"0","revoked":false}),
+        ),
+        ..shared(WALLET, 4, "AgentWallet")
+    };
     FakeSui::new()
         .with_object(None, shared(VERSION, 3, "Version"))
-        .with_object(None, shared(WALLET, 4, "AgentWallet"))
+        .with_object(None, wallet)
         .with_object(
             Some(&owner.address().to_string()),
             owned(COIN, SUI_COIN_TYPE),
@@ -321,13 +327,14 @@ fn an_agent_creates_a_wallet_attaches_its_rules_and_spends_inside_them() {
         json!(agent.address().to_string()),
         "the cap is minted to the agent, not to the key that signed"
     );
-    assert_eq!(created["funding"], json!("0.05 SUI (50000000 mist)"));
+    assert_eq!(created["fundingBaseUnits"], json!("0"));
+    assert_eq!(created["plannedFundingBaseUnits"], json!("50000000"));
     assert_eq!(
         created["rules"],
         json!(["budget 50000000", "per-tx 20000000"])
     );
     assert!(
-        created["note"].as_str().unwrap().contains("NO rules"),
+        created["note"].as_str().unwrap().contains("empty"),
         "a wallet with no rules has no limits, and the answer has to say so: {created}"
     );
 
@@ -1154,13 +1161,17 @@ fn creating_a_wallet_attaches_its_rules_in_a_second_transaction() {
     let attach = rill_policy::decode::decode(&submitted[1]).expect("the attach decodes");
     assert_eq!(
         create.targets,
-        vec![format!("{PACKAGE}::agent_wallet::create_wallet")]
+        vec![
+            "0x0000000000000000000000000000000000000000000000000000000000000002::coin::zero".into(),
+            format!("{PACKAGE}::agent_wallet::create_wallet")
+        ]
     );
     assert_eq!(
         attach.targets,
         vec![
             format!("{PACKAGE}::budget::add"),
             format!("{PACKAGE}::per_tx::add"),
+            format!("{PACKAGE}::agent_wallet::top_up"),
         ],
         "the second transaction must attach both rules the call was given"
     );

@@ -227,6 +227,29 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         return rpc_error(id, -32602, "tools/call requires a tool name.");
     };
 
+    if context.network == "mainnet" && !matches!(name, "rill_status" | "rill_execute") {
+        let package = std::env::var("AGENT_WALLET_PACKAGE_ID").ok();
+        let version = std::env::var("AGENT_WALLET_VERSION_ID").ok();
+        if let Err(reason) = rill_ptb::deployments::wallet_deployment(
+            rill_core::envelope::Network::Mainnet,
+            package.as_deref(),
+            version.as_deref(),
+        ) {
+            return tool_error(id, "not_configured", &reason);
+        }
+        if matches!(name, "rill_swap" | "rill_quote")
+            && std::env::var("RILL_GUARD_PACKAGE_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
+            return tool_error(
+                id,
+                "not_configured",
+                "mainnet swaps require RILL_GUARD_PACKAGE_ID",
+            );
+        }
+    }
     match name {
         "rill_status" => status(context, id),
         "rill_wallet" => wallet(context, id, &params),
@@ -318,8 +341,8 @@ fn quote(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         // Cetus's own ids, defaulted for the same reason the wallet package is: an agent given a
         // pool id cannot invent them, and a caller that had to supply them could supply the wrong
         // ones.
-        integrate_package_id: cetus_integrate(),
-        global_config_id: cetus_global_config(),
+        integrate_package_id: cetus_integrate(context),
+        global_config_id: cetus_global_config(context),
         pool_id: pool,
         spend: amount,
         slippage_bps,
@@ -403,15 +426,25 @@ fn version_id() -> String {
 /// Defaulted like the pair above rather than asked for: a caller that had to supply it could supply
 /// nothing, and a swap with no floor is exactly the outcome the floor exists to prevent.
 /// Cetus's router package, where `router::swap` lives.
-fn cetus_integrate() -> String {
-    std::env::var("CETUS_INTEGRATE_PACKAGE_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_CETUS_INTEGRATE.to_string())
+fn cetus_integrate(context: &WalletContext) -> String {
+    std::env::var("CETUS_INTEGRATE_PACKAGE_ID").unwrap_or_else(|_| {
+        if context.network == "mainnet" {
+            "0x996c4d9480708fb8b92aa7acf819fb0497b5ec8e65ba06601cae2fb6db3312c3".into()
+        } else {
+            rill_ptb::deployments::TESTNET_CETUS_INTEGRATE.to_string()
+        }
+    })
 }
 
 /// Cetus's `GlobalConfig`, which every swap reads.
-fn cetus_global_config() -> String {
-    std::env::var("CETUS_GLOBAL_CONFIG_ID")
-        .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_CETUS_GLOBAL_CONFIG.to_string())
+fn cetus_global_config(context: &WalletContext) -> String {
+    std::env::var("CETUS_GLOBAL_CONFIG_ID").unwrap_or_else(|_| {
+        if context.network == "mainnet" {
+            "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f".into()
+        } else {
+            rill_ptb::deployments::TESTNET_CETUS_GLOBAL_CONFIG.to_string()
+        }
+    })
 }
 
 fn guard_package_id() -> String {
@@ -626,11 +659,11 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         cap_id: get("cap"),
         integrate_package_id: match get("integratePackage") {
             given if !given.is_empty() => given,
-            _ => cetus_integrate(),
+            _ => cetus_integrate(context),
         },
         global_config_id: match get("globalConfig") {
             given if !given.is_empty() => given,
-            _ => cetus_global_config(),
+            _ => cetus_global_config(context),
         },
         pool_id: get("pool"),
         coin_type_a: get("coinTypeA"),
@@ -693,10 +726,20 @@ fn stake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         version_id: version_id(),
         wallet_id: get("wallet"),
         cap_id: get("cap"),
-        haedal_package_id: std::env::var("HAEDAL_PACKAGE_ID")
-            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_HAEDAL_PACKAGE.to_string()),
-        staking_object_id: std::env::var("HAEDAL_STAKING_ID")
-            .unwrap_or_else(|_| rill_ptb::deployments::TESTNET_HAEDAL_STAKING.to_string()),
+        haedal_package_id: std::env::var("HAEDAL_PACKAGE_ID").unwrap_or_else(|_| {
+            if context.network == "mainnet" {
+                "0x126e4cfb051cad744706df590ec399e8c02b6feae195c35b8b496280d5442a62".into()
+            } else {
+                rill_ptb::deployments::TESTNET_HAEDAL_PACKAGE.to_string()
+            }
+        }),
+        staking_object_id: std::env::var("HAEDAL_STAKING_ID").unwrap_or_else(|_| {
+            if context.network == "mainnet" {
+                "0x47b224762220393057ebf4f70501b6e657c3e56684737568439a04f80849b2ca".into()
+            } else {
+                rill_ptb::deployments::TESTNET_HAEDAL_STAKING.to_string()
+            }
+        }),
         validator,
         spend: get("amount"),
         gas_budget: TOOL_GAS_BUDGET,

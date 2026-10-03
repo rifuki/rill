@@ -236,6 +236,38 @@ pub async fn describe_package(
     Ok(functions)
 }
 
+/// Resolve a type's defining package independently of the upgraded call package.
+pub async fn datatype_origin(
+    endpoint: &str,
+    package: &str,
+    module: &str,
+    name: &str,
+) -> ChainResult<String> {
+    use sui_rpc::proto::sui::rpc::v2::GetDatatypeRequest;
+    let client =
+        sui_rpc::client::Client::new(endpoint).map_err(|e| ChainError::Transport(e.to_string()))?;
+    let mut request = GetDatatypeRequest::default();
+    request.package_id = Some(package.into());
+    request.module_name = Some(module.into());
+    request.name = Some(name.into());
+    let datatype = client
+        .clone()
+        .package_client()
+        .get_datatype(request)
+        .await
+        .map_err(|e| ChainError::Transport(e.message().into()))?
+        .into_inner()
+        .datatype
+        .ok_or_else(|| ChainError::NotFound(format!("{package}::{module}::{name}")))?;
+    let origin = datatype
+        .defining_id
+        .ok_or_else(|| ChainError::NotFound("datatype defining ID is missing".into()))?;
+    origin
+        .parse::<sui_sdk_types::Address>()
+        .map(|a| a.to_string())
+        .map_err(|e| ChainError::Transport(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

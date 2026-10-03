@@ -20,9 +20,7 @@ use rill_chain::describe::describe_function;
 use rill_cli::keystore::{Keystore, KeystoreError, SIGN_AS_VAR};
 use rill_cli::runset::RunSet;
 use rill_cli::stdio::{serve, WalletContext};
-use rill_ptb::deployments::{
-    is_superseded, TESTNET_AGENT_WALLET, TESTNET_AGENT_WALLET_VERSION as DEFAULT_VERSION_ID,
-};
+use rill_ptb::deployments::{is_superseded, TESTNET_AGENT_WALLET};
 
 /// The positional arguments, with `--as <address>` removed.
 ///
@@ -236,7 +234,40 @@ fn status(loaded: &Loaded) -> i32 {
     i32::from(loaded.keystore.is_none())
 }
 
+fn default_wallet_id(network: &str, package: bool) -> String {
+    let package_env = std::env::var("AGENT_WALLET_PACKAGE_ID").ok();
+    let version_env = std::env::var("AGENT_WALLET_VERSION_ID").ok();
+    let network = if network == "mainnet" {
+        rill_core::envelope::Network::Mainnet
+    } else {
+        rill_core::envelope::Network::Testnet
+    };
+    match rill_ptb::deployments::wallet_deployment(
+        network,
+        package_env.as_deref(),
+        version_env.as_deref(),
+    ) {
+        Ok((id, version)) => {
+            if package {
+                id.to_string()
+            } else {
+                version.to_string()
+            }
+        }
+        Err(e) => {
+            eprintln!("rill: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    if let Ok(network) = std::env::var("SUI_NETWORK") {
+        if !matches!(network.as_str(), "testnet" | "mainnet") {
+            eprintln!("rill: SUI_NETWORK must be testnet or mainnet");
+            std::process::exit(1);
+        }
+    }
     // The first argument that is not `--as <address>`. Without this the flag becomes the command,
     // and `rill --as 0x… status` reports that `--as` is not a command it knows.
     let command = positional().first().cloned();
@@ -383,10 +414,10 @@ funded."
                 let args = rill_cli::init::InitArgs {
                     package_id: flag("--package")
                         .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
-                        .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                        .unwrap_or_else(|| default_wallet_id(&loaded.network, true)),
                     version_id: flag("--version-object")
                         .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
-                        .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                        .unwrap_or_else(|| default_wallet_id(&loaded.network, false)),
                     amount: flag("--amount").unwrap_or_else(|| "0.2".into()),
                     budget_mist: flag("--budget").unwrap_or_else(|| "200000000".into()),
                     per_tx_mist: flag("--per-tx").unwrap_or_else(|| "50000000".into()),
@@ -537,10 +568,10 @@ funded."
             let args = rill_cli::wallet::CreateArgs {
                 package_id: flag("--package")
                     .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
-                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, true)),
                 version_id: flag("--version-object")
                     .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, false)),
                 agent: flag("--agent"),
                 amount: flag("--amount").unwrap_or_else(|| "0.2".into()),
                 expires_in_days: flag("--days").and_then(|d| d.parse().ok()).unwrap_or(30),
@@ -624,10 +655,10 @@ funded."
             let args = rill_cli::spend_cmd::SpendArgs {
                 package_id: flag("--package")
                     .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
-                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, true)),
                 version_id: flag("--version-object")
                     .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, false)),
                 wallet_id,
                 cap_id,
                 amount: flag("--amount").unwrap_or_else(|| "0.01".into()),
@@ -726,10 +757,10 @@ funded."
             let args = rill_cli::order_cmd::OrderArgs {
                 package_id: flag("--package")
                     .or_else(|| std::env::var("AGENT_WALLET_PACKAGE_ID").ok())
-                    .unwrap_or_else(|| TESTNET_AGENT_WALLET.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, true)),
                 version_id: flag("--version-object")
                     .or_else(|| std::env::var("AGENT_WALLET_VERSION_ID").ok())
-                    .unwrap_or_else(|| DEFAULT_VERSION_ID.into()),
+                    .unwrap_or_else(|| default_wallet_id(&loaded.network, false)),
                 wallet_id: need("--wallet"),
                 cap_id: need("--cap"),
                 deepbook_package: flag("--deepbook")

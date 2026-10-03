@@ -259,6 +259,7 @@ module agent_wallet::agent_wallet {
         assert!(clock.timestamp_ms() < wallet.expires_at_ms, E_EXPIRED);
 
         let required = &wallet.policy.rules;
+        assert!(!required.is_empty(), E_RULE_NOT_SATISFIED);
         let mut satisfied = receipts.into_keys();
         assert!(satisfied.length() == required.length(), E_RULE_NOT_SATISFIED);
         while (!satisfied.is_empty()) {

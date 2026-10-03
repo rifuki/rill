@@ -41,6 +41,8 @@ fn config_with(base: &str) -> Config {
         oauth_secret: "a-test-secret-long-enough-to-pass".into(),
         oauth_secret_from_env: true,
         guard_package_id: Some("0xguard".into()),
+        wallet_package_id: None,
+        wallet_version_id: None,
         owner_secret: None,
         owner_address: None,
         bind_address: "127.0.0.1".into(),

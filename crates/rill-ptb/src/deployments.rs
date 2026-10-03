@@ -105,6 +105,33 @@ pub const TESTNET_DEEPBOOK_TRADE_CAP_TYPE_PACKAGE: &str = TESTNET_DEEPBOOK_MANAG
 pub const TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE: &str =
     "0x984757fc7c0e6dd5f15c2c66e881dd6e5aca98b725f3dbd83c445e057ebb790a";
 
+/// Resolve public deployment IDs, with no testnet fallback on mainnet.
+pub fn wallet_deployment(
+    network: rill_core::envelope::Network,
+    package: Option<&str>,
+    version: Option<&str>,
+) -> Result<(sui_sdk_types::Address, sui_sdk_types::Address), String> {
+    use rill_core::envelope::Network;
+    if network == Network::Mainnet && (package.is_none() || version.is_none()) {
+        return Err("mainnet requires AGENT_WALLET_PACKAGE_ID and AGENT_WALLET_VERSION_ID".into());
+    }
+    let package = package
+        .unwrap_or(TESTNET_AGENT_WALLET)
+        .parse::<sui_sdk_types::Address>()
+        .map_err(|_| "wallet package is not a Sui address")?;
+    let version = version
+        .unwrap_or(TESTNET_AGENT_WALLET_VERSION)
+        .parse::<sui_sdk_types::Address>()
+        .map_err(|_| "wallet Version object is not a Sui address")?;
+    if network == Network::Mainnet
+        && (package.to_string() == TESTNET_AGENT_WALLET
+            || version.to_string() == TESTNET_AGENT_WALLET_VERSION)
+    {
+        return Err("mainnet cannot use testnet wallet deployment IDs".into());
+    }
+    Ok((package, version))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

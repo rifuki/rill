@@ -37,6 +37,27 @@ pub struct SetupContext {
     pub network: Network,
     pub guard_package: Option<Address>,
     pub now_ms: u64,
+    pub wallet_package_id: Option<String>,
+    pub wallet_version_id: Option<String>,
+    pub wallet_type_package: Option<String>,
+    pub deepbook_type_packages: Option<[String; 3]>,
+}
+fn deepbook_network(network: Network) -> DeepBookNetwork {
+    match network {
+        Network::Mainnet => DeepBookNetwork::Mainnet,
+        Network::Testnet => DeepBookNetwork::Testnet,
+    }
+}
+fn deepbook_types(context: &SetupContext) -> Result<[String; 3], String> {
+    match &context.deepbook_type_packages {
+        Some(types) => Ok(types.clone()),
+        None if context.network == Network::Testnet => Ok([
+            deployments::TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE.into(),
+            deployments::TESTNET_DEEPBOOK_TRADE_CAP_TYPE_PACKAGE.into(),
+            deployments::TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE.into(),
+        ]),
+        None => Err("mainnet DeepBook type origins must be resolved from chain".into()),
+    }
 }
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -91,9 +112,11 @@ fn grant(
     if required(body, "skillId")? != skill.id {
         return Err("skillId does not match the published skill".into());
     }
-    if context.network != Network::Testnet {
-        return Err("Studio setup requires a configured wallet deployment; no mainnet deployment is configured".into());
-    }
+    deployments::wallet_deployment(
+        context.network,
+        context.wallet_package_id.as_deref(),
+        context.wallet_version_id.as_deref(),
+    )?;
     let agent = body
         .get("agent")
         .map(|_| required(body, "agent").and_then(address))
@@ -268,9 +291,12 @@ pub async fn prepare_plan(
     chain: &impl SuiRead,
 ) -> Result<Value, String> {
     let grant = grant(body, skill, owner, context)?;
-    let package = address(deployments::TESTNET_AGENT_WALLET)?;
-    let version = address(deployments::TESTNET_AGENT_WALLET_VERSION)?;
-    let deepbook = address(DeepBookNetwork::Testnet.package_id())?;
+    let (package, version) = deployments::wallet_deployment(
+        context.network,
+        context.wallet_package_id.as_deref(),
+        context.wallet_version_id.as_deref(),
+    )?;
+    let deepbook = address(deepbook_network(context.network).package_id())?;
     let mut objects = SharedObjects::new();
     shared(chain, &mut objects, version).await?;
     let mut tx = builder(grant.owner, chain).await?;
@@ -311,7 +337,7 @@ pub async fn prepare_plan(
         build_provision_manager_with_type_package(
             &mut tx,
             deepbook,
-            address(deployments::TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE)?,
+            address(&deepbook_types(context)?[0])?,
             grant.agent,
         )
         .map_err(err)?;
@@ -361,14 +387,21 @@ pub async fn attach_plan(
     chain: &impl SuiRead,
 ) -> Result<Value, String> {
     let mut grant = grant(body, skill, owner, context)?;
-    let package = address(deployments::TESTNET_AGENT_WALLET)?;
-    let version = address(deployments::TESTNET_AGENT_WALLET_VERSION)?;
+    let (package, version) = deployments::wallet_deployment(
+        context.network,
+        context.wallet_package_id.as_deref(),
+        context.wallet_version_id.as_deref(),
+    )?;
     let wallet_id = address(required(body, "walletId")?)?;
     let cap_id = address(required(body, "agentCapId")?)?;
     let mut objects = SharedObjects::new();
     let wallet = shared(chain, &mut objects, wallet_id).await?;
     let expected = canonical_type(&format!(
-        "{package}::agent_wallet::AgentWallet<{}>",
+        "{}::agent_wallet::AgentWallet<{}>",
+        context
+            .wallet_type_package
+            .as_deref()
+            .unwrap_or(&package.to_string()),
         grant.manifest.wallet_coin_type
     ))?;
     if wallet
@@ -416,7 +449,13 @@ pub async fn attach_plan(
         chain,
         grant.agent,
         cap_id,
-        &format!("{package}::agent_wallet::AgentCap"),
+        &format!(
+            "{}::agent_wallet::AgentCap",
+            context
+                .wallet_type_package
+                .as_deref()
+                .unwrap_or(&package.to_string())
+        ),
     )
     .await?;
     if cap
@@ -437,7 +476,8 @@ pub async fn attach_plan(
         .any(|n| n.kind == "deepbook_limit_order");
     if needs_manager {
         let manager = address(required(body, "balanceManagerId")?)?;
-        let deepbook = deployments::TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE;
+        let origins = deepbook_types(context)?;
+        let deepbook = &origins[0];
         let manager_object = shared(chain, &mut objects, manager).await?;
         if manager_object
             .object_type
@@ -461,16 +501,8 @@ pub async fn attach_plan(
             return Err("balance manager owner does not match sender".into());
         }
         for (key, kind, defining_package) in [
-            (
-                "tradeCapId",
-                "TradeCap",
-                deployments::TESTNET_DEEPBOOK_TRADE_CAP_TYPE_PACKAGE,
-            ),
-            (
-                "depositCapId",
-                "DepositCap",
-                deployments::TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE,
-            ),
+            ("tradeCapId", "TradeCap", origins[1].as_str()),
+            ("depositCapId", "DepositCap", origins[2].as_str()),
         ] {
             let id = address(required(body, key)?)?;
             let cap = check_owned_cap(
@@ -620,11 +652,60 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) 
         Ok(v) => v,
         Err(e) => return *e,
     };
-    let context = SetupContext {
+    let mut context = SetupContext {
         network: options.network,
         guard_package: options.guard_package,
         now_ms: studio_api::now_ms(),
+        wallet_package_id: state.config.wallet_package_id.clone(),
+        wallet_version_id: state.config.wallet_version_id.clone(),
+        wallet_type_package: None,
+        deepbook_type_packages: None,
     };
+    let (package, _) = match deployments::wallet_deployment(
+        context.network,
+        context.wallet_package_id.as_deref(),
+        context.wallet_version_id.as_deref(),
+    ) {
+        Ok(ids) => ids,
+        Err(e) => return studio_api::invalid(e),
+    };
+    if context.network == Network::Mainnet || context.wallet_package_id.is_some() {
+        context.wallet_type_package = match rill_chain::describe::datatype_origin(
+            &state.config.sui_rpc_url,
+            &package.to_string(),
+            "agent_wallet",
+            "AgentWallet",
+        )
+        .await
+        {
+            Ok(origin) => Some(origin),
+            Err(e) => return api_err_typed(StatusCode::BAD_GATEWAY, e.to_string(), "ChainError"),
+        };
+    }
+    if skill.flow["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|n| n["type"] == "deepbook_limit_order"))
+    {
+        let package = deepbook_network(context.network).package_id();
+        let mut origins = Vec::new();
+        for kind in ["BalanceManager", "TradeCap", "DepositCap"] {
+            match rill_chain::describe::datatype_origin(
+                &state.config.sui_rpc_url,
+                package,
+                "balance_manager",
+                kind,
+            )
+            .await
+            {
+                Ok(origin) => origins.push(origin),
+                Err(e) => {
+                    return api_err_typed(StatusCode::BAD_GATEWAY, e.to_string(), "ChainError")
+                }
+            }
+        }
+        context.deepbook_type_packages =
+            Some([origins[0].clone(), origins[1].clone(), origins[2].clone()]);
+    }
     let result = if attach {
         attach_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
     } else {

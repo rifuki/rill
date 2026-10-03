@@ -35,11 +35,7 @@ const SUI_COIN_TYPE: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI>";
 
 /// What a freshly created wallet permits, which is nothing, said where both callers read it.
-const NO_RULES_YET: &str =
-    "This wallet has NO rules attached yet, and confirm_spend on an empty policy requires zero \
-     receipts, so the capability is unbounded until rules are attached. Attach them before the \
-     cap is handed to anything: `rill wallet rules --wallet <id> --submit`, or the rill_attach_rules \
-     tool with this wallet id.";
+const NO_RULES_YET: &str = "This wallet is empty. No funds are exposed before its rules are attached and initial funding is added atomically.";
 
 pub struct CreateArgs {
     pub package_id: String,
@@ -129,7 +125,13 @@ pub async fn create_json(
     now_ms: u64,
 ) -> Result<Value, Failure> {
     let chain = GrpcSui::new(endpoint).map_err(|e| e.to_string())?;
-    create_json_on(&chain, keystore, args, now_ms).await
+    match create_and_bound_json_on(&chain, keystore, args, now_ms).await? {
+        Bounded::Yes { report } => Ok(report),
+        Bounded::CreatedButUnbounded { wallet_id, why, .. } => Err(Failure::Failed(format!(
+            "Wallet {} was created empty; rules and funding did not complete: {why}",
+            wallet_id.as_deref().unwrap_or("unknown")
+        ))),
+    }
 }
 
 /// The creation itself, against any chain.
@@ -204,13 +206,19 @@ pub async fn create_json_on(
         )
     }));
 
-    let value = tx.pure(&amount_mist);
-    let gas_arg = tx.gas();
-    let funds = tx
-        .split_coins(gas_arg, vec![value])
-        .into_iter()
-        .next()
-        .expect("one split result per amount");
+    let funds = tx.move_call(
+        sui_transaction_builder::Function::new(
+            "0x2"
+                .parse()
+                .map_err(|e| format!("framework address: {e}"))?,
+            "coin".parse().map_err(|e| format!("coin module: {e}"))?,
+            "zero".parse().map_err(|e| format!("zero function: {e}"))?,
+        )
+        .with_type_args(vec!["0x2::sui::SUI"
+            .parse()
+            .map_err(|e| format!("coin type: {e}"))?]),
+        vec![],
+    );
 
     let wallet = NewWallet {
         package_id: args
@@ -239,8 +247,9 @@ pub async fn create_json_on(
     let mut report = json!({
         "sender": sender.to_string(),
         "agent": wallet.agent.to_string(),
-        "funding": format!("{} SUI ({amount_mist} mist)", args.amount),
-        "fundingBaseUnits": amount_mist.to_string(),
+        "funding": "0 SUI (empty until rules and funding are attached)",
+        "fundingBaseUnits": "0",
+        "plannedFundingBaseUnits": amount_mist.to_string(),
         "rules": describe(&args.manifest),
         "expiresAtMs": wallet.expires_at_ms.to_string(),
         "submitted": false,
@@ -374,6 +383,9 @@ pub async fn create_and_bound_json_on(
     now_ms: u64,
 ) -> Result<Bounded, Failure> {
     let created = create_json_on(chain, keystore, args, now_ms).await?;
+    if args.dry_run {
+        return Ok(Bounded::Yes { report: created });
+    }
     let Some(wallet_id) = created["wallet"].as_str().map(str::to_owned) else {
         return Ok(Bounded::CreatedButUnbounded {
             wallet_id: None,
@@ -390,11 +402,20 @@ pub async fn create_and_bound_json_on(
         gas_budget: args.gas_budget,
         dry_run: false,
     };
-    match crate::rules_cmd::attach_json_on(chain, keystore, &rules).await {
+    match crate::rules_cmd::attach_and_fund_json_on(
+        chain,
+        keystore,
+        &rules,
+        rill_core::amounts::decimal_to_base_units(&args.amount, 9).map_err(|e| e.to_string())?,
+    )
+    .await
+    {
         Ok(attached) => {
             let mut report = created;
             report["rulesAttached"] = attached["rules"].clone();
             report["attachDigest"] = attached["digest"].clone();
+            report["fundingBaseUnits"] = attached["fundingBaseUnits"].clone();
+            report["funding"] = json!(format!("{} SUI", args.amount));
             report["note"] = json!(
                 "Created, funded, and bounded: two transactions, both confirmed. The wallet carries \
                  the rules this call was given, proved on chain against every spend. This cannot be \

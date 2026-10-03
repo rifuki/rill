@@ -13,6 +13,7 @@ use rill_cli::init::{
 };
 use rill_cli::keystore::Keystore;
 use rill_core::manifest::{CapabilityManifest, CapabilityRule};
+use serde_json::json;
 use sui_crypto::ed25519::Ed25519PrivateKey;
 use sui_sdk_types::Digest;
 
@@ -86,9 +87,15 @@ fn owned(id: &str, object_type: &str) -> ObjectSummary {
 
 /// A chain that can answer the create and then the attach, in that order, the way `init` asks them.
 fn chain(owner: &Keystore, agent: &Keystore) -> FakeSui {
+    let wallet = ObjectSummary {
+        fields: Some(
+            json!({"owner":owner.address().to_string(),"budget":"0","spent":"0","revoked":false}),
+        ),
+        ..shared(WALLET, 4, "AgentWallet")
+    };
     FakeSui::new()
         .with_object(None, shared(VERSION, 3, "Version"))
-        .with_object(None, shared(WALLET, 4, "AgentWallet"))
+        .with_object(None, wallet)
         .with_object(
             Some(&owner.address().to_string()),
             owned(COIN, SUI_COIN_TYPE),

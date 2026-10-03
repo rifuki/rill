@@ -185,7 +185,7 @@ pub async fn run_on(
         .ok_or("the create did not report a capability id")?
         .to_owned();
 
-    let attached = crate::rules_cmd::attach_json_on(
+    let attached = crate::rules_cmd::attach_and_fund_json_on(
         chain,
         owner_keystore,
         &crate::rules_cmd::RulesArgs {
@@ -196,6 +196,7 @@ pub async fn run_on(
             gas_budget: args.gas_budget,
             dry_run: false,
         },
+        rill_core::amounts::decimal_to_base_units(&args.amount, 9).map_err(|e| e.to_string())?,
     )
     .await
     .map_err(|e| format!("attaching the rules: {e}"))?;

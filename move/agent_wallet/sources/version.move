@@ -18,6 +18,7 @@
 module agent_wallet::version;
 
 use sui::package::Publisher;
+use sui::event;
 
 /// Bump on every upgrade that changes on-chain behavior. `migrate` moves a live `Version` object's
 /// `version` field up to match; callers holding a stale `Version` reference get rejected by
@@ -29,6 +30,13 @@ const VERSION: u64 = 1;
 const E_INVALID_PACKAGE_VERSION: u64 = 0;
 /// `migrate` was called with a `Publisher` not claimed by this package.
 const E_INVALID_PUBLISHER: u64 = 1;
+const E_NOT_UPGRADE: u64 = 2;
+
+public struct Migrated has copy, drop {
+    version_object: ID,
+    from_version: u64,
+    to_version: u64,
+}
 
 /// Shared object recording which package version is authoritative. The agent-facing spend path
 /// (`create_wallet`, `request_spend`, `confirm_spend`, every rule's `prove`) borrows this and calls
@@ -54,11 +62,15 @@ public fun check_is_valid(self: &Version) {
 /// `from_package` matches on package address only).
 public fun migrate(publisher: &Publisher, self: &mut Version) {
     assert!(publisher.from_package<Version>(), E_INVALID_PUBLISHER);
+    assert!(self.version < VERSION, E_NOT_UPGRADE);
+    let from_version = self.version;
     self.version = VERSION;
+    event::emit(Migrated { version_object: object::id(self), from_version, to_version: VERSION });
 }
 
 #[test_only]
 public fun init_for_testing(ctx: &mut TxContext) {
+    agent_wallet::publisher::init_for_testing(ctx);
     init(ctx);
 }
 

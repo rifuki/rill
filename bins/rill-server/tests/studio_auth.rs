@@ -28,6 +28,8 @@ fn app_state() -> AppState {
         oauth_secret: "test-studio-secret-at-least-32-characters".into(),
         oauth_secret_from_env: true,
         guard_package_id: None,
+        wallet_package_id: None,
+        wallet_version_id: None,
         owner_secret: None,
         owner_address: None,
         bind_address: "127.0.0.1".into(),

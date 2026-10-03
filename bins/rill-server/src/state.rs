@@ -48,6 +48,8 @@ pub struct Config {
     /// True when the secret came from the environment, and therefore survives a restart.
     pub oauth_secret_from_env: bool,
     pub guard_package_id: Option<String>,
+    pub wallet_package_id: Option<String>,
+    pub wallet_version_id: Option<String>,
     /// The address to listen on. `0.0.0.0` by default, because a container that bound loopback
     /// would be unreachable from outside itself and the failure would look like a crash.
     pub bind_address: String,
@@ -91,7 +93,11 @@ impl Config {
             Ok("mainnet") => Network::Mainnet,
             // Testnet is the default. An operator opts *into* mainnet explicitly rather than
             // landing on it by omission.
-            _ => Network::Testnet,
+            Ok("testnet") | Err(_) => Network::Testnet,
+            Ok(_) => {
+                eprintln!("SUI_NETWORK must be testnet or mainnet");
+                std::process::exit(1);
+            }
         };
         let public_base_url =
             std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://localhost:{port}"));
@@ -154,6 +160,8 @@ impl Config {
             guard_package_id: std::env::var("RILL_GUARD_PACKAGE_ID")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            wallet_package_id: trimmed_env("AGENT_WALLET_PACKAGE_ID"),
+            wallet_version_id: trimmed_env("AGENT_WALLET_VERSION_ID"),
             owner_secret: trimmed_env("RILL_OWNER_SECRET"),
             owner_address: trimmed_env("RILL_OWNER_ADDRESS"),
             skills_store_path: std::env::var("SKILLS_STORE_PATH")
@@ -246,6 +254,11 @@ impl Config {
                     .into(),
             );
         }
+        rill_ptb::deployments::wallet_deployment(
+            self.network.into(),
+            self.wallet_package_id.as_deref(),
+            self.wallet_version_id.as_deref(),
+        )?;
         if self.network != Network::Mainnet {
             return Ok(());
         }

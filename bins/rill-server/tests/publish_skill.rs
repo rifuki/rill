@@ -44,6 +44,8 @@ fn config_in(dir: &std::path::Path) -> Config {
         oauth_secret: SECRET.into(),
         oauth_secret_from_env: true,
         guard_package_id: Some("0xguard".into()),
+        wallet_package_id: None,
+        wallet_version_id: None,
         owner_secret: None,
         owner_address: None,
         // Loopback, so `boot_check`'s open-authorization refusal is not in play here: these
