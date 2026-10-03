@@ -28,12 +28,12 @@ use crate::{
 /// The most published skills one deployment holds. Reaching it is refused rather than evicting.
 pub const MAX_STORED_SKILLS: usize = 500;
 
-fn io<E: std::fmt::Display>(e: E) -> StoreError {
+pub(crate) fn io<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Io(e.to_string())
 }
 
 /// Write a file so a reader never sees a partial one.
-fn write_atomic(path: &Path, contents: &str, mode: Option<u32>) -> StoreResult<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &str, mode: Option<u32>) -> StoreResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io)?;
     }

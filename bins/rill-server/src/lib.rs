@@ -13,6 +13,7 @@ pub mod routes;
 pub mod state;
 pub mod studio_auth;
 pub mod studio_compile;
+pub mod studio_grants;
 
 pub mod studio_api;
 pub mod studio_setup;

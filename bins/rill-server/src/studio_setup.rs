@@ -379,13 +379,31 @@ async fn check_owned_cap(
     Ok(cap)
 }
 
-pub async fn attach_plan(
+/// What onboarding and an action grant both derive from a wallet and a published action: the
+/// checked wallet, the run set the signer will pin, and the arguments it builds with.
+///
+/// One derivation for both, so a run set an owner approves in a grant is exactly the run set
+/// onboarding would have exported for the same wallet and action.
+struct Binding {
+    grant: Grant,
+    package: Address,
+    version: Address,
+    wallet_id: Address,
+    objects: SharedObjects,
+    run_set: Value,
+    build_arguments: Value,
+}
+
+/// `fresh` is onboarding: the wallet must still be empty with no rules, because the next step funds
+/// it. Otherwise the wallet must already carry rules, because a grant runs inside them.
+async fn bind(
     body: &Value,
     skill: &PublishedSkill,
     owner: &str,
     context: &SetupContext,
     chain: &impl SuiRead,
-) -> Result<Value, String> {
+    fresh: bool,
+) -> Result<Binding, String> {
     let mut grant = grant(body, skill, owner, context)?;
     let (package, version) = deployments::wallet_deployment(
         context.network,
@@ -432,18 +450,24 @@ pub async fn attach_plan(
     if chain_amount(fields, "expires_at_ms")? <= context.now_ms {
         return Err("wallet has expired".into());
     }
-    if chain_amount(fields, "budget")? != 0 || chain_amount(fields, "spent")? != 0 {
-        return Err(
-            "wallet is already funded or has spent funds; refusing duplicate funding".into(),
-        );
-    }
     let rules = &fields["policy"]["rules"];
     let rules = rules
         .as_array()
         .or_else(|| rules["contents"].as_array())
         .ok_or("wallet policy rules are unavailable")?;
-    if !rules.is_empty() {
-        return Err("wallet already has attached rules".into());
+    if fresh {
+        if chain_amount(fields, "budget")? != 0 || chain_amount(fields, "spent")? != 0 {
+            return Err(
+                "wallet is already funded or has spent funds; refusing duplicate funding".into(),
+            );
+        }
+        if !rules.is_empty() {
+            return Err("wallet already has attached rules".into());
+        }
+    } else if rules.is_empty() {
+        return Err(
+            "wallet has no rules attached yet; finish onboarding before granting an action".into(),
+        );
     }
     let cap = check_owned_cap(
         chain,
@@ -563,6 +587,59 @@ pub async fn attach_plan(
         &STANDARD.encode(bcs::to_bytes(&compiled.transaction).map_err(err)?),
     )
     .map_err(err)?;
+    let runset = json!({"label":skill.name,"network":context.network,"sender":grant.agent.to_string(),"actionId":skill.id,"walletPackageId":package.to_string(),"walletId":wallet_id.to_string(),"agentCapId":cap_id.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"allowedTargets":decoded.targets,"allowedObjectIds":decoded.object_inputs,"maxAmountBaseUnits":grant.per_tx.to_string(),"declaredSpendBaseUnits":compiled.root_spend_mist.to_string(),"minimumRemainingBaseUnits":grant.reserve.to_string(),"gasCeilingBaseUnits":compiled.transaction.gas_payment.budget.to_string()});
+    let params: serde_json::Map<String, Value> = grant
+        .flow
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "deepbook_limit_order")
+        .map(|node| {
+            let mut values = serde_json::Map::new();
+            for key in ["balanceManagerId", "tradeCapId", "depositCapId", "price"] {
+                if let Some(value) = node.config.as_ref().and_then(|config| config.get(key)) {
+                    values.insert(key.into(), value.clone());
+                }
+            }
+            (node.id.clone(), Value::Object(values))
+        })
+        .collect();
+    let build_arguments = json!({
+        "actionId": skill.id,
+        "sender": grant.agent.to_string(),
+        "agentWallet": {
+            "packageId": package.to_string(), "walletId": wallet_id.to_string(),
+            "capId": cap_id.to_string(), "versionId": version.to_string(),
+            "coinType": grant.manifest.wallet_coin_type, "capabilityManifest": grant.manifest
+        },
+        "params": params
+    });
+    Ok(Binding {
+        grant,
+        package,
+        version,
+        wallet_id,
+        objects,
+        run_set: runset,
+        build_arguments,
+    })
+}
+
+pub async fn attach_plan(
+    body: &Value,
+    skill: &PublishedSkill,
+    owner: &str,
+    context: &SetupContext,
+    chain: &impl SuiRead,
+) -> Result<Value, String> {
+    let Binding {
+        grant,
+        package,
+        version,
+        wallet_id,
+        objects,
+        run_set,
+        build_arguments,
+    } = bind(body, skill, owner, context, chain, true).await?;
     let mut tx = builder(grant.owner, chain).await?;
     build_attach_rules(
         &mut tx,
@@ -592,35 +669,37 @@ pub async fn attach_plan(
         &objects,
     )
     .map_err(err)?;
-    let runset = json!({"label":skill.name,"network":context.network,"sender":grant.agent.to_string(),"actionId":skill.id,"walletPackageId":package.to_string(),"walletId":wallet_id.to_string(),"agentCapId":cap_id.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"allowedTargets":decoded.targets,"allowedObjectIds":decoded.object_inputs,"maxAmountBaseUnits":grant.per_tx.to_string(),"declaredSpendBaseUnits":compiled.root_spend_mist.to_string(),"minimumRemainingBaseUnits":grant.reserve.to_string(),"gasCeilingBaseUnits":compiled.transaction.gas_payment.budget.to_string()});
-    let params: serde_json::Map<String, Value> = grant
-        .flow
-        .nodes
-        .iter()
-        .filter(|node| node.kind == "deepbook_limit_order")
-        .map(|node| {
-            let mut values = serde_json::Map::new();
-            for key in ["balanceManagerId", "tradeCapId", "depositCapId", "price"] {
-                if let Some(value) = node.config.as_ref().and_then(|config| config.get(key)) {
-                    values.insert(key.into(), value.clone());
-                }
-            }
-            (node.id.clone(), Value::Object(values))
-        })
-        .collect();
-    let build_arguments = json!({
-        "actionId": skill.id,
-        "sender": grant.agent.to_string(),
-        "agentWallet": {
-            "packageId": package.to_string(), "walletId": wallet_id.to_string(),
-            "capId": cap_id.to_string(), "versionId": version.to_string(),
-            "coinType": grant.manifest.wallet_coin_type, "capabilityManifest": grant.manifest
-        },
-        "params": params
-    });
     Ok(
-        json!({"attachPtb":encode_kind(&finish(tx)?)?,"runSet":runset,"buildArguments":build_arguments}),
+        json!({"attachPtb":encode_kind(&finish(tx)?)?,"runSet":run_set,"buildArguments":build_arguments}),
     )
+}
+
+/// The unsigned grant for running `skill` from an already bounded wallet: what the owner is asked
+/// to sign. Its revision is left at zero for the caller, which knows what was granted before.
+pub async fn grant_plan(
+    body: &Value,
+    skill: &PublishedSkill,
+    owner: &str,
+    context: &SetupContext,
+    chain: &impl SuiRead,
+) -> Result<rill_core::grant::Grant, String> {
+    let binding = bind(body, skill, owner, context, chain, false).await?;
+    let network = serde_json::to_value(context.network)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .ok_or("network is not representable")?;
+    Ok(rill_core::grant::Grant {
+        network,
+        action_id: skill.id.clone(),
+        action_name: skill.name.clone(),
+        agent: binding.grant.agent.to_string(),
+        wallet_id: binding.wallet_id.to_string(),
+        wallet_package_id: binding.package.to_string(),
+        expires_at_ms: binding.grant.expiry.to_string(),
+        revision: 0,
+        run_set: binding.run_set,
+        build_arguments: binding.build_arguments,
+    })
 }
 
 pub async fn prepare(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -648,9 +727,30 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) 
     let Some(skill) = body["skillId"].as_str().and_then(|id| state.skills.get(id)) else {
         return api_err_typed(StatusCode::NOT_FOUND, "Skill not found", "NotFound");
     };
-    let options = match studio_api::options(&state, &json!({})) {
-        Ok(v) => v,
+    let context = match setup_context(&state, &skill).await {
+        Ok(context) => context,
         Err(e) => return *e,
+    };
+    let result = if attach {
+        attach_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
+    } else {
+        prepare_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
+    };
+    match result {
+        Ok(value) => api_ok(value),
+        Err(e) => studio_api::invalid(e),
+    }
+}
+
+/// The deployment a setup or grant for `skill` runs against: network, guard, wallet ids, and the
+/// type origins an upgraded package reports, read from the chain rather than assumed.
+pub(crate) async fn setup_context(
+    state: &AppState,
+    skill: &PublishedSkill,
+) -> Result<SetupContext, Box<Response>> {
+    let options = match studio_api::options(state, &json!({})) {
+        Ok(v) => v,
+        Err(e) => return Err(e),
     };
     let mut context = SetupContext {
         network: options.network,
@@ -667,7 +767,7 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) 
         context.wallet_version_id.as_deref(),
     ) {
         Ok(ids) => ids,
-        Err(e) => return studio_api::invalid(e),
+        Err(e) => return Err(Box::new(studio_api::invalid(e))),
     };
     if context.network == Network::Mainnet || context.wallet_package_id.is_some() {
         context.wallet_type_package = match rill_chain::describe::datatype_origin(
@@ -679,7 +779,13 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) 
         .await
         {
             Ok(origin) => Some(origin),
-            Err(e) => return api_err_typed(StatusCode::BAD_GATEWAY, e.to_string(), "ChainError"),
+            Err(e) => {
+                return Err(Box::new(api_err_typed(
+                    StatusCode::BAD_GATEWAY,
+                    e.to_string(),
+                    "ChainError",
+                )))
+            }
         };
     }
     if skill.flow["nodes"]
@@ -699,20 +805,16 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) 
             {
                 Ok(origin) => origins.push(origin),
                 Err(e) => {
-                    return api_err_typed(StatusCode::BAD_GATEWAY, e.to_string(), "ChainError")
+                    return Err(Box::new(api_err_typed(
+                        StatusCode::BAD_GATEWAY,
+                        e.to_string(),
+                        "ChainError",
+                    )))
                 }
             }
         }
         context.deepbook_type_packages =
             Some([origins[0].clone(), origins[1].clone(), origins[2].clone()]);
     }
-    let result = if attach {
-        attach_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
-    } else {
-        prepare_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
-    };
-    match result {
-        Ok(value) => api_ok(value),
-        Err(e) => studio_api::invalid(e),
-    }
+    Ok(context)
 }

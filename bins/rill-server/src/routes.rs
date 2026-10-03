@@ -98,6 +98,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/execute", post(crate::studio_api::execute))
         .route("/api/setup/prepare", post(crate::studio_setup::prepare))
         .route("/api/setup/attach", post(crate::studio_setup::attach))
+        .route("/api/grants/prepare", post(crate::studio_grants::prepare))
+        .route("/api/grants", post(crate::studio_grants::store))
+        .route("/api/grants/{agent}", get(crate::studio_grants::list))
         .route(
             "/api/mcp/{id}",
             get(crate::studio_api::public_mcp_get).post(crate::studio_api::public_mcp),

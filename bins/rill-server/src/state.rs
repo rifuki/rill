@@ -207,6 +207,16 @@ impl Config {
     }
 
     /// Refuse to start rather than run in a state whose failures are hard to attribute.
+    /// Where owner-signed grants are kept: `GRANTS_STORE_PATH`, else beside the skills file, which
+    /// is where an operator already looks for this deployment's published state.
+    pub fn grants_store_path(&self) -> std::path::PathBuf {
+        std::env::var("GRANTS_STORE_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(&self.skills_store_path).with_file_name("grants.json")
+            })
+    }
+
     pub fn boot_check(&self) -> Result<(), String> {
         // The agent-credential settings are checked on every network, not only mainnet: a
         // half-configured pair or a typo in the address produces a grant that refuses every
@@ -322,6 +332,8 @@ pub(crate) fn read_or_create_secret(path: &std::path::Path) -> String {
 pub struct AppState {
     pub config: Arc<Config>,
     pub skills: Arc<FileSkillStore>,
+    /// Owner-signed action grants, served to the signers they name.
+    pub grants: Arc<rill_store::grants::FileGrantStore>,
     /// Loaded at boot — a corrupt file must surface at startup, not on the first sign-in. Read
     /// once the OAuth endpoints are wired.
     pub oauth: Arc<FileOAuthStore>,
@@ -345,6 +357,9 @@ impl AppState {
         );
         Self {
             skills: Arc::new(FileSkillStore::load(&config.skills_store_path)),
+            grants: Arc::new(rill_store::grants::FileGrantStore::load(
+                config.grants_store_path(),
+            )),
             oauth: Arc::new(FileOAuthStore::load(&config.oauth_store_path, now_ms)),
             chain: Arc::new(chain),
             deepbook_package_id: std::env::var("DEEPBOOK_PACKAGE_ID")

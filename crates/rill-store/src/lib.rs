@@ -18,6 +18,7 @@
 //! [`OAuthStore`].
 
 pub mod file;
+pub mod grants;
 
 use serde::{Deserialize, Serialize};
 
@@ -152,6 +153,16 @@ pub enum StoreError {
     AtCapacity {
         limit: usize,
     },
+    /// The grant store is full, refused for the same reason as [`StoreError::AtCapacity`].
+    GrantsAtCapacity {
+        limit: usize,
+    },
+    /// A grant older than the one already held for the same agent, wallet and action. Accepting it
+    /// would let a superseded approval replace the owner's latest one.
+    StaleRevision {
+        current: u64,
+        given: u64,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -163,6 +174,16 @@ impl std::fmt::Display for StoreError {
                 f,
                 "the store holds its maximum of {limit} skills; refusing rather than evicting \
                  somebody else's"
+            ),
+            Self::GrantsAtCapacity { limit } => write!(
+                f,
+                "the store holds its maximum of {limit} grants; refusing rather than evicting \
+                 somebody else's"
+            ),
+            Self::StaleRevision { current, given } => write!(
+                f,
+                "revision {given} is not newer than revision {current} already held for this \
+                 agent, wallet and action"
             ),
         }
     }
