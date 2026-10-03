@@ -193,15 +193,13 @@ jobs:
           tags: rill-server:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      # A container binds every interface or nothing outside it can connect, and the server refuses a
-      # wide bind unless that is stated. `compose.yaml` states it for a real deployment; this states
-      # it for the same reason, and the flag being needed here is the check working rather than an
-      # inconvenience. The port is published only to this runner.
+      # A container binds every interface or nothing outside it can connect. That used to need an
+      # acknowledgement, because `/oauth/authorize` handed a code to whoever asked. It no longer
+      # does: authorization now waits for consent signed by the owner's wallet, so the wide bind
+      # needs no flag, and the step after this one checks the property that made it safe.
       - name: The container must start and answer /health
         run: |
-          docker run -d --name rill -p 3939:3939 \
-            -e RILL_ALLOW_OPEN_AUTHORIZATION=1 \
-            rill-server:ci
+          docker run -d --name rill -p 3939:3939 rill-server:ci
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:3939/health > /dev/null; then
               echo "healthy after ${i}s"; docker logs rill; exit 0
@@ -209,23 +207,24 @@ jobs:
             sleep 1
           done
           echo "::error::the container never became healthy"; docker logs rill; exit 1
-      # The acknowledgement above is load-bearing, so check it is. Without it the container must
-      # refuse rather than start, or the boot check has stopped doing anything and this job would be
-      # the last place to notice.
-      - name: Without the acknowledgement the container refuses to start
+      # What a wide bind would expose if consent were ever bypassed: an authorization code issued to
+      # anyone who asks. Asked exactly as an agent would, the server must answer with a redirect to
+      # the signed-consent step and no code. If this ever returns a code, the bind is unsafe again.
+      - name: A wide bind issues no authorization code without signed consent
         run: |
-          set +e
-          output=$(docker run --rm --name rill-unack rill-server:ci 2>&1)
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo "::error::a wide bind with no acknowledgement started anyway"
-            printf '%s\n' "$output"
-            exit 1
-          fi
-          printf '%s\n' "$output" | grep -q "no consent step" || {
-            echo "::error::it refused, but not for the reason this check exists for"
-            printf '%s\n' "$output"
-            exit 1
-          }
-          echo "refused, naming the reason."
+          client=$(curl -fsS -X POST http://localhost:3939/oauth/register \
+            -H 'Content-Type: application/json' \
+            -d '{"redirect_uris":["http://127.0.0.1:8765/callback"],"client_name":"ci"}' \
+            | sed -n 's/.*"client_id":"\([^"]*\)".*/\1/p')
+          [ -n "$client" ] || { echo "::error::client registration returned no client_id"; exit 1; }
+          answer=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' \
+            "http://localhost:3939/oauth/authorize?response_type=code&client_id=${client}&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcallback&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&state=ci&scope=mcp%20offline_access")
+          echo "$answer"
+          case "$answer" in
+            3??\ *request=*) ;;
+            *) echo "::error::authorize did not redirect to consent"; exit 1 ;;
+          esac
+          case "$answer" in
+            *code=*) echo "::error::authorize issued a code without consent"; exit 1 ;;
+          esac
+          echo "redirected to consent, no code issued."
