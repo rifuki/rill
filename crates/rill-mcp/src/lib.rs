@@ -474,6 +474,32 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     "additionalProperties": false
                 })),
             ),
+            read_only(
+                "rill_actions",
+                "List the actions this signer may run: every grant the owner of a wallet signed for \
+                 this agent, each checked against the chain (the owner's signature, the wallet still \
+                 naming this agent, not revoked, not expired). Unusable grants are listed with the \
+                 reason. Call this first to learn an actionId for rill_run_action. Reads only.",
+                no_arguments(),
+            ),
+            destructive(
+                "rill_run_action",
+                "Run one action the wallet's owner granted this agent: the Rill builder prepares the \
+                 transaction, and this signer checks it against the owner-signed run set, \
+                 re-simulates it, signs and submits. THIS SUBMITS A REAL TRANSACTION and cannot be \
+                 undone. A refusal naming a rule or the grant is the wallet working; report it \
+                 rather than retrying. Do not call it again after a success: that is a second run.",
+                object_schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "actionId": { "type": "string", "description": "The actionId from rill_actions." },
+                        "walletId": { "type": "string", "description": "Optional. Which wallet's grant to use, when more than one wallet granted this action." },
+                        "params": { "type": "object", "description": "Optional. Runtime values keyed by node id, as the action's build_action schema allows, for example a tighter minimum output. Amounts are decimal text." }
+                    },
+                    "required": ["actionId"],
+                    "additionalProperties": false
+                })),
+            ),
         ],
     }
 }
@@ -560,6 +586,7 @@ mod tests {
             "rill_swap",
             "rill_stake",
             "rill_execute",
+            "rill_run_action",
         ];
 
         let destructive: Vec<String> = [Surface::Actions, Surface::Owner]

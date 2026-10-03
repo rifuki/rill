@@ -13,13 +13,14 @@ use rill_mcp::{negotiate_protocol_version, tools, Surface, LATEST_PROTOCOL_VERSI
 use std::collections::BTreeMap;
 
 /// The tools that need a key. Asserted in both directions below rather than trusted.
-const SIGNING_TOOLS: [&str; 6] = [
+const SIGNING_TOOLS: [&str; 7] = [
     "rill_create_wallet",
     "rill_attach_rules",
     "rill_spend",
     "rill_swap",
     "rill_stake",
     "rill_execute",
+    "rill_run_action",
 ];
 
 fn by_name(surface: Surface) -> BTreeMap<String, rill_mcp::Tool> {
@@ -82,11 +83,13 @@ fn every_signing_tool_is_on_the_signer_and_none_on_the_builder() {
     assert_eq!(
         other,
         vec![
+            "rill_actions".to_string(),
             "rill_quote".to_string(),
             "rill_status".to_string(),
             "rill_wallet".to_string()
         ],
-        "the signer's non-signing tools are status, the wallet read and the swap quote; a new name \
+        "the signer's non-signing tools are status, the wallet read, the granted-action list and \
+         the swap quote; a new name \
          here is either a signing tool missing from SIGNING_TOOLS or a capability the builder should \
          also expose"
     );

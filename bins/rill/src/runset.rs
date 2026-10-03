@@ -120,6 +120,15 @@ impl RunSet {
         Ok(run_set)
     }
 
+    /// A run set that arrived as JSON rather than from a file: the one inside an owner-signed grant.
+    /// Held to exactly the same validation as [`RunSet::from_path`].
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, RunSetError> {
+        let run_set: Self = serde_json::from_value(value.clone())
+            .map_err(|e| RunSetError::Malformed(e.to_string()))?;
+        run_set.validate()?;
+        Ok(run_set)
+    }
+
     pub fn path_from_env() -> Option<PathBuf> {
         std::env::var(RUN_SET_VAR).ok().map(PathBuf::from)
     }

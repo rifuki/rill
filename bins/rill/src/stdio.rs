@@ -281,6 +281,8 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_swap" => swap(context, id, &params),
         "rill_stake" => stake(context, id, &params),
         "rill_execute" => execute(context, id, &params),
+        "rill_actions" => actions(context, id),
+        "rill_run_action" => run_action(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
 }
@@ -1008,6 +1010,267 @@ fn bad_mist(id: Value, fields: &[(&str, &str)]) -> Option<Value> {
             )
         })
     })
+}
+
+/// The Rill API this signer reads grants from and builds actions with.
+fn api_url() -> Option<String> {
+    std::env::var(crate::config::API_URL_VAR)
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty())
+}
+
+const NO_API: &str = "No Rill API is configured, so there are no granted actions to read. Run \
+                      `~/.rill/bin/rill-wallet setup --api <url>` and restart the client.";
+
+/// One fetched grant and what the chain said about it.
+type CheckedGrant = (
+    rill_core::grant::SignedGrant,
+    Result<crate::grants::VerifiedGrant, crate::grants::Refusal>,
+);
+
+/// Every grant for this signer's address, each checked against the chain. A grant that fails a
+/// check is kept with the reason, so `rill_actions` can say why an action is not available.
+fn checked_grants(
+    context: &WalletContext,
+    signer: &str,
+    api: &str,
+) -> Result<Vec<CheckedGrant>, String> {
+    let network = context.network.clone();
+    let endpoint = endpoint(context);
+    let package = package_id();
+    let url = format!("{api}/api/grants/{signer}");
+    block_on(async move {
+        let response = crate::http::get_json(&url).await?;
+        let list = response
+            .get("data")
+            .unwrap_or(&response)
+            .get("grants")
+            .cloned()
+            .unwrap_or(Value::Array(Vec::new()));
+        let grants: Vec<rill_core::grant::SignedGrant> = serde_json::from_value(list)
+            .map_err(|e| format!("the grant list did not parse: {e}"))?;
+        let chain = rill_chain::grpc::GrpcSui::new(&endpoint).map_err(|e| e.to_string())?;
+        let mut checked = Vec::with_capacity(grants.len());
+        for grant in grants {
+            let verdict =
+                crate::grants::verify(&chain, &grant, signer, &network, &package, now_ms()).await;
+            checked.push((grant, verdict));
+        }
+        Ok(checked)
+    })?
+}
+
+/// `rill_actions`: what this agent may run, and for each grant that cannot be used, why.
+fn actions(context: &mut WalletContext, id: Value) -> Value {
+    let Some(api) = api_url() else {
+        return tool_error(id, "not_configured", NO_API);
+    };
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let signer = keystore.address().to_string();
+    let checked = match checked_grants(context, &signer, &api) {
+        Ok(checked) => checked,
+        Err(e) => return tool_error(id, "grants_unavailable", &e),
+    };
+    let actions: Vec<Value> = checked
+        .iter()
+        .map(|(signed, verdict)| {
+            let grant = &signed.grant;
+            let mut entry = json!({
+                "actionId": grant.action_id,
+                "name": grant.action_name,
+                "walletId": grant.wallet_id,
+                "revision": grant.revision,
+                "expiresAtMs": grant.expires_at_ms,
+                "maxPerTransactionBaseUnits": grant.run_set.get("maxAmountBaseUnits"),
+                "usable": verdict.is_ok(),
+            });
+            match verdict {
+                Ok(verified) => entry["owner"] = json!(verified.owner),
+                Err(refusal) => entry["refusedBecause"] = json!(refusal.to_string()),
+            }
+            entry
+        })
+        .collect();
+    tool_ok(
+        id,
+        json!({
+            "signer": signer,
+            "actions": actions,
+            "note": "Each usable action was granted by the wallet's owner and checked against the \
+                     chain just now. Run one with rill_run_action and its actionId. The grant \
+                     stops this signer signing anything the owner did not approve; what any \
+                     transaction can actually spend is still bounded by the wallet's on-chain rules.",
+        }),
+    )
+}
+
+/// `rill_run_action`: build an action through the Rill API and execute it under the owner-signed
+/// run set, through exactly the validation `rill_execute` applies to a run set loaded from a file.
+fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(api) = api_url() else {
+        return tool_error(id, "not_configured", NO_API);
+    };
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let Some(action_id) = argument(params, "actionId") else {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            "actionId is required; rill_actions lists them.",
+        );
+    };
+    let action_id = action_id.to_owned();
+    let wallet = argument(params, "walletId").map(str::to_owned);
+    let overrides = params
+        .get("arguments")
+        .and_then(|a| a.get("params"))
+        .cloned();
+    let signer = keystore.address().to_string();
+
+    let checked = match checked_grants(context, &signer, &api) {
+        Ok(checked) => checked,
+        Err(e) => return tool_error(id, "grants_unavailable", &e),
+    };
+    let matching: Vec<_> = checked
+        .into_iter()
+        .filter(|(signed, _)| signed.grant.action_id == action_id)
+        .filter(|(signed, _)| {
+            wallet.as_deref().is_none_or(|w| {
+                w.parse::<sui_sdk_types::Address>().ok()
+                    == signed
+                        .grant
+                        .wallet_id
+                        .parse::<sui_sdk_types::Address>()
+                        .ok()
+            })
+        })
+        .collect();
+    if matching.is_empty() {
+        let reason = format!(
+            "No grant for {action_id} names this agent. The wallet's owner grants actions in Rill \
+             Studio; rill_actions lists what is granted now."
+        );
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "not_granted", &reason);
+    }
+    let refusals: Vec<String> = matching
+        .iter()
+        .filter_map(|(_, verdict)| verdict.as_ref().err().map(ToString::to_string))
+        .collect();
+    let mut usable: Vec<crate::grants::VerifiedGrant> = matching
+        .into_iter()
+        .filter_map(|(_, verdict)| verdict.ok())
+        .collect();
+    let wallets: std::collections::BTreeSet<String> =
+        usable.iter().map(|v| v.grant.wallet_id.clone()).collect();
+    if usable.is_empty() {
+        let reason = format!(
+            "The grant for {action_id} cannot be used: {}. Ask the wallet's owner; do not look \
+             for another route.",
+            refusals.join("; ")
+        );
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "grant_refused", &reason);
+    }
+    if wallets.len() > 1 {
+        return tool_error(
+            id,
+            "ambiguous_wallet",
+            &format!(
+                "{action_id} is granted from more than one wallet ({}). Pass walletId to choose.",
+                wallets.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    usable.sort_by_key(|v| v.grant.revision);
+    let verified = usable.pop().expect("one usable grant");
+
+    // The builder is asked for the grant's own build arguments. Only `params` may be supplied by
+    // the caller, and the server refuses any that would loosen what was published.
+    let mut arguments = verified.grant.build_arguments.clone();
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("actionId");
+    }
+    if let Some(overrides) = overrides {
+        let merged = arguments
+            .get("params")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut merged = merged;
+        if let Some(extra) = overrides.as_object() {
+            for (node, values) in extra {
+                let entry = merged.entry(node.clone()).or_insert_with(|| json!({}));
+                if let (Some(entry), Some(values)) = (entry.as_object_mut(), values.as_object()) {
+                    for (k, v) in values {
+                        entry.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        arguments["params"] = Value::Object(merged);
+    }
+    let url = format!("{api}/api/mcp/{action_id}");
+    let request = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "build_action", "arguments": arguments }
+    });
+    let built = match block_on(async move { crate::http::post_json(&url, &request).await }) {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) | Err(e) => return tool_error(id, "build_failed", &e),
+    };
+    let result = built.get("data").unwrap_or(&built).get("result").cloned();
+    let Some(result) = result else {
+        return tool_error(
+            id,
+            "build_failed",
+            &format!("the builder answered without a result: {built}"),
+        );
+    };
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    if result["isError"] == json!(true) {
+        return tool_error(id, "build_refused", text);
+    }
+    let envelope: Value = match serde_json::from_str(text) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            return tool_error(
+                id,
+                "build_failed",
+                &format!("the envelope did not parse: {e}"),
+            )
+        }
+    };
+
+    // The owner-signed run set stands in for a file for this one call, then the signer's own
+    // configuration is put back whatever happened.
+    let saved = context.run_set.replace(verified.run_set.clone());
+    let mut response = execute(
+        context,
+        id,
+        &json!({ "arguments": { "envelope": envelope } }),
+    );
+    context.run_set = saved;
+    if let Some(structured) = response
+        .get_mut("result")
+        .and_then(|r| r.get_mut("structuredContent"))
+        .and_then(Value::as_object_mut)
+    {
+        structured.insert(
+            "grant".into(),
+            json!({
+                "actionId": verified.grant.action_id,
+                "walletId": verified.grant.wallet_id,
+                "revision": verified.grant.revision,
+                "owner": verified.owner,
+            }),
+        );
+    }
+    response
 }
 
 fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {

@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 /// Points at a config file other than `~/.rill/config.json`.
 pub const CONFIG_VAR: &str = "RILL_CONFIG";
 
+/// The Rill API base URL, for grants and building actions.
+pub const API_URL_VAR: &str = "RILL_API_URL";
+
 /// Where the file lives under `$HOME`.
 pub const DEFAULT_PATH: &str = ".rill/config.json";
 
@@ -41,6 +44,10 @@ pub struct Config {
     /// A fullnode other than the public one. Becomes `SUI_RPC_URL`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,
+    /// The Rill API this signer fetches owner-signed grants from and builds actions with. Becomes
+    /// `RILL_API_URL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
 }
 
 impl Config {
@@ -61,6 +68,9 @@ impl Config {
         }
         if let Some(url) = &self.rpc_url {
             out.push(("SUI_RPC_URL", url.clone()));
+        }
+        if let Some(url) = &self.api_url {
+            out.push((API_URL_VAR, url.clone()));
         }
         out
     }
@@ -141,6 +151,7 @@ mod tests {
             allow_mainnet: Some(true),
             run_set: None,
             rpc_url: None,
+            api_url: None,
         };
         write(&path, &config).unwrap();
         assert_eq!(read(&path).unwrap(), Some(config.clone()));

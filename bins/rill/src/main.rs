@@ -213,6 +213,9 @@ fn setup(path: Option<&std::path::Path>) -> i32 {
     if let Some(url) = flag("--rpc") {
         config.rpc_url = Some(url);
     }
+    if let Some(url) = flag("--api") {
+        config.api_url = Some(url.trim_end_matches('/').to_owned());
+    }
     if let Err(e) = rill_cli::config::write(path, &config) {
         eprintln!("rill: {e}");
         return 1;
@@ -242,7 +245,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "setup",
-        "write ~/.rill/config.json: --network, --as <address>, --allow-mainnet, --run-set, --rpc",
+        "write ~/.rill/config.json: --network, --as <address>, --allow-mainnet, --api, --run-set, --rpc",
+    ),
+    (
+        "grant",
+        "owner: grant the wallet's agent one published action (prepare, sign, store; --submit)",
     ),
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
@@ -404,6 +411,69 @@ fn main() {
             std::process::exit(code);
         }
         Some("setup") => std::process::exit(setup(config_path.as_deref())),
+        Some("grant") => {
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let Some(keystore) = loaded.keystore.as_ref() else {
+                eprintln!("rill: {}", loaded.no_key_reason());
+                std::process::exit(1);
+            };
+            let (Some(action_id), Some(wallet_id), Some(budget_mist), Some(per_tx_mist)) = (
+                flag("--action"),
+                flag("--wallet"),
+                flag("--budget"),
+                flag("--per-tx"),
+            ) else {
+                eprintln!(
+                    "rill: usage: rill --as <owner> grant --action <id> --wallet <id> --budget <mist> \
+                     --per-tx <mist> [--days <n>] [--api <url>] [--submit]"
+                );
+                std::process::exit(1);
+            };
+            let Some(api) =
+                flag("--api").or_else(|| std::env::var(rill_cli::config::API_URL_VAR).ok())
+            else {
+                eprintln!("rill: no Rill API: pass --api <url> or run `rill setup --api <url>`.");
+                std::process::exit(1);
+            };
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let expires_at_ms = flag("--days")
+                .and_then(|d| d.parse::<u64>().ok())
+                .map(|days| (now_ms + days * 86_400_000).to_string());
+            let args = rill_cli::grant_cmd::GrantArgs {
+                api,
+                action_id,
+                wallet_id,
+                budget_mist,
+                per_tx_mist,
+                expires_at_ms,
+                submit: argv.iter().any(|a| a == "--submit"),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            match runtime.block_on(rill_cli::grant_cmd::grant(keystore, &args)) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("rill: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("help") | Some("--help") | Some("-h") => {
             println!("rill: the local half of Rill. Holds the key, checks the work, signs.");
             print_commands();

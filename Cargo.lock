@@ -1357,6 +1357,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "bcs",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rand",
  "rill-chain",
  "rill-core",
@@ -1364,12 +1368,15 @@ dependencies = [
  "rill-policy",
  "rill-ptb",
  "rmcp",
+ "rustls",
  "serde",
  "serde_json",
  "sui-crypto",
  "sui-sdk-types",
  "sui-transaction-builder",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -104,6 +104,12 @@ Mainnet deployment ids are compiled in, so no environment is needed. Mainnet sig
 you add `--allow-mainnet` yourself; until then the agent can read limits and quote, and every
 submission is refused.
 
+Actions the owner publishes in Studio reach the agent as owner-signed grants: `rill_actions` lists
+them and `rill_run_action` runs one. The signer uses a grant only after the chain confirms the
+wallet's owner signed it and the wallet still names this agent; a grant altered anywhere after
+signing is refused. An owner without a browser grants from the terminal with
+`rill-wallet --as <owner> grant --action <id> --wallet <id> --budget <mist> --per-tx <mist> --submit`.
+
 The wallet's owner creates, limits and funds the agent wallet from their own wallet. The agent's
 machine only ever holds the agent key, and the plugin starts the signer without the owner's two
 steps: `rill_create_wallet` and `rill_attach_rules` exist only under `rill-wallet mcp --owner`, run
