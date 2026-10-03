@@ -1,0 +1,81 @@
+{
+  "agent_wallet": {
+    "packageId": "0xb8b95f9b43381693c72e3b0b0bae9c52c392492f5a1ce49bbea3ca393b694429",
+    "publishDigest": "9SFxUDKGNKGwKcmKHZ6dQWj91WeYywUqMH2BPTZonZSG",
+    "gasUsed": {
+      "computationCost": "100000",
+      "storageCost": "77337600",
+      "storageRebate": "978120",
+      "nonRefundableStorageFee": "9880"
+    },
+    "objects": [
+      {
+        "id": "0x7b7c04fb9a6e7974566f6a6c294b1743c37fef225077cb26375cedac8a5f8eef",
+        "type": "0x2::package::UpgradeCap"
+      },
+      {
+        "id": "0x86430a8195900cd52d607a81993b6125a51628a9db93e10a1afedd2c5a95ba94",
+        "type": "0xb8b95f9b43381693c72e3b0b0bae9c52c392492f5a1ce49bbea3ca393b694429::version::Version"
+      },
+      {
+        "id": "0xc7486c0279d7b0e1e276ec61ba90f82c41c7782060cc6fa5b832ba25deead939",
+        "type": "0x2::package::Publisher"
+      }
+    ]
+  },
+  "rill_guard": {
+    "packageId": "0xfa208560e94310fa66c79df8b9aa1a33b5e3601781906833472ef233388e1e43",
+    "publishDigest": "B1VQsDBPNtWE3bShPCNWoRpprB2RGexAF3RbLwx8nWPJ",
+    "gasUsed": {
+      "computationCost": "100000",
+      "storageCost": "6087600",
+      "storageRebate": "978120",
+      "nonRefundableStorageFee": "9880"
+    },
+    "objects": [
+      {
+        "id": "0x2b49cc7588ab5c9d8291f5fbc5fa1f74669d403baf7a27264e5c980b8f291ee4",
+        "type": "0x2::package::UpgradeCap"
+      }
+    ]
+  },
+  "network": "mainnet",
+  "owner": "0xa1938b420508d960597153e7e3ec7dafce5fddc8747c071220570b93cc426870",
+  "agent": "0x3e559b1d7c6f49c3c5099f20a517daf74af9df9288f6a8902d1b68b791ca17df",
+  "authorizedSmokeBudgetUsd": "10",
+  "initialOwnerSui": "9.3",
+  "smoke": {
+    "date": "2026-10-03",
+    "wallet": "0x4925a1f1df1c5eaf15edeb8a52360275dbc09c014b154216d9ace5739c85c9ea",
+    "agentCap": "0xe06e0fc8710a3fd505ea5829ae9b276cf595799866ef9d6b21842f68aa580066",
+    "rules": {
+      "budgetMist": "100000000",
+      "perTxMist": "50000000"
+    },
+    "createEmptyDigest": "DqhFfgkA1NbUHsAMLhYJ1oqSmssNBSQtF7A1uWpyGuhF",
+    "attachAndFundDigest": "8Z3yr4YzS8qvik5TT2PWvJVYuKhLWGgZaK7Z7exLxt9z",
+    "skillId": "skill_nWKk-W2EzfeOR5sJNoUdCrM7Fb3-yikR54LD1IbsMAU",
+    "cetusIntegrate": "0x9ee0534b703b14457aee7698ea3a07a5080f954ed2b7e9910fbb7a55506824fa",
+    "swap": {
+      "path": "Skill -> HTTP MCP build_action -> agent stdio rill_execute (pinned run-set)",
+      "digest": "2d7Vi6ECnA9MxxZax6aC8FC9AJLXfJZmGFBs6P9gi4Ki",
+      "spentMist": "20000000",
+      "boughtUsdcBaseUnits": "23467",
+      "minOut": "22900"
+    },
+    "overCapRefusal": {
+      "amountMist": "60000000",
+      "refusedBy": "per_tx abort 1, at simulation, nothing submitted"
+    },
+    "transfer": {
+      "digest": "5cYXnqsJzokJwX4grWeShT2UoFULyy3zGpfQj4MspS5Y",
+      "to": "0x958df45a025a23b6ed70d53b9c27750e5897e014146366351b4acdcc21c05237",
+      "mist": "10000000"
+    },
+    "revoke": {
+      "digest": "2z8ZdiGf2cekVGXrkrCKh3bfYPkzR8ZSYtYmLgTsxfG2",
+      "recoveredMist": "70000000",
+      "postRevokeSpend": "refused E_REVOKED at simulation"
+    }
+  }
+}
