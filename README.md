@@ -76,6 +76,42 @@ The Bun/TypeScript implementation this replaces is the **specification**. Its be
 re-expressed here, with conformance fixtures in `fixtures/` checked against it by
 `ts/verify-reference.ts`.
 
+## Use it from Claude Code or Codex
+
+One plugin carries the local signer as an MCP server and one skill that tells the agent how to use
+it safely. This repository is its marketplace.
+
+```sh
+# Claude Code
+/plugin marketplace add rifuki/rill
+/plugin install rill@rill
+
+# Codex
+codex plugin marketplace add rifuki/rill
+codex plugin add rill@rill
+```
+
+The plugin's launcher, `plugins/rill/bin/rill-mcp`, downloads the released `rill-wallet` for your
+platform on first start and runs it only if it matches a checksum written in the launcher itself,
+not one read from the release. Then choose which key signs, once, in a terminal:
+
+```sh
+~/.rill/bin/rill-wallet setup --network mainnet --as <agent address>
+```
+
+That writes `~/.rill/config.json` (mode 600) and nothing else: the key stays in the Sui keystore.
+Mainnet deployment ids are compiled in, so no environment is needed. Mainnet signing stays off until
+you add `--allow-mainnet` yourself; until then the agent can read limits and quote, and every
+submission is refused.
+
+The wallet's owner creates, limits and funds the agent wallet from their own wallet. The agent's
+machine only ever holds the agent key, and the plugin starts the signer without the owner's two
+steps: `rill_create_wallet` and `rill_attach_rules` exist only under `rill-wallet mcp --owner`, run
+with the owner's key.
+
+Before a release exists for the pinned version, point the launcher at a local build with
+`RILL_WALLET_BIN=$PWD/target/release/rill-wallet`.
+
 ## Install
 
 The release is produced by a tag on `github.com/rifuki/rill`, and that is the one origin that
@@ -311,7 +347,7 @@ decides what it can do, so it is worth being blunt about it.
 | | `rill mcp`, over stdio | the hosted endpoint, over HTTP |
 |---|---|---|
 | holds the key | yes | **no, and it is not linked against a signing library at all** |
-| tools | `rill_status`, `rill_wallet`, `rill_create_wallet`, `rill_attach_rules`, `rill_spend`, `rill_execute` | `rill_list_actions`, `rill_describe_action`, `rill_build_action` |
+| tools | `rill_status`, `rill_wallet`, `rill_quote`, `rill_spend`, `rill_swap`, `rill_stake`, `rill_execute`; with `--owner`, also `rill_create_wallet` and `rill_attach_rules` | `rill_list_actions`, `rill_describe_action`, `rill_build_action` |
 | can complete a spend | yes | no |
 | what it returns instead | a submitted transaction and its digest | an unsigned `ExecutionEnvelope`, inert until a local signer validates and signs it |
 

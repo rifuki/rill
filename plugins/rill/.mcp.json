@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "rill": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/rill-mcp"
+    }
+  }
+}

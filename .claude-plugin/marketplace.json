@@ -1,0 +1,16 @@
+{
+  "name": "rill",
+  "owner": {
+    "name": "rifuki"
+  },
+  "metadata": {
+    "description": "Rill: an agent wallet on Sui whose spending limits are enforced on chain."
+  },
+  "plugins": [
+    {
+      "name": "rill",
+      "source": "./plugins/rill",
+      "description": "An agent wallet on Sui whose limits are a Move contract: read them, quote, swap and spend inside them."
+    }
+  ]
+}

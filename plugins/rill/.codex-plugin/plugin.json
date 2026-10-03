@@ -1,0 +1,20 @@
+{
+  "name": "rill",
+  "version": "0.7.0",
+  "description": "An agent wallet on Sui whose limits are a Move contract: read them, quote, swap and spend inside them.",
+  "author": { "name": "rifuki" },
+  "homepage": "https://github.com/rifuki/rill",
+  "license": "MIT",
+  "keywords": ["sui", "wallet", "agent", "mcp", "defi"],
+  "mcpServers": "./codex.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Rill",
+    "shortDescription": "Agent wallet with on-chain limits on Sui",
+    "category": "Finance",
+    "defaultPrompt": [
+      "Check my Rill wallet's limits",
+      "Quote a 0.01 SUI to USDC swap from my Rill wallet"
+    ]
+  }
+}

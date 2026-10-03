@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "rill": {
+      "command": "./bin/rill-mcp",
+      "cwd": ".",
+      "env_vars": ["RILL_WALLET_BIN", "RILL_CONFIG", "RILL_HOME"]
+    }
+  }
+}

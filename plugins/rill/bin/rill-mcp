@@ -1,0 +1,77 @@
+#!/bin/sh
+# Start the Rill signer as an MCP server over stdio, for the plugin that ships this file.
+#
+# The plugin cannot carry a native binary for every platform, so this fetches the released
+# `rill-wallet` once, checks it against a checksum written HERE, and runs it. The checksum is never
+# read from the release that serves the file: a replaced asset with a matching .sha256 beside it
+# would pass that check and still be refused by this one.
+#
+# Nothing goes to stdout but the server itself. It is the protocol wire, and one stray line breaks
+# the client with no hint of why.
+#
+# RILL_WALLET_BIN runs a binary you built or installed yourself instead, and skips the download.
+set -eu
+
+VERSION="0.7.0"
+# One line per released asset: name and sha256. Empty until the release exists, so an unreleased
+# plugin refuses rather than running something unverified.
+CHECKSUMS="
+"
+
+say() { printf 'rill-mcp: %s\n' "$*" >&2; }
+
+if [ -n "${RILL_WALLET_BIN:-}" ]; then
+  exec "$RILL_WALLET_BIN" mcp "$@"
+fi
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) asset="rill-wallet-darwin-arm64" ;;
+  Darwin-x86_64) asset="rill-wallet-darwin-x64" ;;
+  Linux-x86_64) asset="rill-wallet-linux-x64" ;;
+  *)
+    say "no released binary for $(uname -s) $(uname -m). Build it (cargo build --release -p rill) and set RILL_WALLET_BIN."
+    exit 1
+    ;;
+esac
+
+expected=$(printf '%s\n' "$CHECKSUMS" | awk -v a="$asset" '$1 == a { print $2 }')
+if [ -z "$expected" ]; then
+  say "this plugin pins rill-wallet v$VERSION, which has no checksum for $asset yet. Set RILL_WALLET_BIN to a binary you trust."
+  exit 1
+fi
+
+dir="${RILL_HOME:-$HOME/.rill}/bin/$VERSION"
+bin="$dir/$asset"
+
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{ print $1 }'
+  else shasum -a 256 "$1" | awk '{ print $1 }'; fi
+}
+
+# A cached binary is re-checked on every start: the cache is a directory anyone with this user's
+# access can write to, so having verified it once is not a reason to trust it now.
+if [ ! -x "$bin" ] || [ "$(sha256 "$bin")" != "$expected" ]; then
+  mkdir -p "$dir"
+  chmod 700 "${RILL_HOME:-$HOME/.rill}" "$dir" 2>/dev/null || true
+  tmp="$bin.download.$$"
+  url="https://github.com/rifuki/rill/releases/download/rill-wallet-v$VERSION/$asset"
+  say "fetching rill-wallet v$VERSION ($asset)"
+  if ! curl -fsSL --retry 2 -o "$tmp" "$url"; then
+    rm -f "$tmp"
+    say "download failed: $url"
+    exit 1
+  fi
+  actual=$(sha256 "$tmp")
+  if [ "$actual" != "$expected" ]; then
+    rm -f "$tmp"
+    say "checksum mismatch for $asset: expected $expected, got $actual. Not running it."
+    exit 1
+  fi
+  chmod 755 "$tmp"
+  mv "$tmp" "$bin"
+fi
+
+# A stable name for the one command a person runs by hand: `~/.rill/bin/rill-wallet setup`.
+ln -sf "$bin" "${RILL_HOME:-$HOME/.rill}/bin/rill-wallet"
+
+exec "$bin" mcp "$@"
