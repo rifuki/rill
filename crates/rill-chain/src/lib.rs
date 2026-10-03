@@ -83,6 +83,14 @@ pub mod rill_chain_types {
         Unverified,
     }
 
+    /// The node's answer to whether a signature is valid for a message and an address.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SignatureCheck {
+        Valid,
+        /// Invalid, with the node's reason.
+        Invalid(String),
+    }
+
     /// A classified simulation result.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct SimulationOutcome {
@@ -224,6 +232,19 @@ pub trait SuiRead {
     ///
     /// So it is read, per build, from the chain the transaction is going to.
     async fn reference_gas_price(&self) -> ChainResult<u64>;
+
+    /// Whether `signature` (base64, Sui's serialized form) signs `message` as a personal message
+    /// from `address`.
+    ///
+    /// Asked of the node rather than checked here, because the signer of an owner-signed grant may
+    /// be a browser wallet using zkLogin, and verifying that needs the chain's current JWKs. The node
+    /// covers every scheme an address can sign with, multisig included, with one call.
+    async fn verify_personal_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck>;
 }
 
 /// Writes. Separated from [`SuiRead`] so that a component which only needs to read cannot be

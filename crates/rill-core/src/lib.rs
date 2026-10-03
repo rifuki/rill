@@ -12,6 +12,7 @@
 pub mod amounts;
 pub mod envelope;
 pub mod flow;
+pub mod grant;
 pub mod mainnet;
 pub mod manifest;
 pub mod release;

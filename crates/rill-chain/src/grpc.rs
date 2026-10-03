@@ -12,7 +12,8 @@ use sui_rpc::proto::sui::rpc::v2::{
 
 use crate::{
     classify_failure, BalanceDelta, ChainError, ChainResult, CreatedObject, DynamicFieldSummary,
-    ExecutionOutcome, ObjectRef, ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
+    ExecutionOutcome, ObjectRef, ObjectSummary, SignatureCheck, SimulationOutcome, SuiRead,
+    SuiWrite, Verification,
 };
 
 /// Fields worth asking for on an object read. Requesting a mask rather than everything keeps the
@@ -492,6 +493,59 @@ impl SuiRead for GrpcSui {
                         .collect()
                 })
                 .collect(),
+        })
+    }
+
+    async fn verify_personal_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck> {
+        use sui_rpc::proto::sui::rpc::v2::{Bcs, VerifySignatureRequest};
+
+        let Ok(signature) = sui_sdk_types::UserSignature::from_base64(signature) else {
+            return Ok(SignatureCheck::Invalid(
+                "the signature is not a Sui signature in base64".into(),
+            ));
+        };
+        // A personal message is signed as its BCS form: a ULEB128 length, then the bytes.
+        let mut bytes = Vec::with_capacity(message.len() + 5);
+        let mut len = message.len();
+        loop {
+            let low = (len & 0x7f) as u8;
+            len >>= 7;
+            if len == 0 {
+                bytes.push(low);
+                break;
+            }
+            bytes.push(low | 0x80);
+        }
+        bytes.extend_from_slice(message);
+        let mut bcs_message = Bcs::default();
+        bcs_message.name = Some("PersonalMessage".into());
+        bcs_message.value = Some(bytes.into());
+        let mut request = VerifySignatureRequest::default();
+        request.message = Some(bcs_message);
+        request.signature = Some(signature.into());
+        request.address = Some(address.to_owned());
+
+        let response = self
+            .client
+            .clone()
+            .signature_verification_client()
+            .verify_signature(request)
+            .await
+            .map_err(refusal_or_transport)?
+            .into_inner();
+        Ok(if response.is_valid == Some(true) {
+            SignatureCheck::Valid
+        } else {
+            SignatureCheck::Invalid(
+                response
+                    .reason
+                    .unwrap_or_else(|| "the node did not accept the signature".into()),
+            )
         })
     }
 

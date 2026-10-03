@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use crate::{
     BalanceDelta, ChainError, ChainResult, CreatedObject, DynamicFieldSummary, ExecutionOutcome,
-    ObjectSummary, SimulationOutcome, SuiRead, SuiWrite, Verification,
+    ObjectSummary, SignatureCheck, SimulationOutcome, SuiRead, SuiWrite, Verification,
 };
 
 /// What the fake should answer for the next simulation.
@@ -73,6 +73,9 @@ struct State {
     created: Vec<CreatedObject>,
     /// What the fake network answers when asked its price, or why it cannot.
     reference_gas_price: ChainResult<u64>,
+    /// The (message, signature, address) triples the fake accepts as valid. Anything else is
+    /// invalid, so a test that forgot to stage a signature fails rather than passes.
+    valid_signatures: Vec<(Vec<u8>, String, String)>,
 }
 
 impl Default for State {
@@ -93,6 +96,7 @@ impl Default for State {
             // Testnet's, at the time of writing. Real, and different from mainnet's 100. This is
             // the network's answer, which a caller reads; it is not a price a caller assumed.
             reference_gas_price: Ok(1_000),
+            valid_signatures: Vec::new(),
         }
     }
 }
@@ -190,6 +194,16 @@ impl FakeSui {
         self
     }
 
+    /// Accept `signature` as `address`'s signature over `message`.
+    pub fn with_valid_signature(self, message: &[u8], signature: &str, address: &str) -> Self {
+        self.state.borrow_mut().valid_signatures.push((
+            message.to_vec(),
+            signature.to_owned(),
+            address.to_owned(),
+        ));
+        self
+    }
+
     /// Stage the objects an execution should report as created.
     ///
     /// A multi-step flow cannot continue without them: `create_wallet` shares a wallet and mints a
@@ -228,6 +242,25 @@ impl FakeSui {
 }
 
 impl SuiRead for FakeSui {
+    async fn verify_personal_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck> {
+        let accepted = self
+            .state
+            .borrow()
+            .valid_signatures
+            .iter()
+            .any(|(m, s, a)| m.as_slice() == message && s == signature && a == address);
+        Ok(if accepted {
+            SignatureCheck::Valid
+        } else {
+            SignatureCheck::Invalid("not a signature this fake was given".into())
+        })
+    }
+
     async fn get_object(&self, id: &str) -> ChainResult<ObjectSummary> {
         // A node that has certified a transaction has not necessarily indexed its objects yet, so
         // a fake that can only ever answer "here" or "never" cannot express the one case
