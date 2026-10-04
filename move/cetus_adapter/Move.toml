@@ -1,0 +1,11 @@
+[package]
+name = "cetus_adapter"
+edition = "2024.beta"
+
+[dependencies]
+agent_wallet = { local = "../agent_wallet" }
+cetusclmm = { git = "https://github.com/CetusProtocol/cetus-clmm-interface.git", subdir = "sui/cetus_clmm", rev = "5ef409e5aa97cf0c545c5ff64560cb65eaa981e7" }
+
+integer_mate = { git = "https://github.com/CetusProtocol/integer-mate.git", subdir = ".", rev = "09a12d9b171122883d9350039d4ed6e8400033b9", override = true }
+move_stl = { git = "https://github.com/CetusProtocol/move-stl.git", subdir = ".", rev = "0681fec63a310ae753d03a06f7c05d3e2925bb09", override = true }
+

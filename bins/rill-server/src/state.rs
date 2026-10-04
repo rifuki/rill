@@ -334,6 +334,7 @@ pub struct AppState {
     pub skills: Arc<FileSkillStore>,
     /// Owner-signed action grants, served to the signers they name.
     pub grants: Arc<rill_store::grants::FileGrantStore>,
+    pub pairing: Arc<rill_store::pairing::PairingStore>,
     /// Loaded at boot — a corrupt file must surface at startup, not on the first sign-in. Read
     /// once the OAuth endpoints are wired.
     pub oauth: Arc<FileOAuthStore>,
@@ -360,6 +361,12 @@ impl AppState {
             grants: Arc::new(rill_store::grants::FileGrantStore::load(
                 config.grants_store_path(),
             )),
+            pairing: Arc::new(
+                rill_store::pairing::PairingStore::load(
+                    std::path::Path::new(&config.oauth_store_path).with_file_name("pairing.json"),
+                )
+                .expect("pairing store must load at startup"),
+            ),
             oauth: Arc::new(FileOAuthStore::load(&config.oauth_store_path, now_ms)),
             chain: Arc::new(chain),
             deepbook_package_id: std::env::var("DEEPBOOK_PACKAGE_ID")

@@ -261,3 +261,67 @@ fn public_tool_describes_runtime_node_ids_and_exact_defaults() {
         "string"
     );
 }
+
+#[tokio::test]
+async fn republishing_creates_owned_immutable_versions_and_rejects_other_owners() {
+    let dir = fresh_dir();
+    let app = app_in(&dir);
+    let token = bearer("0x1");
+    let mut flow = json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":"1","validator":"0x0"}}],"edges":[]});
+    let (_, first) = call(
+        &app,
+        "POST",
+        "/api/publish",
+        json!({"flow":flow}),
+        Some(&token),
+    )
+    .await;
+    let first = &first["data"];
+    assert_eq!(first["version"], 1);
+    let id = first["skillId"].as_str().unwrap();
+    flow["nodes"][0]["config"]["amount"] = json!("2");
+    let (status, second) = call(
+        &app,
+        "POST",
+        "/api/publish",
+        json!({"flow":flow,"parentSkillId":id}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["data"]["version"], 2);
+    assert_eq!(second["data"]["definitionId"], id);
+    assert_ne!(second["data"]["skillId"], id);
+    assert_ne!(second["data"]["flowDigest"], first["flowDigest"]);
+    let (_, third) = call(
+        &app,
+        "POST",
+        "/api/publish",
+        json!({"flow":flow,"parentSkillId":id}),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        third["data"]["version"], 3,
+        "branching from v1 still allocates the next version"
+    );
+    let attacker = bearer("0x2");
+    for auth in [None, Some(attacker.as_str())] {
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/api/publish",
+            json!({"flow":flow,"parentSkillId":id}),
+            auth,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let store = rill_store::file::FileSkillStore::load(dir.join("skills.json"));
+    use rill_store::SkillStore;
+    assert_eq!(
+        store.get(id).unwrap().flow["nodes"][0]["config"]["amount"],
+        "1"
+    );
+    assert_eq!(store.count(), 3);
+}

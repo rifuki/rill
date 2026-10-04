@@ -131,9 +131,31 @@ impl SkillStore for FileSkillStore {
             .skills
             .lock()
             .map_err(|_| StoreError::Io("store lock poisoned".into()))?;
-        if let Some(existing) = skills.iter_mut().find(|s| s.id == skill.id) {
-            *existing = skill;
+        if let Some(existing) = skills.iter().find(|s| s.id == skill.id) {
+            if existing == &skill {
+                return Ok(());
+            }
+            return Err(StoreError::Corrupt(
+                "published skill IDs are immutable; publish a new version".into(),
+            ));
         } else {
+            // Serialize allocation with persistence: concurrent publishes cannot share a version.
+            if let (Some(definition), Some(version)) = (
+                skill.flow["publication"]["definitionId"].as_str(),
+                skill.flow["publication"]["version"].as_u64(),
+            ) {
+                if skills.iter().any(|s| {
+                    s.flow["publication"]["definitionId"]
+                        .as_str()
+                        .unwrap_or(&s.id)
+                        == definition
+                        && s.flow["publication"]["version"].as_u64().unwrap_or(1) == version
+                }) {
+                    return Err(StoreError::Corrupt(
+                        "skill version already exists; retry publishing".into(),
+                    ));
+                }
+            }
             if skills.len() >= MAX_STORED_SKILLS {
                 return Err(StoreError::AtCapacity {
                     limit: MAX_STORED_SKILLS,
@@ -141,7 +163,11 @@ impl SkillStore for FileSkillStore {
             }
             skills.push(skill);
         }
-        self.persist(&skills)
+        if let Err(error) = self.persist(&skills) {
+            skills.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn count(&self) -> usize {

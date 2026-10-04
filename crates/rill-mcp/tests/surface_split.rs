@@ -13,12 +13,13 @@ use rill_mcp::{negotiate_protocol_version, tools, Surface, LATEST_PROTOCOL_VERSI
 use std::collections::BTreeMap;
 
 /// The tools that need a key. Asserted in both directions below rather than trusted.
-const SIGNING_TOOLS: [&str; 7] = [
+const SIGNING_TOOLS: [&str; 8] = [
     "rill_create_wallet",
     "rill_attach_rules",
     "rill_spend",
     "rill_swap",
     "rill_stake",
+    "rill_unstake",
     "rill_execute",
     "rill_run_action",
 ];
@@ -84,6 +85,7 @@ fn every_signing_tool_is_on_the_signer_and_none_on_the_builder() {
         other,
         vec![
             "rill_actions".to_string(),
+            "rill_portfolio".to_string(),
             "rill_quote".to_string(),
             "rill_status".to_string(),
             "rill_wallet".to_string()
@@ -201,5 +203,21 @@ fn the_advertised_revision_is_the_newest_one_supported() {
     assert_eq!(
         LATEST_PROTOCOL_VERSION, sorted[0],
         "the list is newest-first and the advertised version is its head; one of those is wrong"
+    );
+}
+
+#[test]
+fn unstake_schema_requires_decimal_amount_and_floor_without_extra_fields() {
+    let tools = by_name(Surface::Wallet);
+    let schema = &tools["rill_unstake"].input_schema;
+    assert_eq!(schema["required"], serde_json::json!(["amount", "minOut"]));
+    assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+    assert_eq!(
+        schema["properties"]["amount"]["type"],
+        serde_json::json!("string")
+    );
+    assert_eq!(
+        schema["properties"]["minOut"]["type"],
+        serde_json::json!("string")
     );
 }

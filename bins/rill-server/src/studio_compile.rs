@@ -1,4 +1,6 @@
 //! Compile Studio graphs into unsigned transaction kinds.
+mod protected;
+use protected::compile_protected;
 use rill_chain::SuiRead;
 use rill_core::{
     envelope::Network,
@@ -18,7 +20,17 @@ pub struct AgentWalletInput {
     pub coin_type: String,
     pub capability_manifest: CapabilityManifest,
     pub version_id: String,
+    #[serde(default)]
+    pub protected_swap: Option<ProtectedSwapInput>,
 }
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtectedSwapInput {
+    pub adapter_package_id: String,
+    pub revision: u64,
+    pub owner: String,
+}
+
 fn sui_coin_type() -> String {
     "0x2::sui::SUI".into()
 }
@@ -125,7 +137,7 @@ fn incoming<'a>(flow: &'a FlowGraph, node: &FlowNode) -> Vec<&'a rill_core::flow
         .filter(|edge| edge.target == node.id)
         .collect()
 }
-fn effective_floor(flow: &FlowGraph, node: &FlowNode) -> Result<u64, CompileError> {
+pub(crate) fn effective_floor(flow: &FlowGraph, node: &FlowNode) -> Result<u64, CompileError> {
     let own = string(node, "min_amount_out")?
         .map(parse_u64_string)
         .transpose()
@@ -296,6 +308,11 @@ pub async fn compile(
         root_total = root_total
             .checked_add(root_amount)
             .ok_or_else(|| error("root funding exceeds u64"))?;
+    }
+    if let Some(wallet) = &options.agent_wallet {
+        if let Some(protection) = &wallet.protected_swap {
+            return compile_protected(flow, options, chain, wallet, protection, root_total).await;
+        }
     }
     let mut tx = TransactionBuilder::new();
     tx.set_sender(options.sender.unwrap_or(Address::ZERO));

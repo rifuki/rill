@@ -1,0 +1,19 @@
+{
+  "network": "mainnet",
+  "upgradeable": true,
+  "owner": "0x3e4b7c3d4ddc4f7ae281d1390d79ca016b8d1ad80a2ff92d5a15b88b91739c09",
+  "agentWallet": {
+    "packageId": "0x1bad7dbb6084162202817375332addc489e158caac024f24b9b4c9440d180b7a",
+    "typeOrigin": "0xb8b95f9b43381693c72e3b0b0bae9c52c392492f5a1ce49bbea3ca393b694429",
+    "versionObjectId": "0x86430a8195900cd52d607a81993b6125a51628a9db93e10a1afedd2c5a95ba94",
+    "upgradeCapId": "0x7b7c04fb9a6e7974566f6a6c294b1743c37fef225077cb26375cedac8a5f8eef",
+    "upgradeDigest": "8FMjfPWQuSYbrWyM2VBLZki6emXAupzSBUFLoVMG3Dit",
+    "migrationDigest": "FFRdyykDKrsKNNsRNw6b5PVY9scC3eHdwAM4Uf2xfAvV"
+  },
+  "cetusAdapter": {
+    "packageId": "0x119d1a38177734b18c1d51895a507a184a619fb5fd8226d37bb94859deb0211f",
+    "publishDigest": "AEdqwg5iqRayZS5UaxRWXT3ozpptoRwxgmbpzj7NQL2U",
+    "upgradeCapId": "0x298d4d144f50e7fbdb327b070452a583690825e8e3fed1722bc876e4b301e446"
+  },
+  "rillGuardPackageId": "0xfa208560e94310fa66c79df8b9aa1a33b5e3601781906833472ef233388e1e43"
+}

@@ -23,7 +23,7 @@ use sui::event;
 /// Bump on every upgrade that changes on-chain behavior. `migrate` moves a live `Version` object's
 /// `version` field up to match; callers holding a stale `Version` reference get rejected by
 /// `check_is_valid` until they migrate.
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 /// `check_is_valid` was called against a `Version` object whose `version` no longer matches this
 /// package's compiled `VERSION` — the caller is targeting stale bytecode/state assumptions.

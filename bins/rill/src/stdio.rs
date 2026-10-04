@@ -226,10 +226,11 @@ pub fn handle(context: &mut WalletContext, message: &Value) -> Option<Value> {
             } else {
                 rill_mcp::Surface::Wallet
             };
-            let tools: Vec<Value> = rill_mcp::tools(surface)
+            let mut tools: Vec<Value> = rill_mcp::tools(surface)
                 .into_iter()
                 .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
                 .collect();
+            tools.push(json!({"name":"rill_pair","description":"Prove this local signer to an owner-created pairing request. Gives no spend authority; owner confirms in Studio.","inputSchema":{"type":"object","properties":{"requestId":{"type":"string"}},"required":["requestId"],"additionalProperties":false}}));
             Some(rpc_result(id, json!({ "tools": tools })))
         }
         "tools/call" => Some(call(context, id, message)),
@@ -260,7 +261,12 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
 
     // A named pair is checked here, before any chain read, so a testnet id on mainnet is refused by
     // name. With none named, the published mainnet pair and guard are the defaults.
-    if context.network == "mainnet" && !matches!(name, "rill_status" | "rill_execute") {
+    if context.network == "mainnet"
+        && !matches!(
+            name,
+            "rill_status" | "rill_execute" | "rill_pair" | "rill_portfolio" | "rill_unstake"
+        )
+    {
         let package = std::env::var("AGENT_WALLET_PACKAGE_ID").ok();
         let version = std::env::var("AGENT_WALLET_VERSION_ID").ok();
         if let Err(reason) = rill_ptb::deployments::wallet_deployment(
@@ -273,6 +279,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
     }
     match name {
         "rill_status" => status(context, id),
+        "rill_pair" => pair_signer(context, id, &params),
         "rill_wallet" => wallet(context, id, &params),
         "rill_quote" => quote(context, id, &params),
         "rill_create_wallet" => create_wallet(context, id, &params),
@@ -280,10 +287,28 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_spend" => spend(context, id, &params),
         "rill_swap" => swap(context, id, &params),
         "rill_stake" => stake(context, id, &params),
+        "rill_portfolio" => portfolio(context, id, &params),
+        "rill_unstake" => unstake(context, id, &params),
         "rill_execute" => execute(context, id, &params),
         "rill_actions" => actions(context, id),
         "rill_run_action" => run_action(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
+    }
+}
+
+fn pair_signer(context: &WalletContext, id: Value, params: &Value) -> Value {
+    let Some(api) = api_url() else {
+        return tool_error(id, "not_configured", NO_API);
+    };
+    let Some(key) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let Some(request) = argument(params, "requestId") else {
+        return tool_error(id, "invalid_arguments", "requestId is required.");
+    };
+    match block_on(crate::pair_cmd::pair(key, &api, request, &context.network)) {
+        Ok(Ok(report)) => tool_ok(id, report),
+        Ok(Err(error)) | Err(error) => tool_error(id, "pairing_refused", &error),
     }
 }
 
@@ -733,6 +758,115 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(Ok(result)) => tool_ok(id, result),
         Ok(Err(failure)) => failure_response(context, id, "swap_failed", &failure),
         Err(e) => failure_response(context, id, "swap_failed", &Failure::Failed(e)),
+    }
+}
+
+fn portfolio(context: &WalletContext, id: Value, params: &Value) -> Value {
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if arguments
+        .as_object()
+        .is_none_or(|o| o.keys().any(|k| k != "owner"))
+    {
+        return tool_error(
+            id,
+            "bad_request",
+            "portfolio accepts only an optional owner address",
+        );
+    }
+    let owner = if let Some(value) = arguments.get("owner") {
+        let Some(owner) = value.as_str() else {
+            return tool_error(id, "bad_request", "owner must be a string");
+        };
+        owner.to_owned()
+    } else if let Some(key) = context.keystore.as_ref() {
+        key.address().to_string()
+    } else {
+        return tool_error(
+            id,
+            "bad_request",
+            "owner address required when no signer is configured",
+        );
+    };
+    match block_on(crate::portfolio_cmd::portfolio_json(
+        &endpoint(context),
+        &owner,
+    )) {
+        Ok(Ok(report)) => tool_ok(id, report),
+        Ok(Err(e)) | Err(e) => tool_error(id, "portfolio_failed", &e),
+    }
+}
+
+fn unstake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let Some(key) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key configured.");
+    };
+    if context.network != "mainnet" {
+        return tool_error(
+            id,
+            "bad_request",
+            "Haedal redemption currently supports mainnet only.",
+        );
+    }
+    if !context.mainnet_allowed {
+        return tool_error(
+            id,
+            "mainnet_not_opted_in",
+            &rill_core::mainnet::mainnet_refusal(),
+        );
+    }
+    let Some(arguments) = params.get("arguments").and_then(Value::as_object) else {
+        return tool_error(id, "bad_request", "arguments must be an object");
+    };
+    if arguments
+        .keys()
+        .any(|k| !["amount", "minOut", "receiver", "dryRun"].contains(&k.as_str()))
+    {
+        return tool_error(id, "bad_request", "unknown unstake argument");
+    }
+    let (Some(amount), Some(min_out)) = (argument(params, "amount"), argument(params, "minOut"))
+    else {
+        return tool_error(
+            id,
+            "bad_request",
+            "amount and minOut must be decimal strings",
+        );
+    };
+    if arguments.get("receiver").is_some_and(|v| !v.is_string())
+        || arguments.get("dryRun").is_some_and(|v| !v.is_boolean())
+    {
+        return tool_error(
+            id,
+            "bad_request",
+            "receiver must be a string and dryRun a boolean",
+        );
+    }
+    let args = crate::unstake_cmd::UnstakeArgs {
+        package_id: crate::unstake_cmd::MAINNET_HAEDAL.into(),
+        staking_object_id: crate::unstake_cmd::MAINNET_STAKING.into(),
+        coin_type: crate::unstake_cmd::MAINNET_HASUI.into(),
+        guard_package_id: guard_package_id(),
+        amount: amount.into(),
+        min_out: min_out.into(),
+        receiver: argument(params, "receiver")
+            .map(str::to_owned)
+            .unwrap_or_else(|| key.address().to_string()),
+        gas_budget: TOOL_GAS_BUDGET,
+        dry_run: arguments
+            .get("dryRun")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    match block_on(crate::unstake_cmd::unstake_json(
+        &endpoint(context),
+        key,
+        &args,
+    )) {
+        Ok(Ok(report)) => tool_ok(id, report),
+        Ok(Err(failure)) => failure_response(context, id, "unstake_failed", &failure),
+        Err(e) => failure_response(context, id, "unstake_failed", &Failure::Failed(e)),
     }
 }
 
@@ -1553,6 +1687,25 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unstake_rejects_unknown_and_numeric_arguments_before_chain_reads() {
+        use sui_crypto::ed25519::Ed25519PrivateKey;
+        let encoded = Ed25519PrivateKey::new([52; 32]).to_suiprivkey().unwrap();
+        let mut ctx = WalletContext::new(
+            Some(Keystore::from_suiprivkey(&encoded).unwrap()),
+            "mainnet".into(),
+            true,
+        );
+        for args in [
+            json!({"amount":1,"minOut":"1"}),
+            json!({"amount":"1","minOut":"1","force":true}),
+            json!({"amount":"1","minOut":"1","dryRun":"true"}),
+        ] {
+            let report = unstake(&mut ctx, json!(1), &json!({"arguments":args}));
+            assert_eq!(report["result"]["structuredContent"]["code"], "bad_request");
+        }
+    }
 
     fn context() -> WalletContext {
         WalletContext::new(None, "testnet".into(), false)

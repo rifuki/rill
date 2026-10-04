@@ -1,0 +1,14 @@
+// Compile-fail probe: copy into sources temporarily in an isolated package.
+// The compiler must reject the unconsumed Settlement (no drop or store).
+module agent_wallet::missing_settlement_probe {
+    use agent_wallet::agent_wallet::{Self as aw, AgentWallet, SpendRequest};
+    use agent_wallet::version::Version;
+    use sui::clock::Clock;
+    public struct Adapter has drop {}
+    public fun forget<T, Out>(wallet: &mut AgentWallet<T>, req: SpendRequest,
+        version: &Version, clock: &Clock, ctx: &mut TxContext) {
+        let (coin, _unsettled) = aw::confirm_protected<T, Out, Adapter>(Adapter {},
+            wallet, req, 1, object::id_from_address(@0xC), 1, version, clock, ctx);
+        sui::transfer::public_transfer(coin, ctx.sender());
+    }
+}

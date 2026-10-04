@@ -251,6 +251,9 @@ const COMMANDS: &[(&str, &str)] = &[
         "grant",
         "owner: grant the wallet's agent one published action (prepare, sign, store; --submit)",
     ),
+    ("portfolio", "read token balances: --owner <address>, defaults to signer"),
+    ("unstake", "redeem owned haSUI: --amount <decimal> --min-out <decimal> [--receiver <address>] [--submit]"),
+    ("pair", "prove the local signer: --request <id> --api <url>; owner confirms in Studio"),
     ("status", "report readiness and exit"),
     ("address", "print the signing address, nothing else"),
     ("capabilities", "show what the loaded run-set permits"),
@@ -411,6 +414,118 @@ fn main() {
             std::process::exit(code);
         }
         Some("setup") => std::process::exit(setup(config_path.as_deref())),
+        Some("portfolio") | Some("unstake") => {
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let endpoint = std::env::var("SUI_RPC_URL")
+                .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", loaded.network));
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("rill: {e}");
+                    std::process::exit(1)
+                }
+            };
+            let result: Result<serde_json::Value, String> = if positional()
+                .first()
+                .map(String::as_str)
+                == Some("portfolio")
+            {
+                let owner = flag("--owner")
+                    .or_else(|| loaded.keystore.as_ref().map(|k| k.address().to_string()));
+                match owner {
+                    Some(owner) => {
+                        runtime.block_on(rill_cli::portfolio_cmd::portfolio_json(&endpoint, &owner))
+                    }
+                    None => Err("portfolio requires --owner or a configured signer".into()),
+                }
+            } else {
+                let Some(key) = loaded.keystore.as_ref() else {
+                    eprintln!("rill: {}", loaded.no_key_reason());
+                    std::process::exit(1);
+                };
+                let submit = argv.iter().any(|a| a == "--submit");
+                if loaded.network != "mainnet" || (submit && !loaded.mainnet_allowed) {
+                    eprintln!(
+                        "rill: unstake requires mainnet, and --submit requires mainnet opt-in"
+                    );
+                    std::process::exit(1);
+                }
+                let (Some(amount), Some(min_out)) = (flag("--amount"), flag("--min-out")) else {
+                    eprintln!("usage: rill-wallet unstake --amount <decimal haSUI> --min-out <decimal SUI> [--receiver <address>] [--submit]");
+                    std::process::exit(1);
+                };
+                let args = rill_cli::unstake_cmd::UnstakeArgs {
+                    package_id: rill_cli::unstake_cmd::MAINNET_HAEDAL.into(),
+                    staking_object_id: rill_cli::unstake_cmd::MAINNET_STAKING.into(),
+                    coin_type: rill_cli::unstake_cmd::MAINNET_HASUI.into(),
+                    guard_package_id: std::env::var("RILL_GUARD_PACKAGE_ID")
+                        .unwrap_or_else(|_| rill_ptb::deployments::MAINNET_RILL_GUARD.to_string()),
+                    amount,
+                    min_out,
+                    receiver: flag("--receiver").unwrap_or_else(|| key.address().to_string()),
+                    gas_budget: 50_000_000,
+                    dry_run: !submit,
+                };
+                runtime
+                    .block_on(rill_cli::unstake_cmd::unstake_json(&endpoint, key, &args))
+                    .map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(v) => println!("{v}"),
+                Err(e) => {
+                    eprintln!("rill: {e}");
+                    std::process::exit(1)
+                }
+            }
+        }
+        Some("pair") => {
+            let argv: Vec<String> = std::env::args().collect();
+            let flag = |name: &str| {
+                argv.iter()
+                    .position(|a| a == name)
+                    .and_then(|i| argv.get(i + 1))
+                    .cloned()
+            };
+            let Some(keystore) = loaded.keystore.as_ref() else {
+                eprintln!("rill: {}", loaded.no_key_reason());
+                std::process::exit(1);
+            };
+            let Some(request) = flag("--request") else {
+                eprintln!("usage: rill-wallet pair --request <id> --api <url>");
+                std::process::exit(1);
+            };
+            let Some(api) =
+                flag("--api").or_else(|| std::env::var(rill_cli::config::API_URL_VAR).ok())
+            else {
+                eprintln!("pair requires --api or RILL_API_URL");
+                std::process::exit(1);
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            match runtime.block_on(rill_cli::pair_cmd::pair(
+                keystore,
+                &api,
+                &request,
+                &loaded.network,
+            )) {
+                Ok(report) => println!("{}", report),
+                Err(error) => {
+                    eprintln!("rill: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("grant") => {
             let argv: Vec<String> = std::env::args().collect();
             let flag = |name: &str| {

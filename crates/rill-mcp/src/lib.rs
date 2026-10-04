@@ -177,7 +177,17 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                                 "capDigest": { "type": "string" },
                                 "coinType": { "type": "string" },
                                 "versionId": { "type": "string" },
-                                "capabilityManifest": { "type": "object" }
+                                "capabilityManifest": { "type": "object" },
+                                "protectedSwap": {
+                                    "type": "object",
+                                    "properties": {
+                                        "adapterPackageId": {"type":"string"},
+                                        "revision": {"type":"integer","minimum":1},
+                                        "owner": {"type":"string"}
+                                    },
+                                    "required": ["adapterPackageId", "revision", "owner"],
+                                    "additionalProperties": false
+                                }
                             },
                             "required": [
                                 "packageId", "walletId", "capId",
@@ -456,6 +466,21 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     "additionalProperties": false
                 })),
             ),
+            read_only(
+                "rill_portfolio",
+                "Read directly owned token balances and objects for an address, defaulting to this signer. Exact base units; excludes shared vault funds and external lending positions. No transaction or signature.",
+                object_schema(json!({"type":"object","properties":{"owner":{"type":"string"}},"additionalProperties":false})),
+            ),
+            destructive(
+                "rill_unstake",
+                "Immediately redeem this signer's own Haedal haSUI for SUI. THIS SUBMITS A REAL TRANSACTION and cannot be undone. Requires a positive minOut in decimal SUI and enforces it on chain. The protocol charges its live instant-redemption fee and may lack liquidity. Delayed unstaking creates a ticket and needs a later epoch claim; this tool does not do that. Simulates before signing; do not retry an unknown submission outcome. Receiver defaults to signer. Mainnet only.",
+                object_schema(json!({"type":"object","properties":{
+                    "amount":{"type":"string","description":"Positive decimal haSUI amount."},
+                    "minOut":{"type":"string","description":"Positive minimum decimal SUI after protocol fee."},
+                    "receiver":{"type":"string","description":"Public Sui address receiving redeemed SUI; defaults to signer."},
+                    "dryRun":{"type":"boolean","description":"Simulate without submitting; defaults false."}
+                },"required":["amount","minOut"],"additionalProperties":false})),
+            ),
             destructive(
                 "rill_execute",
                 "Validate, byte-pin, re-simulate, sign, and submit one ExecutionEnvelope built \
@@ -585,6 +610,7 @@ mod tests {
             "rill_spend",
             "rill_swap",
             "rill_stake",
+            "rill_unstake",
             "rill_execute",
             "rill_run_action",
         ];

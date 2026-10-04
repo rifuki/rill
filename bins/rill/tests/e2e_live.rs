@@ -932,6 +932,8 @@ async fn run(
 
     step("the agent lists and runs the grant");
     let hasui_before = coin_total(chain, &agent, "::hasui::HASUI").await;
+    let owner_usdc_before = coin_total(chain, &owner, "::usdc::USDC").await;
+    let agent_usdc_before = coin_total(chain, &agent, "::usdc::USDC").await;
     let mut signer = Agent::start(setup);
     let (actions, _) = signer.call("rill_actions", json!({}));
     let entry = grant_entry(&actions, &action, &wallet);
@@ -954,6 +956,19 @@ async fn run(
     receipts["run"] = json!({"digest": digest, "spentMist": spend.to_string()});
     eprintln!("ran {digest}");
 
+    if kind == Kind::Swap && std::env::var("RILL_E2E_EXPECT_PROTECTED").as_deref() == Ok("1") {
+        let owner_after =
+            coin_total_changed(chain, &owner, "::usdc::USDC", owner_usdc_before).await;
+        if owner_after <= owner_usdc_before {
+            return Err("protected swap did not settle USDC to owner".into());
+        }
+        let agent_after = coin_total(chain, &agent, "::usdc::USDC").await;
+        if agent_after != agent_usdc_before {
+            return Err("protected swap changed the agent's USDC balance".into());
+        }
+        receipts["run"]["ownerUsdcReceived"] = json!((owner_after - owner_usdc_before).to_string());
+        receipts["run"]["agentUsdcUnchanged"] = json!(true);
+    }
     if kind == Kind::Stake {
         let after = coin_total_changed(chain, &agent, "::hasui::HASUI", hasui_before).await;
         if after <= hasui_before {

@@ -495,3 +495,33 @@ fn a_client_registration_survives_a_restart() {
         "otherwise every connected agent silently breaks on the next deploy"
     );
 }
+
+#[test]
+fn published_skill_is_immutable_but_identical_save_is_idempotent() {
+    let path = tmp("immutable.json");
+    let _ = std::fs::remove_file(&path);
+    let store = FileSkillStore::load(&path);
+    let original = skill("pinned", Some("0xowner"), "2026-10-04");
+    store.save(original.clone()).unwrap();
+    store.save(original.clone()).unwrap();
+    let mut changed = original.clone();
+    changed.flow = serde_json::json!({"nodes": [{"amount": "100"}], "edges": []});
+    assert!(store.save(changed).is_err());
+    assert_eq!(store.get("pinned"), Some(original.clone()));
+    assert_eq!(FileSkillStore::load(&path).get("pinned"), Some(original));
+}
+
+#[test]
+fn duplicate_publications_cannot_allocate_the_same_lineage_version() {
+    let path = tmp("version-conflict.json");
+    let _ = std::fs::remove_file(&path);
+    let store = FileSkillStore::load(&path);
+    let mut first = skill("first", Some("0xowner"), "2026-10-04");
+    first.flow["publication"] = serde_json::json!({"definitionId":"definition", "version":2});
+    let mut second = first.clone();
+    second.id = "second".into();
+    store.save(first.clone()).unwrap();
+    assert!(store.save(second).is_err());
+    assert_eq!(store.count(), 1);
+    assert_eq!(FileSkillStore::load(&path).get("first"), Some(first));
+}

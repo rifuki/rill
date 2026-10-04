@@ -17,7 +17,7 @@
 //! `Upgrade` inside a spend is not a shape anybody approved, and silently ignoring the commands
 //! that are not Move calls is how one gets waved through.
 
-use sui_sdk_types::{Command, Transaction};
+use sui_sdk_types::{Argument, Command, Transaction};
 
 use crate::Rejection;
 
@@ -68,6 +68,9 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
 
     for command in &programmable.commands {
         commands.push(name_of(command).to_string());
+        if touches_gas_coin(command) {
+            commands.push("GasCoinAction".into());
+        }
         if let Command::MoveCall(call) = command {
             targets.push(format!(
                 "{}::{}::{}",
@@ -93,6 +96,20 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
         commands,
         object_inputs,
     })
+}
+
+fn touches_gas_coin(command: &Command) -> bool {
+    let gas = |arg: &Argument| *arg == Argument::Gas;
+    match command {
+        Command::MoveCall(call) => call.arguments.iter().any(gas),
+        Command::SplitCoins(split) => gas(&split.coin) || split.amounts.iter().any(gas),
+        Command::TransferObjects(transfer) => {
+            gas(&transfer.address) || transfer.objects.iter().any(gas)
+        }
+        Command::MergeCoins(merge) => gas(&merge.coin) || merge.coins_to_merge.iter().any(gas),
+        Command::MakeMoveVector(vector) => vector.elements.iter().any(gas),
+        _ => false,
+    }
 }
 
 /// Every command kind, named.
@@ -202,8 +219,31 @@ mod tests {
         tx.transfer_objects(vec![coin], to);
 
         let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
-        assert_eq!(decoded.commands, vec!["SplitCoins", "TransferObjects"]);
+        assert_eq!(
+            decoded.commands,
+            vec!["SplitCoins", "GasCoinAction", "TransferObjects"]
+        );
         assert!(decoded.targets.is_empty());
+    }
+
+    #[test]
+    fn appending_a_gas_coin_payment_is_refused() {
+        let mut tx = builder();
+        tx.move_call(
+            Function::new(
+                addr(0xca),
+                Identifier::new("swap").unwrap(),
+                Identifier::new("execute_a_to_b").unwrap(),
+            ),
+            vec![],
+        );
+        let amount = tx.pure(&40_000_000u64);
+        let gas = tx.gas();
+        let stolen = tx.split_coins(gas, vec![amount]);
+        let attacker = tx.pure(&addr(0xff));
+        tx.transfer_objects(stolen, attacker);
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert!(check_command_kinds(&decoded).is_err());
     }
 
     #[test]
@@ -238,7 +278,7 @@ mod tests {
     fn a_split_and_transfer_spend_is_allowed() {
         let mut tx = builder();
         let amount = tx.pure(&1u64);
-        let gas = tx.gas();
+        let gas = tx.object(ObjectInput::owned(addr(0xab), 1, Digest::ZERO));
         let coin = tx
             .split_coins(gas, vec![amount])
             .into_iter()

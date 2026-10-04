@@ -454,6 +454,17 @@ impl Validated {
         let decoded = crate::decode::decode(&self.envelope.unsigned_ptb)?;
         crate::decode::check_command_kinds(&decoded)?;
         crate::inspect::check_target_sequence(&policy.allowed_targets, &decoded.targets)?;
+        if policy.allowed_targets.iter().any(|target| {
+            target.ends_with("::swap::execute_a_to_b") || target.ends_with("::swap::execute_b_to_a")
+        }) {
+            if let Some(command) = decoded
+                .commands
+                .iter()
+                .find(|command| command.as_str() != "MoveCall")
+            {
+                return Err(Rejection::UnexpectedCommand(command.clone()));
+            }
+        }
         crate::inspect::check_object_scope(&policy.required_object_ids, &decoded.object_inputs)?;
 
         Ok(BytePinned {

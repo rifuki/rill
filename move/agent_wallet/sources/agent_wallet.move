@@ -67,6 +67,40 @@ module agent_wallet::agent_wallet {
     const E_RULE_NOT_SATISFIED: u64 = 10;
     /// `add_rule` was called for a `Rule` type already attached to this wallet's policy.
     const E_RULE_ALREADY_SET: u64 = 11;
+    const E_PROTECTED_MODE: u64 = 12;
+    const E_NOT_PROTECTED: u64 = 13;
+    const E_WRONG_ADAPTER: u64 = 14;
+    const E_STALE_REVISION: u64 = 15;
+    const E_WRONG_POOL: u64 = 16;
+    const E_MIN_OUTPUT: u64 = 17;
+    const E_WRONG_OUTPUT: u64 = 18;
+    const E_INVALID_CHANGE: u64 = 19;
+
+    /// Added through a dynamic field: existing published layouts remain unchanged.
+    public struct ProtectedKey has copy, drop, store {}
+    public struct ProtectedPolicy has store {
+        adapter: TypeName,
+        output: TypeName,
+        pool: ID,
+        min_output: u64,
+        revision: u64,
+    }
+    /// Non-droppable and non-storable. Only the adapter named in the policy can
+    /// settle; the output destination is never supplied by the transaction caller.
+    public struct Settlement<phantom T, phantom Out, phantom Adapter> {
+        wallet: ID,
+        revision: u64,
+        amount: u64,
+        min_output: u64,
+    }
+    public struct ProtectedConfigured has copy, drop {
+        wallet: ID, adapter: TypeName, output: TypeName, pool: ID,
+        min_output: u64, revision: u64,
+    }
+    public struct ProtectedSettled has copy, drop {
+        wallet: ID, revision: u64, amount: u64, output: u64,
+        change: u64, recipient: address,
+    }
 
     /// Shared object: the agent's capped, revocable wallet. `T` = the budget coin type (any token).
     /// Deliberately minimal — custody + identity + hard kill-switch only. Every *composable*
@@ -252,6 +286,14 @@ module agent_wallet::agent_wallet {
         clock: &Clock,
         ctx: &mut TxContext,
     ): Coin<T> {
+        assert!(!is_protected(wallet), E_PROTECTED_MODE);
+        release_spend(wallet, req, version, clock, ctx)
+    }
+
+    fun release_spend<T>(
+        wallet: &mut AgentWallet<T>, req: SpendRequest, version: &Version,
+        clock: &Clock, ctx: &mut TxContext,
+    ): Coin<T> {
         version.check_is_valid();
         let SpendRequest { wallet: req_wallet, amount, receipts } = req;
         assert!(req_wallet == object::id(wallet), E_WRONG_WALLET);
@@ -277,6 +319,109 @@ module agent_wallet::agent_wallet {
             remaining: wallet.budget.value(),
         });
         out
+    }
+
+    /// Owner binds a concrete adapter witness, output asset and pool. No disable
+    /// function exists: generic release stays blocked even if ordinary rules change.
+    /// Calling again updates configuration and increments revision without touching
+    /// wallet lifetime spend or rule bookkeeping.
+    public fun configure_protected<T, Out, Adapter: drop>(
+        _: Adapter, wallet: &mut AgentWallet<T>, version: &Version,
+        pool: ID, min_output: u64, ctx: &TxContext,
+    ) {
+        assert!(ctx.sender() == wallet.owner, E_NOT_OWNER);
+        // Protection may only activate after migration invalidates v1 bytecode.
+        // Owner withdrawal/revoke remain version-independent emergency exits.
+        version.check_is_valid();
+        assert!(min_output > 0, E_MIN_OUTPUT);
+        let adapter = type_name::with_defining_ids<Adapter>();
+        let output = type_name::with_defining_ids<Out>();
+        let revision = if (is_protected(wallet)) {
+            let cfg: &mut ProtectedPolicy = df::borrow_mut(&mut wallet.id, ProtectedKey {});
+            cfg.adapter = adapter;
+            cfg.output = output;
+            cfg.pool = pool;
+            cfg.min_output = min_output;
+            cfg.revision = cfg.revision + 1;
+            cfg.revision
+        } else {
+            df::add(&mut wallet.id, ProtectedKey {}, ProtectedPolicy {
+                adapter, output, pool, min_output, revision: 1,
+            });
+            1
+        };
+        event::emit(ProtectedConfigured {
+            wallet: object::id(wallet), adapter, output, pool, min_output, revision,
+        });
+    }
+
+    /// The trusted adapter obtains the input together with a settlement obligation.
+    /// Its witness constructor must remain private to that adapter's module.
+    public fun confirm_protected<T, Out, Adapter: drop>(
+        _: Adapter, wallet: &mut AgentWallet<T>, req: SpendRequest,
+        revision: u64, pool: ID, min_output: u64, version: &Version,
+        clock: &Clock, ctx: &mut TxContext,
+    ): (Coin<T>, Settlement<T, Out, Adapter>) {
+        assert!(is_protected(wallet), E_NOT_PROTECTED);
+        let cfg: &ProtectedPolicy = df::borrow(&wallet.id, ProtectedKey {});
+        assert!(cfg.adapter == type_name::with_defining_ids<Adapter>(), E_WRONG_ADAPTER);
+        assert!(cfg.output == type_name::with_defining_ids<Out>(), E_WRONG_OUTPUT);
+        assert!(cfg.revision == revision, E_STALE_REVISION);
+        assert!(cfg.pool == pool, E_WRONG_POOL);
+        assert!(min_output >= cfg.min_output, E_MIN_OUTPUT);
+        let amount = req.amount;
+        let receipt = Settlement { wallet: object::id(wallet), revision, amount, min_output };
+        (release_spend(wallet, req, version, clock, ctx), receipt)
+    }
+
+    /// Return unused input to custody and send the actual output directly to owner.
+    /// Spend accounting uses reserved input (conservative), never reset by edits.
+    public fun settle_protected<T, Out, Adapter: drop>(
+        _: Adapter, wallet: &mut AgentWallet<T>, receipt: Settlement<T, Out, Adapter>,
+        output: Coin<Out>, change: Coin<T>, ctx: &mut TxContext,
+    ) {
+        let Settlement { wallet: expected_wallet, revision, amount, min_output } = receipt;
+        assert!(expected_wallet == object::id(wallet), E_WRONG_WALLET);
+        let cfg: &ProtectedPolicy = df::borrow(&wallet.id, ProtectedKey {});
+        assert!(cfg.adapter == type_name::with_defining_ids<Adapter>(), E_WRONG_ADAPTER);
+        assert!(cfg.output == type_name::with_defining_ids<Out>(), E_WRONG_OUTPUT);
+        assert!(cfg.revision == revision, E_STALE_REVISION);
+        assert!(!wallet.revoked, E_REVOKED);
+        let output_amount = output.value();
+        let change_amount = change.value();
+        assert!(output_amount >= min_output, E_MIN_OUTPUT);
+        assert!(change_amount <= amount, E_INVALID_CHANGE);
+        wallet.budget.join(change.into_balance());
+        let recipient = wallet.owner;
+        transfer::public_transfer(output, recipient);
+        event::emit(ProtectedSettled {
+            wallet: object::id(wallet), revision, amount, output: output_amount,
+            change: change_amount, recipient,
+        });
+        // Keep the context in the stable adapter interface for future settlement
+        // bookkeeping; custody and recipient are derived entirely from the wallet.
+        let _ = ctx;
+    }
+
+    public fun is_protected<T>(wallet: &AgentWallet<T>): bool {
+        df::exists(&wallet.id, ProtectedKey {})
+    }
+    public fun protected_revision<T>(wallet: &AgentWallet<T>): u64 {
+        if (is_protected(wallet)) {
+            let cfg: &ProtectedPolicy = df::borrow(&wallet.id, ProtectedKey {});
+            cfg.revision
+        } else { 0 }
+    }
+    public fun protected_policy<T>(wallet: &AgentWallet<T>): (TypeName, TypeName, ID, u64, u64) {
+        let cfg: &ProtectedPolicy = df::borrow(&wallet.id, ProtectedKey {});
+        (cfg.adapter, cfg.output, cfg.pool, cfg.min_output, cfg.revision)
+    }
+
+    /// Partial withdrawal remains available even during version transitions.
+    public fun withdraw<T>(wallet: &mut AgentWallet<T>, amount: u64, ctx: &mut TxContext): Coin<T> {
+        assert!(ctx.sender() == wallet.owner, E_NOT_OWNER);
+        assert!(amount <= wallet.budget.value(), E_INSUFFICIENT_FUNDS);
+        coin::take(&mut wallet.budget, amount, ctx)
     }
 
     // ── SpendRequest views (used by rule modules' `prove`) ──

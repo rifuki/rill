@@ -67,8 +67,22 @@ pub fn owner(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, Bo
         Some(h) => crate::mcp::authenticate(state, h.to_str().ok()).map(Some),
     }
 }
+fn publication(skill: &PublishedSkill) -> Value {
+    let mut workflow = skill.flow.clone();
+    if let Some(object) = workflow.as_object_mut() {
+        object.remove("publication");
+    }
+    json!({
+        "definitionId": skill.flow["publication"]["definitionId"].as_str().unwrap_or(&skill.id),
+        "version": skill.flow["publication"]["version"].as_u64().unwrap_or(1),
+        "flowDigest": rill_core::grant::content_digest(&workflow),
+        "parentSkillId": skill.flow["publication"]["parentSkillId"],
+    })
+}
 pub fn skill_urls(state: &AppState, skill: &PublishedSkill) -> Value {
+    let metadata = publication(skill);
     json!({"id":skill.id,"name":skill.name,"description":skill.description,"createdAt":skill.created_at,
+        "definitionId":metadata["definitionId"],"version":metadata["version"],"flowDigest":metadata["flowDigest"],"parentSkillId":metadata["parentSkillId"],
         "mcpUrl":format!("{}/api/mcp/{}",state.config.base(),skill.id),
         "skillUrl":format!("{}/api/skills/{}/skill.md",state.config.base(),skill.id)})
 }
@@ -275,7 +289,31 @@ pub async fn publish(State(state): State<AppState>, headers: HeaderMap, body: By
         Ok(v) => v,
         Err(e) => return *e,
     };
+    let parent = match body.get("parentSkillId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) if !id.is_empty() => {
+            let Some(parent) = state.skills.get(id) else {
+                return api_err_typed(StatusCode::NOT_FOUND, "Parent skill not found", "NotFound");
+            };
+            if owner.is_none()
+                || parent.owner.as_deref().map(|o| o.trim().to_lowercase())
+                    != owner.as_deref().map(|o| o.trim().to_lowercase())
+            {
+                return api_err_typed(
+                    StatusCode::FORBIDDEN,
+                    "Only the parent skill owner can publish a new version",
+                    "Forbidden",
+                );
+            }
+            Some(parent)
+        }
+        Some(_) => return invalid("parentSkillId must be a nonempty skill ID"),
+    };
     let mut stored = body["flow"].clone();
+    stored
+        .as_object_mut()
+        .expect("validated flow object")
+        .remove("publication");
     stored["studio"] = json!(true);
     if let Some(value) = body.get("manifest") {
         let m = match manifest(value) {
@@ -294,8 +332,28 @@ pub async fn publish(State(state): State<AppState>, headers: HeaderMap, body: By
         return invalid("Add a transaction action before publishing");
     }
     let name = actions.join(" + ");
+    let id = format!("skill_{}", rill_auth::tokens::random_id());
+    let definition_id = parent
+        .as_ref()
+        .map(|p| publication(p)["definitionId"].as_str().unwrap().to_owned())
+        .unwrap_or_else(|| id.clone());
+    let version = if let Some(owner) = &owner {
+        state
+            .skills
+            .list_by_owner(owner)
+            .iter()
+            .filter(|s| publication(s)["definitionId"] == definition_id)
+            .map(|s| publication(s)["version"].as_u64().unwrap_or(1))
+            .max()
+            .unwrap_or(0)
+            + 1
+    } else {
+        1
+    };
+    stored["publication"] = json!({"definitionId":definition_id,"version":version,
+        "flowDigest":rill_core::grant::content_digest(&stored),"parentSkillId":parent.as_ref().map(|p| &p.id)});
     let skill = PublishedSkill {
-        id: format!("skill_{}", rill_auth::tokens::random_id()),
+        id,
         name: name.clone(),
         description: format!("Build {name} as one unsigned Sui transaction."),
         flow: stored,
@@ -305,10 +363,19 @@ pub async fn publish(State(state): State<AppState>, headers: HeaderMap, body: By
         created_at: crate::build::format_rfc3339_ms(now_ms()),
     };
     if let Err(e) = state.skills.save(skill.clone()) {
+        let conflict = matches!(&e, rill_store::StoreError::Corrupt(message) if message == "skill version already exists; retry publishing");
         return api_err_typed(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            if conflict {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            },
             e.to_string(),
-            "StoreError",
+            if conflict {
+                "VersionConflict"
+            } else {
+                "StoreError"
+            },
         );
     }
     let mut result = skill_urls(&state, &skill);
@@ -325,7 +392,8 @@ pub async fn skill_doc(State(state): State<AppState>, Path(id): Path<String>) ->
     let Some(skill) = state.skills.get(&id) else {
         return api_err_typed(StatusCode::NOT_FOUND, "Skill not found", "NotFound");
     };
-    ([(axum::http::header::CONTENT_TYPE,"text/markdown; charset=utf-8")],format!("# {}\n\n{}\n\nMCP: {}/api/mcp/{}\n\nBuild with `build_action`, providing sender, agentWallet and params. The server returns an unsigned envelope only after strict simulation. Use local rill-wallet to validate, re-simulate and sign.\n",skill.name,skill.description,state.config.base(),skill.id)).into_response()
+    let metadata = publication(&skill);
+    ([(axum::http::header::CONTENT_TYPE,"text/markdown; charset=utf-8")],format!("# {}\n\n{}\n\nSkill ID: {}\n\nDefinition: {}\n\nVersion: {}\n\nWorkflow digest: {}\n\nMCP: {}/api/mcp/{}\n\nThis publication is immutable. Grants approve this exact skill ID and workflow. A new version requires a new owner approval.\n\nBuild with `build_action`, providing sender, agentWallet and params. The server returns an unsigned envelope only after strict simulation. Use local rill-wallet to validate, re-simulate and sign.\n",skill.name,skill.description,skill.id,metadata["definitionId"].as_str().unwrap(),metadata["version"],metadata["flowDigest"].as_str().unwrap(),state.config.base(),skill.id)).into_response()
 }
 pub async fn introspect(State(state): State<AppState>, body: Bytes) -> Response {
     let body = match parse_body(&body) {

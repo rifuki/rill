@@ -556,6 +556,7 @@ fn the_transport_advertises_the_whole_flow_and_marks_only_the_submitting_tools_d
         "rill_spend",
         "rill_swap",
         "rill_stake",
+        "rill_unstake",
         "rill_execute",
         "rill_run_action",
     ];

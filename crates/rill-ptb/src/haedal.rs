@@ -114,3 +114,33 @@ pub fn request_stake(
 pub fn expected_stake_targets(package_id: Address) -> Vec<String> {
     vec![format!("{package_id}::interface::request_stake")]
 }
+
+/// Immediate redemption, consuming haSUI and returning SUI for an explicit settlement.
+#[derive(Clone)]
+pub struct Unstake {
+    pub package_id: Address,
+    pub staking_object_id: Address,
+}
+
+/// Emit Haedal's immediate redemption. The protocol applies its live fee and liquidity checks.
+/// Delayed redemption is a different operation returning an epoch-locked ticket.
+pub fn request_unstake_instant(
+    tx: &mut TransactionBuilder,
+    unstake: &Unstake,
+    hasui_coin: Argument,
+    shared: &SharedObjects,
+) -> Result<Argument, HaedalError> {
+    let system_id = SUI_SYSTEM_STATE_ID
+        .parse()
+        .map_err(|_| HaedalError::BadIdentifier(SUI_SYSTEM_STATE_ID.into()))?;
+    let system = tx.object(shared.input(system_id, true)?);
+    let staking = tx.object(shared.input(unstake.staking_object_id, true)?);
+    Ok(tx.move_call(
+        Function::new(
+            unstake.package_id,
+            ident("staking")?,
+            ident("request_unstake_instant_coin")?,
+        ),
+        vec![system, staking, hasui_coin],
+    ))
+}

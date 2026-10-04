@@ -77,7 +77,7 @@ pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
 /// upgrade keeps this id as the type origin but moves the call target, so after one this becomes
 /// the latest `published-at` and the original stays recorded in `Published.toml`.
 pub const MAINNET_AGENT_WALLET: &str =
-    "0xb8b95f9b43381693c72e3b0b0bae9c52c392492f5a1ce49bbea3ca393b694429";
+    "0x1bad7dbb6084162202817375332addc489e158caac024f24b9b4c9440d180b7a";
 
 /// The shared `Version` object [`MAINNET_AGENT_WALLET`] gates itself on.
 pub const MAINNET_AGENT_WALLET_VERSION: &str =

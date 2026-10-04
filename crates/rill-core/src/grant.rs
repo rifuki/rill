@@ -150,6 +150,16 @@ fn utc_minute(ms: u64) -> String {
     )
 }
 
+/// SHA-256 of deterministic JSON, for immutable workflow publication metadata.
+pub fn content_digest(value: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+    Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn write_canonical(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {

@@ -3,7 +3,7 @@ use crate::{
     envelope::{api_err_typed, api_ok},
     state::AppState,
     studio_api,
-    studio_compile::{self, AgentWalletInput, CompileOptions},
+    studio_compile::{self, AgentWalletInput, CompileOptions, ProtectedSwapInput},
 };
 use axum::{
     body::Bytes,
@@ -365,8 +365,14 @@ pub async fn prepare_plan(
         )
         .map_err(err)?;
     }
+    let protected = std::env::var("RILL_CETUS_ADAPTER_PACKAGE_ID").ok()
+        .filter(|id| !id.trim().is_empty())
+        .filter(|_| {
+            let actions:Vec<_>=grant.flow.nodes.iter().filter(|n| !matches!(n.kind.as_str(),"ptb"|"guardrail")).collect();
+            actions.len()==1 && actions[0].kind=="cetus_swap"
+        }).map(|adapter|json!({"adapterPackageId":adapter,"revision":1,"owner":grant.owner.to_string()}));
     Ok(
-        json!({"setupPtb":encode_kind(&finish(tx)?)?,"runSetTemplate":{},"requiresTradeCap":needs_manager,"walletPackageId":package.to_string(),"deepbookPackageId":deepbook.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"budgetMist":grant.budget.to_string(),"owner":grant.owner.to_string(),"agent":grant.agent.to_string(),"ownerIsAgent":grant.owner==grant.agent}),
+        json!({"setupPtb":encode_kind(&finish(tx)?)?,"runSetTemplate":{},"requiresTradeCap":needs_manager,"walletPackageId":package.to_string(),"deepbookPackageId":deepbook.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"budgetMist":grant.budget.to_string(),"owner":grant.owner.to_string(),"agent":grant.agent.to_string(),"ownerIsAgent":grant.owner==grant.agent,"protection":protected}),
     )
 }
 fn chain_amount(fields: &Value, key: &str) -> Result<u64, String> {
@@ -430,6 +436,7 @@ struct Binding {
     objects: SharedObjects,
     run_set: Value,
     build_arguments: Value,
+    protection: Option<ProtectedSwapInput>,
 }
 
 /// `fresh` is onboarding: the wallet must still be empty with no rules, because the next step funds
@@ -602,11 +609,69 @@ async fn bind(
             }
         }
     }
+    let protection = if let Some(adapter) = std::env::var("RILL_CETUS_ADAPTER_PACKAGE_ID")
+        .ok()
+        .filter(|a| !a.trim().is_empty())
+    {
+        let actions: Vec<_> = grant
+            .flow
+            .nodes
+            .iter()
+            .filter(|n| !matches!(n.kind.as_str(), "ptb" | "guardrail"))
+            .collect();
+        if actions.len() == 1 && actions[0].kind == "cetus_swap" {
+            let revision = if fresh {
+                1
+            } else {
+                let mut read = rill_ptb::policy_read::policy_rules_transaction(
+                    package,
+                    wallet_id,
+                    &grant.manifest.wallet_coin_type,
+                    &objects,
+                    chain.reference_gas_price().await.map_err(err)?,
+                )
+                .map_err(err)?;
+                if let sui_sdk_types::TransactionKind::ProgrammableTransaction(ptb) = &mut read.kind
+                {
+                    if let sui_sdk_types::Command::MoveCall(call) = &mut ptb.commands[0] {
+                        call.function = Identifier::new("protected_revision").map_err(err)?;
+                    }
+                }
+                let bytes = chain
+                    .simulate_read(&STANDARD.encode(bcs::to_bytes(&read).map_err(err)?))
+                    .await
+                    .map_err(err)?;
+                bcs::from_bytes::<u64>(
+                    bytes
+                        .command_returns
+                        .iter()
+                        .flatten()
+                        .next()
+                        .ok_or("protected revision read returned no value")?,
+                )
+                .map_err(err)?
+            };
+            if revision > 0 {
+                Some(ProtectedSwapInput {
+                    adapter_package_id: address(&adapter)?.to_string(),
+                    revision,
+                    owner: grant.owner.to_string(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let compiled = studio_compile::compile(
         &grant.flow,
         &CompileOptions {
             sender: Some(grant.agent),
             agent_wallet: Some(AgentWalletInput {
+                protected_swap: protection.clone(),
                 package_id: package.to_string(),
                 wallet_id: wallet_id.to_string(),
                 cap_id: cap_id.to_string(),
@@ -647,7 +712,7 @@ async fn bind(
             (node.id.clone(), Value::Object(values))
         })
         .collect();
-    let build_arguments = json!({
+    let mut build_arguments = json!({
         "actionId": skill.id,
         "sender": grant.agent.to_string(),
         "agentWallet": {
@@ -657,6 +722,9 @@ async fn bind(
         },
         "params": params
     });
+    if let Some(p) = &protection {
+        build_arguments["agentWallet"]["protectedSwap"] = json!(p);
+    }
     Ok(Binding {
         grant,
         package,
@@ -665,6 +733,7 @@ async fn bind(
         objects,
         run_set: runset,
         build_arguments,
+        protection,
     })
 }
 
@@ -683,6 +752,7 @@ pub async fn attach_plan(
         objects,
         run_set,
         build_arguments,
+        protection,
     } = bind(body, skill, owner, context, chain, true).await?;
     let mut tx = builder(grant.owner, chain).await?;
     build_attach_rules(
@@ -697,6 +767,38 @@ pub async fn attach_plan(
         &objects,
     )
     .map_err(err)?;
+    if let Some(protection) = &protection {
+        let node = grant
+            .flow
+            .nodes
+            .iter()
+            .find(|n| n.kind == "cetus_swap")
+            .ok_or("protected swap node missing")?;
+        let config = node
+            .inputs
+            .as_ref()
+            .or(node.config.as_ref())
+            .ok_or("swap config missing")?;
+        let pool_id = address(required(config, "pool")?)?;
+        let pool = chain.get_object(&pool_id.to_string()).await.map_err(err)?;
+        let (a, b) = rill_ptb::cetus::pool_coin_types(
+            pool.object_type.as_deref().ok_or("pool type missing")?,
+        )
+        .ok_or("invalid pool type")?;
+        let a2b = canonical_type(&a)? == canonical_type(&grant.manifest.wallet_coin_type)?;
+        let swap = rill_ptb::protected::ProtectedSwap {
+            adapter_package: address(&protection.adapter_package_id)?,
+            pool_id,
+            config_id: address(deployments::MAINNET_CETUS_GLOBAL_CONFIG)?,
+            coin_type_a: a,
+            coin_type_b: b,
+            a2b,
+            revision: protection.revision,
+            min_output: studio_compile::effective_floor(&grant.flow, node).map_err(err)?,
+            sqrt_price_limit: 0,
+        };
+        rill_ptb::protected::configure(&mut tx, &swap, wallet_id, version, &objects)?;
+    }
     let amount = tx.pure(&grant.budget);
     let gas = tx.gas();
     let funds = tx
@@ -714,7 +816,7 @@ pub async fn attach_plan(
     )
     .map_err(err)?;
     Ok(
-        json!({"attachPtb":encode_kind(&finish(tx)?)?,"runSet":run_set,"buildArguments":build_arguments}),
+        json!({"attachPtb":encode_kind(&finish(tx)?)?,"runSet":run_set,"buildArguments":build_arguments,"protection":protection}),
     )
 }
 

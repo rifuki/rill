@@ -196,9 +196,33 @@ pub fn build_manifest_gated_spend(
     tx: &mut TransactionBuilder,
     binding: &WalletBinding,
     amount_base_units: u64,
-    // Initial shared versions read from the chain; a missing one refuses the build.
     shared: &SharedObjects,
 ) -> Result<Argument, SpendError> {
+    let (request, wallet, version, clock) =
+        build_manifest_spend_request(tx, binding, amount_base_units, shared)?;
+    let coin_type = binding
+        .coin_type
+        .parse()
+        .map_err(|_| SpendError::BadIdentifier(binding.coin_type.clone()))?;
+    Ok(tx.move_call(
+        Function::new(
+            binding.package_id,
+            ident("agent_wallet")?,
+            ident("confirm_spend")?,
+        )
+        .with_type_args(vec![coin_type]),
+        vec![wallet, request, version, clock],
+    ))
+}
+
+/// Build and prove a request without releasing its coin. Protected adapters consume it.
+pub fn build_manifest_spend_request(
+    tx: &mut TransactionBuilder,
+    binding: &WalletBinding,
+    amount_base_units: u64,
+    // Initial shared versions read from the chain; a missing one refuses the build.
+    shared: &SharedObjects,
+) -> Result<(Argument, Argument, Argument, Argument), SpendError> {
     if amount_base_units == 0 {
         return Err(SpendError::ZeroAmount);
     }
@@ -250,19 +274,7 @@ pub fn build_manifest_gated_spend(
         );
     }
 
-    let coin_type_arg = binding
-        .coin_type
-        .parse()
-        .map_err(|_| SpendError::BadIdentifier(binding.coin_type.clone()))?;
-    Ok(tx.move_call(
-        Function::new(
-            binding.package_id,
-            ident("agent_wallet")?,
-            ident("confirm_spend")?,
-        )
-        .with_type_args(vec![coin_type_arg]),
-        vec![wallet, request, version, clock],
-    ))
+    Ok((request, wallet, version, clock))
 }
 
 /// The Move call targets this sequence emits, in order.

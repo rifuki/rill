@@ -20,6 +20,7 @@ pub mod guard;
 pub mod haedal;
 pub mod lifecycle;
 pub mod policy_read;
+pub mod protected;
 pub mod registry;
 pub mod rules;
 pub mod shared;

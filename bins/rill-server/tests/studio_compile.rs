@@ -204,6 +204,126 @@ fn wallet_options(extra_rule: Option<serde_json::Value>) -> CompileOptions {
     })).unwrap());
     options
 }
+
+#[tokio::test]
+async fn protected_swap_has_no_coin_escape_and_checks_owner_binding() {
+    use rill_server::studio_compile::ProtectedSwapInput;
+    let flow = flow(json!({"nodes":[{"id":"swap","type":"cetus_swap","config":{
+        "pool":"0x123","inputCoinType":"0x2::sui::SUI","amount_in":"1000000","min_amount_out":"100"
+    }}],"edges":[]}));
+    let mut options = wallet_options(None);
+    options.agent_wallet.as_mut().unwrap().protected_swap = Some(ProtectedSwapInput {
+        adapter_package_id: "0xd1".into(),
+        revision: 1,
+        owner: "0xc2".into(),
+    });
+    let chain = wallet_chain().with_object(
+        None,
+        ObjectSummary {
+            reference: ObjectRef {
+                id: "0xa1".parse::<Address>().unwrap().to_string(),
+                version: 17,
+                digest: sui_sdk_types::Digest::ZERO.to_string(),
+            },
+            object_type: Some("0xa0::agent_wallet::AgentWallet<0x2::sui::SUI>".into()),
+            shared_initial_version: Some(7),
+            fields: Some(json!({"owner":"0xc2","agent":"0xc1"})),
+        },
+    );
+    let compiled = compile(&flow, &options, &chain).await.unwrap();
+    let TransactionKind::ProgrammableTransaction(ptb) = compiled.transaction.kind else {
+        panic!("PTB")
+    };
+    assert!(ptb
+        .commands
+        .iter()
+        .all(|command| matches!(command, Command::MoveCall(_))));
+    let functions: Vec<_> = ptb
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::MoveCall(call) => Some(call.function.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        functions,
+        ["request_spend", "prove", "prove", "execute_a_to_b"]
+    );
+    let mut guarded = serde_json::to_value(&flow).unwrap();
+    guarded["nodes"].as_array_mut().unwrap().push(json!({"id":"floor","type":"guardrail","config":{"minValue":"200","coinType":"0x3::usdc::USDC"}}));
+    guarded["edges"] =
+        json!([{"source":"swap","sourceHandle":"coin_out","target":"floor","targetHandle":"in"}]);
+    let built = compile(
+        &serde_json::from_value(guarded.clone()).unwrap(),
+        &options,
+        &chain,
+    )
+    .await
+    .unwrap();
+    let TransactionKind::ProgrammableTransaction(guarded_ptb) = built.transaction.kind else {
+        panic!("PTB")
+    };
+    let Command::MoveCall(call) = guarded_ptb.commands.last().unwrap() else {
+        panic!("adapter")
+    };
+    let sui_sdk_types::Argument::Input(index) = call.arguments[3] else {
+        panic!("floor input")
+    };
+    let sui_sdk_types::Input::Pure(value) = &guarded_ptb.inputs[index as usize] else {
+        panic!("pure floor")
+    };
+    assert_eq!(bcs::from_bytes::<u64>(value).unwrap(), 200);
+    for (field, value) in [("coinType", "0x2::sui::SUI"), ("minValue", "0")] {
+        let mut rejected = guarded.clone();
+        rejected["nodes"][1]["config"][field] = json!(value);
+        assert!(
+            compile(&serde_json::from_value(rejected).unwrap(), &options, &chain)
+                .await
+                .is_err()
+        );
+    }
+    let mut rejected = guarded.clone();
+    rejected["edges"][0]["sourceHandle"] = json!("residual");
+    assert!(
+        compile(&serde_json::from_value(rejected).unwrap(), &options, &chain)
+            .await
+            .is_err()
+    );
+    let mut rejected = guarded.clone();
+    rejected["edges"] = json!([]);
+    assert!(
+        compile(&serde_json::from_value(rejected).unwrap(), &options, &chain)
+            .await
+            .is_err()
+    );
+    let mut rejected = guarded;
+    rejected["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":"extra","type":"guardrail","config":{"minValue":"1"}}));
+    rejected["edges"].as_array_mut().unwrap().push(
+        json!({"source":"floor","sourceHandle":"coin_out","target":"extra","targetHandle":"in"}),
+    );
+    assert!(
+        compile(&serde_json::from_value(rejected).unwrap(), &options, &chain)
+            .await
+            .is_err()
+    );
+    options
+        .agent_wallet
+        .as_mut()
+        .unwrap()
+        .protected_swap
+        .as_mut()
+        .unwrap()
+        .owner = "0xdead".into();
+    assert!(compile(&flow, &options, &chain)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("vault owner"));
+}
 #[tokio::test]
 async fn wallet_stake_emits_hot_potato_before_staking() {
     let flow = flow(

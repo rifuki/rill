@@ -26,6 +26,7 @@ pub mod keystore;
 pub mod limits;
 pub mod manager_cmd;
 pub mod order_cmd;
+pub mod pair_cmd;
 pub mod quote_cmd;
 pub mod revoke_cmd;
 pub mod rules_cmd;
@@ -37,3 +38,6 @@ pub mod swap_cmd;
 pub mod verdict;
 pub mod wallet;
 pub mod wallet_read;
+
+pub mod portfolio_cmd;
+pub mod unstake_cmd;

@@ -35,6 +35,33 @@ The wallet's owner publishes actions in Rill Studio and grants them to this agen
 A grant that is refused (not signed by the owner, expired, wallet revoked, agent rotated) is the
 system protecting the owner. Report it; the owner fixes it by granting again in Studio.
 
+## Pair the signer
+
+When Studio gives the user a pairing request, call `rill_pair { requestId }`. It signs a
+domain-bound proof with the configured agent key. The user confirms the paired address in Studio
+and separately approves vault funding and the action grant. Pairing itself grants no spending
+permission. Never choose or import an owner key to complete pairing.
+
+## Portfolio and unstaking
+
+Use `rill_portfolio` to read directly owned coins and objects. Amounts are exact base-unit strings;
+the result does not include shared vault balances, lending positions or USD valuations.
+
+`rill_unstake` redeems the signer's own haSUI immediately. Name the amount, the receiver and a
+positive SUI `minOut`; first use `dryRun: true`, then submit only when the user has authorized that
+redemption. Haedal charges its live instant-redemption fee, requires its protocol minimum and may
+refuse when liquidity is unavailable. This tool does not create a delayed redemption ticket.
+Report the confirmed digest once and never retry a submitted redemption.
+
+## Protected swaps
+
+Use `rill_run_action` for a protected swap grant. Its adapter enforces the approved pool, output
+asset, policy revision and minimum output on chain; proceeds go to the vault owner and unspent
+input returns to the vault. Generic `rill_spend` or `rill_swap` cannot release coins from a
+protected vault. Editing a published workflow creates a new immutable version requiring a new
+owner-signed grant. Other action types retain their declared budget rules and signer restrictions;
+do not describe those as using the protected swap adapter.
+
 ## Before any other spend
 
 1. `rill_wallet { wallet }` and read `largestSpendNow`. Never attempt more than it allows.

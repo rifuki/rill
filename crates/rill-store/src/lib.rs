@@ -19,6 +19,7 @@
 
 pub mod file;
 pub mod grants;
+pub mod pairing;
 
 use serde::{Deserialize, Serialize};
 
