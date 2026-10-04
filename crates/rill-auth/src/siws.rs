@@ -103,6 +103,36 @@ pub fn verify_sign_in_signature(message: &str, encoded: &str) -> Result<String, 
     Ok(signature.derive_address().to_string())
 }
 
+/// What checking a sign-in signature needs: nothing more, or the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInCheck {
+    /// Verified here, by the address the signature derives to.
+    Verified(String),
+    /// A zkLogin or passkey signature. Its validity depends on chain state (zkLogin's JWKs and
+    /// epoch), so the node must verify it, against one of these addresses derived from the
+    /// signature itself. A zkLogin seed with a leading zero byte derives two; either may be the
+    /// account's.
+    AskNode { candidates: Vec<String> },
+}
+
+/// Like [`verify_sign_in_signature`], but routes the schemes only a node can verify to it instead
+/// of refusing them. Browser wallets signed in with Google sign with zkLogin, so refusing it
+/// refused most of the people who would ever open Studio.
+pub fn check_sign_in_signature(message: &str, encoded: &str) -> Result<SignInCheck, SignInError> {
+    use sui_sdk_types::UserSignature;
+    let signature =
+        UserSignature::from_base64(encoded.trim()).map_err(|_| SignInError::InvalidSignature)?;
+    match &signature {
+        UserSignature::ZkLogin(zklogin) => Ok(SignInCheck::AskNode {
+            candidates: zklogin.derive_address().map(|a| a.to_string()).collect(),
+        }),
+        UserSignature::Passkey(passkey) => Ok(SignInCheck::AskNode {
+            candidates: vec![passkey.derive_address().to_string()],
+        }),
+        _ => verify_sign_in_signature(message, encoded).map(SignInCheck::Verified),
+    }
+}
+
 fn verify_simple(
     digest: &[u8],
     signature: &sui_sdk_types::SimpleSignature,

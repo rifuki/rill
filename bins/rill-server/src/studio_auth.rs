@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use rill_auth::{
-    siws::{build_sign_in_message, verify_sign_in_signature, SignInMessage},
+    siws::{build_sign_in_message, check_sign_in_signature, SignInCheck, SignInMessage},
     tokens::{random_id, sign_token, TokenClaims, TokenKind},
 };
 use rill_store::{AuthorizationCode, AuthorizationRequest, OAuthStore, RequestKind};
@@ -109,7 +109,9 @@ pub async fn wallet_token(
         &input.challenge_id,
         &input.signature,
         RequestKind::Studio,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -174,7 +176,9 @@ pub async fn complete_consent(
         &input.request_id,
         &input.signature,
         RequestKind::Agent,
-    ) {
+    )
+    .await
+    {
         Ok(result) => result,
         Err(response) => return *response,
     };
@@ -232,7 +236,7 @@ fn missing_request() -> Response {
 
 // Verify before consuming so a cancelled or incorrect wallet signature can be retried. The
 // atomic take after verification prevents concurrent submissions from issuing two credentials.
-fn complete(
+async fn complete(
     state: &AppState,
     id: &str,
     signature: &str,
@@ -243,13 +247,38 @@ fn complete(
         .get_request(id.trim(), now_ms())
         .filter(|request| request.kind == kind)
         .ok_or_else(missing_request)?;
-    let address = verify_sign_in_signature(&pending.message, signature).map_err(|error| {
-        oauth_err(
+    let rejected = |reason: String| {
+        Box::new(oauth_err(
             StatusCode::UNAUTHORIZED,
             "invalid_signature",
-            error.to_string(),
-        )
-    })?;
+            reason,
+        ))
+    };
+    let address = match check_sign_in_signature(&pending.message, signature) {
+        Ok(SignInCheck::Verified(address)) => address,
+        // zkLogin and passkey: the node verifies, against addresses derived from the signature
+        // itself. Nothing the caller states about who they are takes part.
+        Ok(SignInCheck::AskNode { candidates }) => {
+            use rill_chain::{SignatureCheck, SuiRead as _};
+            let mut verified = None;
+            for candidate in candidates {
+                if let Ok(SignatureCheck::Valid) = state
+                    .chain
+                    .verify_personal_message(
+                        pending.message.as_bytes(),
+                        signature.trim(),
+                        &candidate,
+                    )
+                    .await
+                {
+                    verified = Some(candidate);
+                    break;
+                }
+            }
+            verified.ok_or_else(|| rejected("Signature verification failed.".into()))?
+        }
+        Err(error) => return Err(rejected(error.to_string())),
+    };
     let request = state
         .oauth
         .take_request(id.trim(), now_ms())
