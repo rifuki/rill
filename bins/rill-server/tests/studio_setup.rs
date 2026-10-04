@@ -54,6 +54,44 @@ fn object(chain: FakeSui, id: &str, kind: &str, fields: Value, owner: Option<&st
 fn chain(balance: &str, owner: &str, agent: &str) -> FakeSui {
     chain_seeing_wallet_after(0, balance, owner, agent)
 }
+
+#[tokio::test]
+async fn single_swap_runtime_default_fits_the_owner_allocation() {
+    let mut published = skill();
+    published.flow["nodes"] = json!([{"id":"swap","type":"cetus_swap","config":{
+        "pool":"0x123","amount_in":"100000000","inputCoinType":"0x2::sui::SUI","min_amount_out":"1"
+    }}]);
+    let mut input = body();
+    input["budgetMist"] = json!("7500000");
+    input["perTxMist"] = json!("5000000");
+    let c = object(
+        chain("0", "0x1", "0x2"),
+        "0x123",
+        "0x3::pool::Pool<0x2::sui::SUI,0x3::usdc::USDC>",
+        json!({}),
+        None,
+    );
+    let c = object(
+        c,
+        deployments::TESTNET_CETUS_GLOBAL_CONFIG,
+        "0x3::config::GlobalConfig",
+        json!({}),
+        None,
+    );
+    let result = attach_plan(&input, &published, &addr("0x1"), &context(), &c)
+        .await
+        .unwrap();
+    assert_eq!(result["runSet"]["declaredSpendBaseUnits"], "5000000");
+    assert_eq!(
+        result["buildArguments"]["params"]["swap"]["amount_in"],
+        "5000000"
+    );
+    assert_eq!(
+        published.flow["nodes"][0]["config"]["amount_in"],
+        "100000000"
+    );
+    assert_eq!(published.flow["nodes"][0]["config"]["min_amount_out"], "1");
+}
 fn chain_listing_cap_after(listings: usize) -> FakeSui {
     lagging_chain(0, listings, "0", "0x1", "0x2")
 }

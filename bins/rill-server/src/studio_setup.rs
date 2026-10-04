@@ -221,6 +221,29 @@ fn grant(
             }
         }
     }
+    let actions: Vec<_> = flow
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !matches!(node.kind.as_str(), "ptb" | "guardrail"))
+        .map(|(index, _)| index)
+        .collect();
+    if actions.len() == 1 && flow.nodes[actions[0]].kind == "cetus_swap" {
+        let node = &mut flow.nodes[actions[0]];
+        let requested = node
+            .inputs
+            .as_ref()
+            .and_then(|v| v.get("amount_in"))
+            .or_else(|| node.config.as_ref().and_then(|v| v.get("amount_in")))
+            .and_then(Value::as_str)
+            .ok_or("swap amount_in must be an exact base-unit string")?;
+        let default = parse_u64_string(requested)
+            .map_err(err)?
+            .min(per_tx)
+            .min(budget - reserve);
+        // Runtime amount is owner-bounded; the immutable publication and output floor stay intact.
+        set_node_value(node, "amount_in", json!(default.to_string()))?;
+    }
     Ok(Grant {
         owner: sender,
         agent,
@@ -701,11 +724,22 @@ async fn bind(
         .flow
         .nodes
         .iter()
-        .filter(|node| node.kind == "deepbook_limit_order")
+        .filter(|node| matches!(node.kind.as_str(), "deepbook_limit_order" | "cetus_swap"))
         .map(|node| {
             let mut values = serde_json::Map::new();
-            for key in ["balanceManagerId", "tradeCapId", "depositCapId", "price"] {
-                if let Some(value) = node.config.as_ref().and_then(|config| config.get(key)) {
+            for key in [
+                "balanceManagerId",
+                "tradeCapId",
+                "depositCapId",
+                "price",
+                "amount_in",
+            ] {
+                if let Some(value) = node
+                    .inputs
+                    .as_ref()
+                    .and_then(|inputs| inputs.get(key))
+                    .or_else(|| node.config.as_ref().and_then(|config| config.get(key)))
+                {
                     values.insert(key.into(), value.clone());
                 }
             }
