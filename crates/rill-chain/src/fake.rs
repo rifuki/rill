@@ -53,6 +53,8 @@ impl Default for SimulationBehavior {
 struct State {
     /// Per-object countdown of reads that must answer `not found` first.
     not_yet_indexed: HashMap<String, usize>,
+    /// Ids an owner listing leaves out for this many more listings, then includes.
+    not_yet_listed: HashMap<String, usize>,
     objects: HashMap<String, ObjectSummary>,
     /// Per-object reference an owner listing reports instead of the current one: the index behind
     /// `list_owned_objects` trailing the ledger behind `get_object`.
@@ -83,6 +85,7 @@ impl Default for State {
         Self {
             objects: HashMap::new(),
             not_yet_indexed: HashMap::new(),
+            not_yet_listed: HashMap::new(),
             listed_behind: HashMap::new(),
             owned: HashMap::new(),
             dynamic_fields: HashMap::new(),
@@ -175,6 +178,18 @@ impl FakeSui {
         let id = object.reference.id.clone();
         let chain = self.with_object(owner, object);
         chain.state.borrow_mut().not_yet_indexed.insert(id, reads);
+        chain
+    }
+
+    /// An owned object that owner listings leave out the next `listings` times, while `get_object`
+    /// already answers for it.
+    ///
+    /// The ownership index is the slowest read to catch up: on testnet, onboarding's next request
+    /// found the new wallet but not, yet, the capability in its agent's list.
+    pub fn with_listing_after(self, listings: usize, owner: &str, object: ObjectSummary) -> Self {
+        let id = object.reference.id.clone();
+        let chain = self.with_object(Some(owner), object);
+        chain.state.borrow_mut().not_yet_listed.insert(id, listings);
         chain
     }
 
@@ -284,11 +299,21 @@ impl SuiRead for FakeSui {
     }
 
     async fn list_owned_objects(&self, owner: &str) -> ChainResult<Vec<ObjectSummary>> {
-        let s = self.state.borrow();
+        let mut s = self.state.borrow_mut();
+        let hidden: Vec<String> = s
+            .not_yet_listed
+            .iter_mut()
+            .filter(|(_, remaining)| **remaining > 0)
+            .map(|(id, remaining)| {
+                *remaining -= 1;
+                id.clone()
+            })
+            .collect();
         Ok(s.owned
             .get(owner)
             .map(|ids| {
                 ids.iter()
+                    .filter(|id| !hidden.contains(id))
                     .filter_map(|id| {
                         let mut object = s.objects.get(id).cloned()?;
                         if let Some(behind) = s.listed_behind.get(id) {

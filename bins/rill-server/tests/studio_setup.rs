@@ -52,6 +52,24 @@ fn object(chain: FakeSui, id: &str, kind: &str, fields: Value, owner: Option<&st
     )
 }
 fn chain(balance: &str, owner: &str, agent: &str) -> FakeSui {
+    chain_seeing_wallet_after(0, balance, owner, agent)
+}
+fn chain_listing_cap_after(listings: usize) -> FakeSui {
+    lagging_chain(0, listings, "0", "0x1", "0x2")
+}
+/// The same chain, with a node that answers "not found" for the wallet `reads` times first: the
+/// owner's create landed through another fullnode and this one has not indexed it yet.
+fn chain_seeing_wallet_after(reads: usize, balance: &str, owner: &str, agent: &str) -> FakeSui {
+    lagging_chain(reads, 0, balance, owner, agent)
+}
+fn lagging_chain(
+    wallet_reads: usize,
+    cap_listings: usize,
+    balance: &str,
+    owner: &str,
+    agent: &str,
+) -> FakeSui {
+    let reads = wallet_reads;
     let chain = object(
         FakeSui::new(),
         deployments::TESTNET_AGENT_WALLET_VERSION,
@@ -59,25 +77,41 @@ fn chain(balance: &str, owner: &str, agent: &str) -> FakeSui {
         json!({}),
         None,
     );
-    let chain = object(
-        chain,
-        "0x10",
-        &format!(
-            "{}::agent_wallet::AgentWallet<0x2::sui::SUI>",
-            deployments::TESTNET_AGENT_WALLET
-        ),
-        json!({"owner":owner,"agent":agent,"cap_id":"0x11","budget":balance,"spent":"0","policy":{"rules":{"contents":[]}},"revoked":false,"expires_at_ms":"1000000"}),
+    let chain = chain.with_object_after(
+        reads,
         None,
+        ObjectSummary {
+            reference: ObjectRef {
+                id: addr("0x10"),
+                version: 17,
+                digest: sui_sdk_types::Digest::ZERO.to_string(),
+            },
+            object_type: Some(format!(
+                "{}::agent_wallet::AgentWallet<0x2::sui::SUI>",
+                deployments::TESTNET_AGENT_WALLET
+            )),
+            fields: Some(
+                json!({"owner":owner,"agent":agent,"cap_id":"0x11","budget":balance,"spent":"0","policy":{"rules":{"contents":[]}},"revoked":false,"expires_at_ms":"1000000"}),
+            ),
+            shared_initial_version: Some(7),
+        },
     );
-    let chain = object(
-        chain,
-        "0x11",
-        &format!(
-            "{}::agent_wallet::AgentCap",
-            deployments::TESTNET_AGENT_WALLET
-        ),
-        json!({"wallet":"0x10"}),
-        Some(&addr(agent)),
+    let chain = chain.with_listing_after(
+        cap_listings,
+        &addr(agent),
+        ObjectSummary {
+            reference: ObjectRef {
+                id: addr("0x11"),
+                version: 17,
+                digest: sui_sdk_types::Digest::ZERO.to_string(),
+            },
+            object_type: Some(format!(
+                "{}::agent_wallet::AgentCap",
+                deployments::TESTNET_AGENT_WALLET
+            )),
+            fields: Some(json!({"wallet":"0x10"})),
+            shared_initial_version: None,
+        },
     );
     let chain = object(
         chain,
@@ -119,6 +153,35 @@ async fn prepare_creates_an_empty_wallet_with_version() {
         matches!(&commands[1],Command::MoveCall(c) if c.function.as_str()=="create_wallet" && c.arguments.len()==4)
     );
     assert!(!commands.iter().any(|c| matches!(c, Command::SplitCoins(_))));
+}
+/// Found by the end-to-end run on testnet: the attach request arrived before this server's node had
+/// seen the wallet the owner had just created, and was refused as "not found on chain".
+#[tokio::test]
+async fn attach_waits_for_a_wallet_the_node_has_not_indexed_yet() {
+    let result = attach_plan(
+        &body(),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &chain_seeing_wallet_after(3, "0", "0x1", "0x2"),
+    )
+    .await
+    .expect("a wallet that appears within the wait is attached");
+    assert!(result["attachPtb"].is_string());
+}
+/// The next lag the same run met: the wallet was readable, the agent's capability not yet in the
+/// agent's owner listing.
+#[tokio::test]
+async fn attach_waits_for_a_capability_the_owner_index_has_not_listed_yet() {
+    attach_plan(
+        &body(),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &chain_listing_cap_after(3),
+    )
+    .await
+    .expect("a capability listed within the wait is accepted");
 }
 #[tokio::test]
 async fn attach_places_all_rules_before_funding_and_exports_exact_runset() {

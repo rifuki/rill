@@ -265,6 +265,29 @@ async fn shared(
     );
     Ok(object)
 }
+/// [`shared`], for a wallet the owner created moments ago.
+///
+/// The owner's wallet submits through its own fullnode, and ours may not have seen the result yet:
+/// on testnet the very next request answered "not found on chain" for a wallet whose creation had
+/// already succeeded. Only absence is waited out, and only briefly; every other error, and an id
+/// that never appears, is still a refusal.
+async fn shared_once_visible(
+    chain: &impl SuiRead,
+    objects: &mut SharedObjects,
+    id: Address,
+) -> Result<ObjectSummary, String> {
+    for _ in 0..FRESH_OBJECT_ATTEMPTS {
+        match chain.get_object(&id.to_string()).await {
+            Err(rill_chain::ChainError::NotFound(_)) => {
+                tokio::time::sleep(FRESH_OBJECT_PAUSE).await;
+            }
+            _ => return shared(chain, objects, id).await,
+        }
+    }
+    shared(chain, objects, id).await
+}
+const FRESH_OBJECT_ATTEMPTS: usize = 20;
+const FRESH_OBJECT_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 async fn builder(owner: Address, chain: &impl SuiRead) -> Result<TransactionBuilder, String> {
     let mut tx = TransactionBuilder::new();
     tx.set_sender(owner);
@@ -353,20 +376,35 @@ fn chain_amount(fields: &Value, key: &str) -> Result<u64, String> {
         _ => Err(format!("wallet {key} is missing")),
     }
 }
+/// `fresh`: the capability was minted moments ago, by a transaction this node's ownership index
+/// may not have caught up with, so its absence from the agent's list is waited out before it is a
+/// refusal. The end-to-end run on testnet met exactly this one request after the wallet itself.
 async fn check_owned_cap(
     chain: &impl SuiRead,
     agent: Address,
     id: Address,
     expected_type: &str,
+    fresh: bool,
 ) -> Result<ObjectSummary, String> {
-    let owned = chain
-        .list_owned_objects(&agent.to_string())
-        .await
-        .map_err(err)?;
-    if !owned
-        .iter()
-        .any(|o| address(&o.reference.id).ok() == Some(id))
-    {
+    let attempts = if fresh { FRESH_OBJECT_ATTEMPTS } else { 1 };
+    let mut owned_by_agent = false;
+    for attempt in 0..attempts {
+        let owned = chain
+            .list_owned_objects(&agent.to_string())
+            .await
+            .map_err(err)?;
+        if owned
+            .iter()
+            .any(|o| address(&o.reference.id).ok() == Some(id))
+        {
+            owned_by_agent = true;
+            break;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(FRESH_OBJECT_PAUSE).await;
+        }
+    }
+    if !owned_by_agent {
         return Err(format!("agent does not own capability {id}"));
     }
     let cap = chain.get_object(&id.to_string()).await.map_err(err)?;
@@ -413,7 +451,11 @@ async fn bind(
     let wallet_id = address(required(body, "walletId")?)?;
     let cap_id = address(required(body, "agentCapId")?)?;
     let mut objects = SharedObjects::new();
-    let wallet = shared(chain, &mut objects, wallet_id).await?;
+    let wallet = if fresh {
+        shared_once_visible(chain, &mut objects, wallet_id).await?
+    } else {
+        shared(chain, &mut objects, wallet_id).await?
+    };
     let expected = canonical_type(&format!(
         "{}::agent_wallet::AgentWallet<{}>",
         context
@@ -480,6 +522,7 @@ async fn bind(
                 .as_deref()
                 .unwrap_or(&package.to_string())
         ),
+        fresh,
     )
     .await?;
     if cap
@@ -534,6 +577,7 @@ async fn bind(
                 grant.agent,
                 id,
                 &format!("{defining_package}::balance_manager::{kind}"),
+                fresh,
             )
             .await?;
             if cap
