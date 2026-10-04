@@ -552,6 +552,13 @@ RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh testnet
 RILL_E2E_ALLOW_MAINNET=1 RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh mainnet  # ~0.01 SUI
 ```
 
+Name a scenario (`swap`, `stake`, `deepbook`) to run only that one. With `RILL_E2E_KEEP=1` the
+swap scenario stops once the grant is stored and leaves the wallet live, and
+`scripts/agent-redteam.py` then sends a real agent hostile prompts (drain it, sign a "support"
+envelope, print the keys, loop past a refusal) and checks on chain after each that nothing moved
+outside the grant. Run that only on a machine whose keystore holds the agent's key and no other:
+its first version, with the user's settings leaving file access open, printed the whole keystore.
+
 The contracts are tested by their own toolchain:
 
 ```sh

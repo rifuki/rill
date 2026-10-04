@@ -2,25 +2,33 @@
 #
 # The whole owner-to-agent flow against a live network, in one command that cleans up after itself.
 #
-#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet]
+#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook]
 #
 # Builds the server and the signer, starts a throwaway server on a free loopback port with its own
-# stores, runs `bins/rill/tests/e2e_live.rs` against it, and stops the server whatever happened.
+# stores, runs the scenarios in `bins/rill/tests/e2e_live.rs` against it one after another (they
+# share the owner's key, so never in parallel), and stops the server whatever happened. Name a
+# scenario to run only that one.
 # The owner and the agent are both keys in the local Sui keystore, so no step waits on a wallet
 # popup; the test revokes the wallet it funded even when a step fails.
 #
 # RILL_E2E_WALLET_BIN runs the agent side on another signer binary, such as the release the plugin
 # launcher downloaded, instead of the one just built.
 #
-# Mainnet spends real SUI (a 0.005 SUI swap plus gas, the rest of the 0.0075 SUI budget comes back
-# on revoke) and needs RILL_E2E_ALLOW_MAINNET=1. Receipts land in the run directory printed at the
-# end, as e2e-receipts.json.
+# Mainnet spends real SUI and needs RILL_E2E_ALLOW_MAINNET=1: the swap turns 0.005 SUI into USDC, the
+# stake turns 1 SUI into haSUI held by the agent, and the DeepBook ask rests above the market until
+# the owner cancels it and withdraws its 1.1 SUI. Every wallet's remainder comes back on revoke.
+# Receipts land in the run directory printed at the end, one e2e-<scenario>-receipts.json each.
 set -euo pipefail
 
 network="${1:-testnet}"
+scenario="${2:-}"
 case "$network" in
   testnet | mainnet) ;;
-  *) echo "usage: scripts/e2e.sh [testnet|mainnet]" >&2; exit 2 ;;
+  *) echo "usage: scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook]" >&2; exit 2 ;;
+esac
+case "$scenario" in
+  "" | swap | stake | deepbook) ;;
+  *) echo "unknown scenario: $scenario (swap, stake or deepbook)" >&2; exit 2 ;;
 esac
 : "${RILL_E2E_OWNER:?set RILL_E2E_OWNER to the owner address in the local Sui keystore}"
 : "${RILL_E2E_AGENT:?set RILL_E2E_AGENT to the agent address in the local Sui keystore}"
@@ -63,8 +71,9 @@ done
 status=0
 RILL_E2E_NETWORK="$network" RILL_E2E_API="$api" RILL_E2E_DIR="$run_dir" \
   RILL_E2E_WALLET_BIN="${RILL_E2E_WALLET_BIN:-$root/target/debug/rill-wallet}" \
-  cargo test --locked -q -p rill --test e2e_live -- --ignored --nocapture || status=$?
+  cargo test --locked -q -p rill --test e2e_live -- --ignored --nocapture --test-threads=1 \
+  ${scenario:+"${scenario}_"} || status=$?
 
 echo
-echo "run directory: $run_dir (server.log, e2e-receipts.json)"
+echo "run directory: $run_dir (server.log, e2e-*-receipts.json)"
 exit "$status"
