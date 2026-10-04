@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rill_chain::{fake::FakeSui, ObjectRef, ObjectSummary};
 use rill_core::envelope::Network;
 use rill_ptb::deployments;
-use rill_server::studio_setup::{attach_plan, prepare_plan, SetupContext};
+use rill_server::studio_setup::{attach_plan, prepare_plan, recovery_plan, SetupContext};
 use rill_store::PublishedSkill;
 use serde_json::{json, Value};
 use sui_sdk_types::{Address, Command, TransactionKind};
@@ -677,4 +677,228 @@ fn mainnet_never_falls_back_to_testnet_wallet_ids() {
         Some(deployments::TESTNET_AGENT_WALLET_VERSION)
     )
     .is_err());
+}
+
+mod recovery {
+    use super::*;
+    use rill_ptb::registry::{pool_spec, DeepBookNetwork};
+
+    fn published() -> PublishedSkill {
+        let mut value = skill();
+        value.flow["nodes"] =
+            json!([{"id":"order","type":"deepbook_limit_order","config":{"poolKey":"SUI_DBUSDC"}}]);
+        value
+    }
+    fn input() -> Value {
+        json!({"sender":"0x1","walletId":"0x10","balanceManagerId":"0x20","receiver":"0x9"})
+    }
+    fn manager_chain(owner: &str) -> FakeSui {
+        let c = object(
+            chain("0", "0x1", "0x2"),
+            "0x20",
+            &format!(
+                "{}::balance_manager::BalanceManager",
+                deployments::TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE
+            ),
+            json!({"owner":addr(owner)}),
+            None,
+        );
+        let pool = pool_spec(DeepBookNetwork::Testnet, "SUI_DBUSDC").unwrap();
+        object(
+            c,
+            &pool.pool_id.to_string(),
+            "0x3::pool::Pool<0x2::sui::SUI,0x3::usdc::USDC>",
+            json!({}),
+            None,
+        )
+    }
+    fn ptb(value: Value) -> sui_sdk_types::ProgrammableTransaction {
+        let bytes = STANDARD
+            .decode(value["recoveryPtb"].as_str().unwrap())
+            .unwrap();
+        let TransactionKind::ProgrammableTransaction(ptb) = bcs::from_bytes(&bytes).unwrap() else {
+            panic!("not a PTB")
+        };
+        ptb
+    }
+
+    #[tokio::test]
+    async fn cancels_orders_withdraws_both_assets_and_revokes_to_the_owner() {
+        let c = manager_chain("0x1");
+        let value = recovery_plan(&input(), &published(), &addr("0x1"), &context(), &c)
+            .await
+            .unwrap();
+        assert_eq!(value["submitted"], false);
+        assert!(c.submitted().is_empty());
+        let ptb = ptb(value);
+        let calls: Vec<_> = ptb
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::MoveCall(call) => Some(call.function.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "generate_proof_as_owner",
+                "cancel_all_orders",
+                "withdraw_all",
+                "withdraw_all",
+                "revoke"
+            ]
+        );
+        let Command::TransferObjects(transfer) = ptb.commands.last().unwrap() else {
+            panic!("missing owner settlement")
+        };
+        let sui_sdk_types::Argument::Input(index) = transfer.address else {
+            panic!("recipient must be a pure owner address")
+        };
+        let sui_sdk_types::Input::Pure(bytes) = &ptb.inputs[index as usize] else {
+            panic!("recipient is not pure")
+        };
+        assert_eq!(
+            bcs::from_bytes::<Address>(bytes).unwrap(),
+            "0x1".parse::<Address>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_manager_owned_by_another_wallet() {
+        let error = recovery_plan(
+            &input(),
+            &published(),
+            &addr("0x1"),
+            &context(),
+            &manager_chain("0x9"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("balance manager owner"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_vault_owned_by_another_wallet() {
+        let c = object(
+            manager_chain("0x1"),
+            "0x10",
+            &format!(
+                "{}::agent_wallet::AgentWallet<0x2::sui::SUI>",
+                deployments::TESTNET_AGENT_WALLET
+            ),
+            json!({"owner":addr("0x9"),"revoked":false}),
+            None,
+        );
+        let error = recovery_plan(&input(), &published(), &addr("0x1"), &context(), &c)
+            .await
+            .unwrap_err();
+        assert!(error.contains("wallet owner"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_already_revoked_vault_can_still_recover_its_manager() {
+        let c = object(
+            manager_chain("0x1"),
+            "0x10",
+            &format!(
+                "{}::agent_wallet::AgentWallet<0x2::sui::SUI>",
+                deployments::TESTNET_AGENT_WALLET
+            ),
+            json!({"owner":addr("0x1"),"revoked":true}),
+            None,
+        );
+        let ptb = ptb(
+            recovery_plan(&input(), &published(), &addr("0x1"), &context(), &c)
+                .await
+                .unwrap(),
+        );
+        assert!(!ptb
+            .commands
+            .iter()
+            .any(|c| matches!(c,Command::MoveCall(call) if call.function.as_str()=="revoke")));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_foreign_action_before_chain_access() {
+        let error = recovery_plan(
+            &input(),
+            &published(),
+            &addr("0x9"),
+            &context(),
+            &FakeSui::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("action's owner"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn refuses_unrecognized_manager_types() {
+        let c = object(
+            manager_chain("0x1"),
+            "0x20",
+            "0x9::fake::BalanceManager",
+            json!({"owner":addr("0x1")}),
+            None,
+        );
+        let error = recovery_plan(&input(), &published(), &addr("0x1"), &context(), &c)
+            .await
+            .unwrap_err();
+        assert!(error.contains("manager type"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_pool_nodes_cancel_and_withdraw_only_once() {
+        let mut value = published();
+        value.flow["nodes"].as_array_mut().unwrap().push(
+            json!({"id":"second","type":"deepbook_limit_order","config":{"poolKey":"SUI_DBUSDC"}}),
+        );
+        let ptb = ptb(recovery_plan(
+            &input(),
+            &value,
+            &addr("0x1"),
+            &context(),
+            &manager_chain("0x1"),
+        )
+        .await
+        .unwrap());
+        let cancellations = ptb.commands.iter().filter(|c| matches!(c, Command::MoveCall(call) if call.function.as_str()=="cancel_all_orders")).count();
+        assert_eq!(cancellations, 1);
+        let withdrawals = ptb
+            .commands
+            .iter()
+            .filter(
+                |c| matches!(c, Command::MoveCall(call) if call.function.as_str()=="withdraw_all"),
+            )
+            .count();
+        assert_eq!(withdrawals, 2);
+    }
+
+    #[tokio::test]
+    async fn input_pool_selection_matches_the_compiler_precedence() {
+        let mut value = published();
+        value.flow["nodes"][0]["config"]["poolKey"] = json!("invalid");
+        value.flow["nodes"][0]["inputs"] = json!({"poolKey":"SUI_DBUSDC"});
+        assert!(recovery_plan(
+            &input(),
+            &value,
+            &addr("0x1"),
+            &context(),
+            &manager_chain("0x1")
+        )
+        .await
+        .is_ok());
+        value.flow["nodes"][0]["inputs"] = json!({"poolKey":"invalid"});
+        assert!(recovery_plan(
+            &input(),
+            &value,
+            &addr("0x1"),
+            &context(),
+            &manager_chain("0x1")
+        )
+        .await
+        .unwrap_err()
+        .contains("unknown DeepBook pool"));
+    }
 }

@@ -7,6 +7,9 @@ pub async fn prepare(State(state): State<AppState>, headers: HeaderMap, body: By
 pub async fn attach(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     handle(state, headers, body, SetupAction::Attach).await
 }
+pub async fn recover(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    handle(state, headers, body, SetupAction::Recover).await
+}
 pub async fn preview_setup(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -26,6 +29,7 @@ enum SetupAction {
     Preview,
     Prepare,
     Attach,
+    Recover,
 }
 async fn handle(state: AppState, headers: HeaderMap, body: Bytes, action: SetupAction) -> Response {
     let body = match studio_api::parse_body(&body) {
@@ -46,6 +50,11 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, action: SetupA
     let Some(skill) = body["skillId"].as_str().and_then(|id| state.skills.get(id)) else {
         return api_err_typed(StatusCode::NOT_FOUND, "Skill not found", "NotFound");
     };
+    if matches!(action, SetupAction::Recover) {
+        if let Err(error) = recovery::recovery_owner(&body, &skill, &owner) {
+            return studio_api::invalid(error);
+        }
+    }
     if matches!(action, SetupAction::Options) {
         return match setup_defaults(&skill, &owner) {
             Ok(value) => api_ok(value),
@@ -65,6 +74,9 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, action: SetupA
         }
         SetupAction::Attach => {
             attach_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
+        }
+        SetupAction::Recover => {
+            recovery_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
         }
         SetupAction::Prepare => {
             prepare_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await

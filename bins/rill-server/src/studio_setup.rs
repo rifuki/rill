@@ -2,6 +2,7 @@
 mod defaults;
 mod http;
 mod preview;
+mod recovery;
 use crate::{
     envelope::{api_err_typed, api_ok},
     state::AppState,
@@ -16,7 +17,8 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 pub use defaults::setup_defaults;
-pub use http::{attach, prepare, preview_setup, setup_options};
+pub use http::{attach, prepare, preview_setup, recover, setup_options};
+pub use recovery::recovery_plan;
 use rill_chain::{ObjectSummary, SuiRead};
 use rill_core::{
     amounts::parse_u64_string,

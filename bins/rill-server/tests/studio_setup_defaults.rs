@@ -136,3 +136,41 @@ async fn options_route_is_owner_authenticated_and_does_not_require_chain_access(
     assert_eq!(status, StatusCode::OK, "{value}");
     assert_eq!(value["data"]["budgetMist"], "15000000");
 }
+
+#[tokio::test]
+async fn recovery_requires_owner_login_before_reading_chain() {
+    let response = routes::router(state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/setup/recover")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn recovery_refuses_another_owners_action_before_resolving_packages() {
+    let mut state = state();
+    std::sync::Arc::get_mut(&mut state.config)
+        .unwrap()
+        .sui_rpc_url = "https://must-not-contact.invalid".into();
+    let mut published = skill();
+    published.flow["nodes"] =
+        json!([{"id":"order","type":"deepbook_limit_order","config":{"poolKey":"SUI_DBUSDC"}}]);
+    state.skills.save(published).unwrap();
+    let bearer = token(&state, "0x9", "rill_studio");
+    let (status, value) = call(
+        &state,
+        "/api/setup/recover",
+        Some(&bearer),
+        json!({"skillId":"skill_swap","sender":"0x9","walletId":"0x10","balanceManagerId":"0x20"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert!(value.to_string().contains("action's owner"));
+}
