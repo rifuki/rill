@@ -60,6 +60,21 @@ fn is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
+/// Returning drops the set and cancels unused connection attempts.
+async fn first_connection(
+    mut attempts: tokio::task::JoinSet<std::io::Result<TcpStream>>,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = std::io::Error::other("DNS returned no usable addresses");
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = error,
+            Err(error) => last_error = std::io::Error::other(error),
+        }
+    }
+    Err(last_error)
+}
+
 async fn send(
     method: Method,
     url: &str,
@@ -105,7 +120,16 @@ async fn send(
         .body(Full::new(Bytes::from(body.unwrap_or_default())))
         .map_err(|e| e.to_string())?;
 
-    let tcp = TcpStream::connect((host.trim_matches(|c| c == '[' || c == ']'), port))
+    // DNS can contain an unreachable IPv6 address before a working IPv4 one.
+    // Race transport connections, then send the request only on the first success.
+    let addresses = tokio::net::lookup_host((host.trim_matches(|c| c == '[' || c == ']'), port))
+        .await
+        .map_err(|e| format!("resolving {host}:{port}: {e}"))?;
+    let mut attempts = tokio::task::JoinSet::new();
+    for address in addresses {
+        attempts.spawn(TcpStream::connect(address));
+    }
+    let tcp = first_connection(attempts)
         .await
         .map_err(|e| format!("connecting to {host}:{port}: {e}"))?;
     let (status, bytes) = if https {
@@ -238,5 +262,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("plain http"), "{error}");
+    }
+    #[tokio::test]
+    #[ignore = "read-only production API; requires network"]
+    async fn production_api_connects_without_waiting_for_broken_ipv6() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            get_json("https://api.rill.rifuki.dev/health"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reachable IPv4 must not wait behind a stalled IPv6 address"
+        );
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_or_failed_address_cannot_hide_a_reachable_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut attempts = tokio::task::JoinSet::new();
+        attempts.spawn(std::future::pending::<std::io::Result<TcpStream>>());
+        attempts.spawn(async { Err(std::io::Error::other("unreachable address")) });
+        attempts.spawn(TcpStream::connect(listener.local_addr().unwrap()));
+        let connected = tokio::time::timeout(Duration::from_secs(1), first_connection(attempts))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            connected.peer_addr().unwrap(),
+            listener.local_addr().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_addresses_or_all_failures_return_an_error() {
+        assert!(first_connection(tokio::task::JoinSet::new()).await.is_err());
+        let mut attempts = tokio::task::JoinSet::new();
+        attempts.spawn(async { Err(std::io::Error::other("refused")) });
+        assert!(first_connection(attempts)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("refused"));
     }
 }
