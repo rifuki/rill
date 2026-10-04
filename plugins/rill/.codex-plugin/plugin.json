@@ -1,6 +1,6 @@
 {
   "name": "rill",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "An agent wallet on Sui whose limits are a Move contract: read them, quote, swap and spend inside them.",
   "author": {
     "name": "rifuki"
