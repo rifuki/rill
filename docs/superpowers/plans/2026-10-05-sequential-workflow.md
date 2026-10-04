@@ -32,6 +32,6 @@ Files: `rill-frontend/src/lib/agent-workflow.ts`, its test, `rill-frontend/src/c
 
 ## Task 3: Deliver
 
-- [ ] Update the agent skill with no retries, no automatic reinvestment, and receipt inspection guidance.
-- [ ] Validate a combined workflow through MCP using isolated test fixtures and refusal paths against production grants. Do not claim another real three-step mainnet execution unless fresh approved grants exist.
-- [ ] Commit only owned files, deploy frontend to both hosts, install the locally built signer without altering its key/config, and record evidence in `_handoff/journey.md`.
+- [x] Update the agent skill with no retries, no automatic reinvestment, and receipt inspection guidance.
+- [x] Validate a combined workflow through MCP using isolated test fixtures and refusal paths against production grants. Do not claim another real three-step mainnet execution unless fresh approved grants exist.
+- [x] Commit only owned files, deploy frontend to both hosts, install the locally built signer without altering its key/config, and record evidence in `_handoff/journey.md`.
