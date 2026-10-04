@@ -30,11 +30,11 @@ server's description of the action. Test allocations were revoked and recovered.
 
 ## Local checks
 
-- Rust workspace: 774 passed, 0 failed, 69 ignored at the recorded full run. Added production
+- Rust workspace: 775 passed, 0 failed, 70 ignored at the recorded full run. Added production
   pairing and protected-swap assertions were also run separately against the live API.
 - Move wallet: 55 passed, including protected custody, revision, pool/output checks and owner exit.
 - Cetus adapter compiled against pinned official interfaces; actual execution proven above.
-- Frontend: 179 passed; TypeScript check and production build passed.
+- Frontend: 180 passed; TypeScript check and production build passed.
 - Clippy workspace/all targets with warnings denied passed. Build-script dependency audit passed.
 - The appended gas-coin transfer regression failed before the fix and passed afterwards. The
   signer now rejects gas-coin action operands and requires MoveCall-only protected envelopes.
