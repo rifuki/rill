@@ -112,6 +112,7 @@ fn every_kind_manifest() -> CapabilityManifest {
             },
             CapabilityRule::SlippageFloor {
                 min_out_mist: "9500000".into(),
+                coin_type: None,
             },
             CapabilityRule::AssetScope {
                 allowed_coin_types: vec!["0x2::sui::SUI".into()],

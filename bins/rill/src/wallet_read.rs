@@ -718,6 +718,7 @@ mod tests {
             },
             CapabilityRule::SlippageFloor {
                 min_out_mist: "1".into(),
+                coin_type: None,
             },
         ]);
         let out = label_rules(&names(&["budget"]), Some(&local));

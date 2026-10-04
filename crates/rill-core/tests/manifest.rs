@@ -103,6 +103,7 @@ fn every_cap_declares_which_layer_holds_it() {
             },
             CapabilityRule::SlippageFloor {
                 min_out_mist: "1".into(),
+                coin_type: None,
             },
         ],
     };

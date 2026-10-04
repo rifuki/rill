@@ -66,6 +66,7 @@ fn all_rule_kinds() -> Vec<CapabilityRule> {
         },
         CapabilityRule::SlippageFloor {
             min_out_mist: "1".into(),
+            coin_type: None,
         },
         CapabilityRule::AssetScope {
             allowed_coin_types: vec!["0x2::sui::SUI".into()],

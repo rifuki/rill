@@ -65,9 +65,19 @@ pub fn ensure_narrower(
                     max_mist: a,
                 },
             ) => amount(aw)? == amount(pw)? && amount(a)? <= amount(p)?,
-            (SlippageFloor { min_out_mist: p }, SlippageFloor { min_out_mist: a }) => {
-                amount(a)? >= amount(p)?
-            }
+            // Same coin, or the comparison means nothing: a floor of 10000 USDC base units is not
+            // tighter than 1 SUI. A published coin-less floor binds every swap, so an applied one
+            // that names a coin would loosen it.
+            (
+                SlippageFloor {
+                    min_out_mist: p,
+                    coin_type: pc,
+                },
+                SlippageFloor {
+                    min_out_mist: a,
+                    coin_type: ac,
+                },
+            ) => pc == ac && amount(a)? >= amount(p)?,
             (
                 TimeWindow {
                     not_before_ms: pb,
@@ -135,6 +145,12 @@ mod tests {
                 json!({"kind":"slippage_floor","minOutMist":"10"}),
                 json!({"kind":"slippage_floor","minOutMist":"11"}),
                 json!({"kind":"slippage_floor","minOutMist":"9"}),
+            ),
+            // Moving a floor to another coin is not tightening it, whatever the numbers say.
+            (
+                json!({"kind":"slippage_floor","minOutMist":"10","coinType":"0x3::usdc::USDC"}),
+                json!({"kind":"slippage_floor","minOutMist":"11","coinType":"0x3::usdc::USDC"}),
+                json!({"kind":"slippage_floor","minOutMist":"1000","coinType":"0x2::sui::SUI"}),
             ),
             (
                 json!({"kind":"time_window","notBeforeMs":"10","notAfterMs":"20"}),

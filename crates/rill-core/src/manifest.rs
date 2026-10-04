@@ -41,8 +41,18 @@ pub enum CapabilityRule {
     ProtocolScope { allowed_packages: Vec<String> },
     /// Absolute minimum swap output, in base units — never basis points, mirroring the on-chain
     /// guard, which only ever compares against an absolute floor.
+    ///
+    /// The base units are the swap's OUTPUT coin's, not the wallet's: a SUI wallet swapping to
+    /// USDC is floored in USDC. `coin_type` names that coin, so the floor applies only to swaps that
+    /// output it and is shown in its units. Without it (manifests written before it existed) the
+    /// floor applies to every swap and is shown as plain base units, because guessing the coin is
+    /// how "0.05 SUI" came to mean 50 USDC.
     #[serde(rename_all = "camelCase")]
-    SlippageFloor { min_out_mist: String },
+    SlippageFloor {
+        min_out_mist: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        coin_type: Option<String>,
+    },
     /// Only these coin types may move.
     #[serde(rename_all = "camelCase")]
     AssetScope { allowed_coin_types: Vec<String> },
@@ -252,6 +262,10 @@ pub enum ManifestError {
         field: &'static str,
         source: AmountError,
     },
+    /// Not a `package::module::Name` coin type.
+    BadCoinType {
+        field: &'static str,
+    },
     EmptyScope {
         kind: RuleKind,
     },
@@ -278,6 +292,9 @@ impl std::fmt::Display for ManifestError {
                  zero-width or inverted window can never be satisfied"
             ),
             Self::BadAmount { field, source } => write!(f, "{field}: {source}"),
+            Self::BadCoinType { field } => {
+                write!(f, "{field}: expected a coin type like 0x2::sui::SUI")
+            }
             Self::EmptyScope { kind } => write!(
                 f,
                 "rules[{}] declares an empty scope, which makes nothing reachable. List at least \
@@ -323,8 +340,19 @@ impl CapabilityManifest {
                     u64_field(window_ms, "rules[rate_limit].windowMs")?;
                     u64_field(max_mist, "rules[rate_limit].maxMist")?;
                 }
-                CapabilityRule::SlippageFloor { min_out_mist } => {
+                CapabilityRule::SlippageFloor {
+                    min_out_mist,
+                    coin_type,
+                } => {
                     u64_field(min_out_mist, "rules[slippage_floor].minOutMist")?;
+                    if coin_type
+                        .as_deref()
+                        .is_some_and(|t| t.split("::").count() != 3)
+                    {
+                        return Err(ManifestError::BadCoinType {
+                            field: "rules[slippage_floor].coinType",
+                        });
+                    }
                 }
                 CapabilityRule::TimeWindow {
                     not_before_ms,
@@ -481,7 +509,7 @@ pub fn to_signer_policy(manifest: &CapabilityManifest) -> Result<SignerPolicy, M
             CapabilityRule::ProtocolScope { allowed_packages } => {
                 policy.allowed_packages = Some(allowed_packages.clone())
             }
-            CapabilityRule::SlippageFloor { min_out_mist } => {
+            CapabilityRule::SlippageFloor { min_out_mist, .. } => {
                 policy.min_slippage_out_mist = Some(min_out_mist.clone())
             }
             CapabilityRule::AssetScope { allowed_coin_types } => {
@@ -672,8 +700,14 @@ fn describe(rule: &CapabilityRule, coin_type: &str) -> (String, DeclarationCap) 
                 },
             )
         }
-        CapabilityRule::SlippageFloor { min_out_mist } => {
-            let value = format_amount(min_out_mist, coin_type);
+        CapabilityRule::SlippageFloor {
+            min_out_mist,
+            coin_type: output,
+        } => {
+            let value = match output {
+                Some(output) => format_amount(min_out_mist, output),
+                None => format!("{min_out_mist} base units of each swap's output coin"),
+            };
             (
                 format!("Min swap output ≥ {value}"),
                 DeclarationCap {

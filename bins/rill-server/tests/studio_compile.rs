@@ -297,6 +297,39 @@ async fn manifest_floor_cannot_be_bypassed_through_downstream_guard() {
         .to_string()
         .contains("slippage_floor"));
 }
+/// A floor names the coin it is counted in. Against a swap that outputs that coin it binds, and
+/// is reported in that coin's units; against a swap that outputs another coin it says nothing,
+/// because 101 base units of SUI and of USDC are not the same amount.
+#[tokio::test]
+async fn a_floor_binds_only_swaps_that_output_its_coin() {
+    let flow = flow(json!({"nodes":[
+        {"id":"swap","type":"cetus_swap","config":{"pool":"0x123","amount_in":"1000000000","min_amount_out":"100"}}
+    ],"edges":[]}));
+    let floor = |coin: &str| {
+        wallet_options(Some(
+            json!({"kind":"slippage_floor","minOutMist":"101","coinType":coin}),
+        ))
+    };
+    let refused = compile(&flow, &floor("0x3::usdc::USDC"), &wallet_chain())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("slippage_floor"), "{refused}");
+    assert!(
+        refused.contains("swap swap accepts as little as"),
+        "{refused}"
+    );
+
+    compile(&flow, &floor("0x2::sui::SUI"), &wallet_chain())
+        .await
+        .expect("a SUI floor says nothing about a swap that outputs USDC");
+    let met = wallet_options(Some(
+        json!({"kind":"slippage_floor","minOutMist":"100","coinType":"0x3::usdc::USDC"}),
+    ));
+    compile(&flow, &met, &wallet_chain())
+        .await
+        .expect("a floor the swap meets passes");
+}
 #[tokio::test]
 async fn deepbook_price_preserves_the_exact_base_unit() {
     let flow = flow(

@@ -244,7 +244,8 @@ pub async fn compile(
         let root_amount = match node.kind.as_str() {
             "ptb" => 0,
             "cetus_swap" => {
-                swap_floors.push(effective_floor(flow, node)?);
+                // Validated here, before any read, and recorded with its output coin below.
+                effective_floor(flow, node)?;
                 let amount = amount(node, "amount_in")?;
                 if !boolean(node, "by_amount_in", true)? {
                     return Err(error(
@@ -410,6 +411,11 @@ pub async fn compile(
                     return Err(error("inputCoinType is not in this pool"));
                 };
                 let output_type = if a2b { b.clone() } else { a.clone() };
+                swap_floors.push((
+                    node.id.clone(),
+                    effective_floor(flow, node)?,
+                    output_type.clone(),
+                ));
                 moved_types.extend([a.clone(), b.clone()]);
                 let funded = if let Some(edge) = edges.first() {
                     let coin = outputs.remove(&edge.source).ok_or_else(|| {
@@ -780,7 +786,7 @@ fn enforce_manifest(
     options: &CompileOptions,
     transaction: &Transaction,
     moved: &BTreeSet<String>,
-    floors: &[u64],
+    floors: &[(String, u64, String)],
     spend: u64,
 ) -> Result<(), CompileError> {
     let Some(wallet) = &options.agent_wallet else {
@@ -856,12 +862,26 @@ fn enforce_manifest(
                     return Err(error("recipient_allowlist refuses the sender"));
                 }
             }
-            CapabilityRule::SlippageFloor { min_out_mist } => {
+            // Compared in the swap's output coin, the only units both numbers share. A floor that
+            // names a coin binds only the swaps that output it.
+            CapabilityRule::SlippageFloor {
+                min_out_mist,
+                coin_type: floor_coin,
+            } => {
                 let min = parse_u64_string(min_out_mist).map_err(error)?;
-                if floors.iter().any(|floor| *floor < min) {
-                    return Err(error(
-                        "slippage_floor exceeds the swap's effective guard floor",
-                    ));
+                let floor_coin = floor_coin.as_deref().map(coin_type).transpose()?;
+                for (node, floor, output) in floors {
+                    if floor_coin.as_ref().is_some_and(|c| c != output) {
+                        continue;
+                    }
+                    if *floor < min {
+                        return Err(error(format!(
+                            "slippage_floor exceeds the swap's effective guard floor: swap {node} \
+                             accepts as little as {}, below the wallet's {}",
+                            format_amount(&floor.to_string(), output),
+                            format_amount(min_out_mist, output),
+                        )));
+                    }
                 }
             }
             _ => {}

@@ -14,7 +14,7 @@
       },
       "declaration": {
         "summaryLines": [
-          "Budget \u2264 5 SUI total"
+          "Budget ≤ 5 SUI total"
         ],
         "caps": [
           {
@@ -85,12 +85,12 @@
       },
       "declaration": {
         "summaryLines": [
-          "Budget \u2264 5 SUI total",
-          "Per-transaction \u2264 1 SUI",
-          "\u2264 2 SUI per 1h window",
+          "Budget ≤ 5 SUI total",
+          "Per-transaction ≤ 1 SUI",
+          "≤ 2 SUI per 1h window",
           "Time window: not before 2025-08-31T00:26:40.000Z; before 2025-09-01T00:26:40.000Z (exclusive)",
           "Only protocols: 0x000000000000000000000000000000000000000000000000000000000000dead",
-          "Min swap output \u2265 0.00099 SUI",
+          "Min swap output ≥ 990000 base units of each swap's output coin",
           "Only coins: 0x2::sui::SUI",
           "Only recipients: 0x000000000000000000000000000000000000000000000000000000000000beef"
         ],
@@ -122,7 +122,7 @@
           },
           {
             "label": "Min swap output",
-            "value": "0.00099 SUI",
+            "value": "990000 base units of each swap's output coin",
             "enforcement": "pre-flight"
           },
           {
@@ -201,7 +201,7 @@
       },
       "declaration": {
         "summaryLines": [
-          "Budget \u2264 12345 base units of 0xabc::mystery::COIN total"
+          "Budget ≤ 12345 base units of 0xabc::mystery::COIN total"
         ],
         "caps": [
           {
@@ -221,6 +221,53 @@
       ],
       "signerPolicy": {
         "maxAmountMist": "12345"
+      }
+    },
+    {
+      "name": "slippage floor in the output coin",
+      "manifest": {
+        "walletCoinType": "0x2::sui::SUI",
+        "rules": [
+          {
+            "kind": "budget",
+            "totalMist": "5000000000"
+          },
+          {
+            "kind": "slippage_floor",
+            "minOutMist": "50000",
+            "coinType": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+          }
+        ]
+      },
+      "declaration": {
+        "summaryLines": [
+          "Budget ≤ 5 SUI total",
+          "Min swap output ≥ 0.05 USDC"
+        ],
+        "caps": [
+          {
+            "label": "Budget",
+            "value": "5 SUI",
+            "enforcement": "on-chain"
+          },
+          {
+            "label": "Min swap output",
+            "value": "0.05 USDC",
+            "enforcement": "pre-flight"
+          }
+        ]
+      },
+      "onChainRuleParams": [
+        {
+          "module": "budget",
+          "config": {
+            "totalMist": "5000000000"
+          }
+        }
+      ],
+      "signerPolicy": {
+        "maxAmountMist": "5000000000",
+        "minSlippageOutMist": "50000"
       }
     }
   ]
