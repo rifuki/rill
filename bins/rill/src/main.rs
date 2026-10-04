@@ -339,7 +339,10 @@ fn status(loaded: &Loaded) -> i32 {
                 );
             }
         }
-        None => println!("  run-set: none, so execution will refuse. Set RILL_RUN_SET_PATH."),
+        None => println!(
+            "  run-set: none. Owner-signed rill_run_action remains available with a valid grant; \
+             generic rill_execute requires RILL_RUN_SET_PATH."
+        ),
     }
     i32::from(loaded.keystore.is_none())
 }
@@ -1100,7 +1103,10 @@ funded."
         }
         Some("mcp") => {
             if loaded.run_set.is_none() {
-                eprintln!("rill: no run-set configured; execution will refuse.");
+                eprintln!(
+                    "rill: no run-set configured. Owner-signed rill_run_action remains available \
+                     with a valid grant; generic rill_execute requires RILL_RUN_SET_PATH."
+                );
             }
             match &loaded.keystore {
                 Some(store) => eprintln!("rill ready: {} ({})", loaded.network, store.address()),

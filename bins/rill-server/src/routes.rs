@@ -96,6 +96,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/simulate", post(crate::studio_api::simulate))
         .route("/api/publish", post(crate::studio_api::publish))
         .route("/api/execute", post(crate::studio_api::execute))
+        .route(
+            "/api/setup/preview",
+            post(crate::studio_setup::preview_setup),
+        )
         .route("/api/setup/prepare", post(crate::studio_setup::prepare))
         .route("/api/setup/attach", post(crate::studio_setup::attach))
         .route("/api/pairing/prepare", post(crate::studio_pairing::prepare))

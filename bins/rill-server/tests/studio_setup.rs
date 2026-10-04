@@ -95,6 +95,57 @@ async fn single_swap_runtime_default_fits_the_owner_allocation() {
 fn chain_listing_cap_after(listings: usize) -> FakeSui {
     lagging_chain(0, listings, "0", "0x1", "0x2")
 }
+
+#[tokio::test]
+async fn mainnet_swap_floor_is_checked_before_wallet_creation_or_funding() {
+    let mut published = skill();
+    published.flow["nodes"] = json!([{"id":"swap","type":"cetus_swap","config":{
+        "pool":"0x123","amount_in":"100000000","min_amount_out":"10000"
+    }}]);
+    let mut input = body();
+    input["budgetMist"] = json!("15000000");
+    input["perTxMist"] = json!("10000000");
+    let mut ctx = context();
+    ctx.network = Network::Mainnet;
+    ctx.wallet_package_id = Some("0xa0".into());
+    ctx.wallet_version_id = Some("0xa2".into());
+    let quote_chain = |out: u64| {
+        object(
+            chain("0", "0x1", "0x2"),
+            "0x123",
+            "0x3::pool::Pool<0x2::sui::SUI,0x3::usdc::USDC>",
+            json!({}),
+            None,
+        )
+        .with_read_return(vec![])
+        .with_read_return(out.to_le_bytes().to_vec())
+        .with_read_return(9_975_000u64.to_le_bytes().to_vec())
+        .with_read_return(vec![0])
+        .with_read_return(25_000u64.to_le_bytes().to_vec())
+    };
+    let c = quote_chain(5_873);
+    let rejected = prepare_plan(&input, &published, &addr("0x1"), &ctx, &c)
+        .await
+        .unwrap_err();
+    assert!(
+        rejected.contains("below the published minimum"),
+        "{rejected}"
+    );
+    assert!(c.submitted().is_empty());
+    let c = quote_chain(11_746);
+    let c = object(c, "0xa2", "0xa0::version::Version", json!({}), None);
+    let prepared = prepare_plan(&input, &published, &addr("0x1"), &ctx, &c)
+        .await
+        .unwrap();
+    assert_eq!(prepared["swapPreview"]["quotedOutputBaseUnits"], "11746");
+    assert_eq!(prepared["swapPreview"]["feeBaseUnits"], "25000");
+    let c = quote_chain(5_873);
+    assert!(attach_plan(&input, &published, &addr("0x1"), &ctx, &c)
+        .await
+        .unwrap_err()
+        .contains("below the published minimum"));
+    assert!(c.submitted().is_empty());
+}
 /// The same chain, with a node that answers "not found" for the wallet `reads` times first: the
 /// owner's create landed through another fullnode and this one has not indexed it yet.
 fn chain_seeing_wallet_after(reads: usize, balance: &str, owner: &str, agent: &str) -> FakeSui {

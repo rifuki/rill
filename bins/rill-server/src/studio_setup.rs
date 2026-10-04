@@ -1,4 +1,6 @@
 //! Two-transaction Studio onboarding: create empty, then attach rules and fund atomically.
+mod http;
+mod preview;
 use crate::{
     envelope::{api_err_typed, api_ok},
     state::AppState,
@@ -12,6 +14,7 @@ use axum::{
     response::Response,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+pub use http::{attach, prepare, preview_setup};
 use rill_chain::{ObjectSummary, SuiRead};
 use rill_core::{
     amounts::parse_u64_string,
@@ -336,6 +339,8 @@ pub async fn prepare_plan(
     context: &SetupContext,
     chain: &impl SuiRead,
 ) -> Result<Value, String> {
+    let swap_preview = preview::plan(body, skill, owner, context, chain).await?;
+    preview::ensure_floor(&swap_preview)?;
     let grant = grant(body, skill, owner, context)?;
     let (package, version) = deployments::wallet_deployment(
         context.network,
@@ -395,7 +400,7 @@ pub async fn prepare_plan(
             actions.len()==1 && actions[0].kind=="cetus_swap"
         }).map(|adapter|json!({"adapterPackageId":adapter,"revision":1,"owner":grant.owner.to_string()}));
     Ok(
-        json!({"setupPtb":encode_kind(&finish(tx)?)?,"runSetTemplate":{},"requiresTradeCap":needs_manager,"walletPackageId":package.to_string(),"deepbookPackageId":deepbook.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"budgetMist":grant.budget.to_string(),"owner":grant.owner.to_string(),"agent":grant.agent.to_string(),"ownerIsAgent":grant.owner==grant.agent,"protection":protected}),
+        json!({"setupPtb":encode_kind(&finish(tx)?)?,"runSetTemplate":{},"requiresTradeCap":needs_manager,"walletPackageId":package.to_string(),"deepbookPackageId":deepbook.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"budgetMist":grant.budget.to_string(),"owner":grant.owner.to_string(),"agent":grant.agent.to_string(),"ownerIsAgent":grant.owner==grant.agent,"protection":protected,"swapPreview":swap_preview}),
     )
 }
 fn chain_amount(fields: &Value, key: &str) -> Result<u64, String> {
@@ -778,6 +783,8 @@ pub async fn attach_plan(
     context: &SetupContext,
     chain: &impl SuiRead,
 ) -> Result<Value, String> {
+    let swap_preview = preview::plan(body, skill, owner, context, chain).await?;
+    preview::ensure_floor(&swap_preview)?;
     let Binding {
         grant,
         package,
@@ -880,46 +887,6 @@ pub async fn grant_plan(
         run_set: binding.run_set,
         build_arguments: binding.build_arguments,
     })
-}
-
-pub async fn prepare(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle(state, headers, body, false).await
-}
-pub async fn attach(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle(state, headers, body, true).await
-}
-async fn handle(state: AppState, headers: HeaderMap, body: Bytes, attach: bool) -> Response {
-    let body = match studio_api::parse_body(&body) {
-        Ok(v) => v,
-        Err(e) => return *e,
-    };
-    let owner = match studio_api::owner(&state, &headers) {
-        Ok(Some(o)) => o,
-        Ok(None) => {
-            return api_err_typed(
-                StatusCode::UNAUTHORIZED,
-                "Sign in with the wallet that owns this skill",
-                "Unauthorized",
-            )
-        }
-        Err(e) => return *e,
-    };
-    let Some(skill) = body["skillId"].as_str().and_then(|id| state.skills.get(id)) else {
-        return api_err_typed(StatusCode::NOT_FOUND, "Skill not found", "NotFound");
-    };
-    let context = match setup_context(&state, &skill).await {
-        Ok(context) => context,
-        Err(e) => return *e,
-    };
-    let result = if attach {
-        attach_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
-    } else {
-        prepare_plan(&body, &skill, &owner, &context, state.chain.as_ref()).await
-    };
-    match result {
-        Ok(value) => api_ok(value),
-        Err(e) => studio_api::invalid(e),
-    }
 }
 
 /// The deployment a setup or grant for `skill` runs against: network, guard, wallet ids, and the

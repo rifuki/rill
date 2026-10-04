@@ -418,6 +418,40 @@ pub mod aborts {
                     "The prove calls did not match the wallet's live policy. Read what it actually \
                      carries rather than assuming."
                 }
+                ("agent_wallet", 12) => {
+                    "Use the wallet's owner-approved protected adapter. Generic spend is blocked; \
+                     do not bypass protection or retry through the generic spend path."
+                }
+                ("agent_wallet", 13) => {
+                    "Ask the owner to configure a protected policy before using this adapter. \
+                     Do not substitute generic spend for the protected action."
+                }
+                ("agent_wallet", 14) => {
+                    "Read the live protected policy and use its owner-approved adapter. \
+                     Changing the amount cannot authorise a different adapter."
+                }
+                ("agent_wallet", 15) => {
+                    "Read the latest policy revision and rebuild the action with a current \
+                     owner-signed grant. Do not replay stale transaction bytes or bypass protection."
+                }
+                ("agent_wallet", 16) => {
+                    "Use the pool bound by the owner's live protected policy. A different pool \
+                     requires an owner-approved policy change and a matching action grant."
+                }
+                ("agent_wallet", 17) => {
+                    "Check the fresh quote, input amount, and owner-approved minimum output floor. \
+                     The configured/requested floor must be positive and the action floor must \
+                     meet the policy floor; actual output must meet the action floor. Do not \
+                     blindly retry, lower the floor without owner approval, or bypass the protected adapter."
+                }
+                ("agent_wallet", 18) => {
+                    "Use the output asset bound by the owner's live protected policy. Changing \
+                     the output asset requires an owner-approved policy change and matching grant."
+                }
+                ("agent_wallet", 19) => {
+                    "The adapter returned more input change than was reserved. Stop execution \
+                     and inspect the adapter's settlement accounting; do not bypass settlement."
+                }
                 _ => "Nothing about the amount will change this one.",
             }
         }
@@ -487,6 +521,16 @@ pub mod aborts {
                                      the prove calls must match the wallet's live policy exactly"
             }
             ("agent_wallet", 11) => "that rule is already attached; adding rules is not idempotent",
+            ("agent_wallet", 12) => "this protected wallet blocks generic spend",
+            ("agent_wallet", 13) => "the wallet is not in protected mode",
+            ("agent_wallet", 14) => "the adapter does not match the protected policy",
+            ("agent_wallet", 15) => "the protected action uses a stale policy revision",
+            ("agent_wallet", 16) => "the pool does not match the protected policy",
+            ("agent_wallet", 17) => {
+                "the configured or actual minimum output requirement was not met"
+            }
+            ("agent_wallet", 18) => "the output asset does not match the protected policy",
+            ("agent_wallet", 19) => "the returned input change exceeds the reserved spend",
             _ => "a rule refused it",
         };
 
@@ -520,6 +564,70 @@ pub mod aborts {
             let refusal = classify_rule_abort(&error).unwrap();
             assert_eq!(refusal.module, "budget");
             assert!(refusal.to_string().contains("total budget"));
+        }
+
+        #[test]
+        fn protected_wallet_refusals_name_the_failed_constraint() {
+            for (code, expected) in [
+                (12, "generic spend"),
+                (13, "not in protected mode"),
+                (14, "adapter"),
+                (15, "policy revision"),
+                (16, "pool"),
+                (17, "minimum output"),
+                (18, "output asset"),
+                (19, "change"),
+            ] {
+                let error = PER_TX
+                    .replace("per_tx", "agent_wallet")
+                    .replace("}, 1)", &format!("}}, {code})"));
+                let refusal = classify_rule_abort(&error).expect("wallet refusal");
+                assert!(refusal.meaning.contains(expected), "code {code}: {refusal}");
+                assert_ne!(
+                    refusal.advice(),
+                    "Nothing about the amount will change this one."
+                );
+            }
+        }
+
+        #[test]
+        fn protected_minimum_output_advice_preserves_owner_approval() {
+            let error = PER_TX
+                .replace("per_tx", "agent_wallet")
+                .replace("}, 1)", "}, 17)");
+            let refusal = classify_rule_abort(&error).expect("wallet refusal");
+            assert!(
+                refusal.meaning.contains("configured or actual"),
+                "{refusal}"
+            );
+            let advice = refusal.advice();
+            for expected in [
+                "quote",
+                "amount",
+                "owner-approved",
+                "Do not",
+                "lower",
+                "bypass",
+            ] {
+                assert!(advice.contains(expected), "missing {expected}: {advice}");
+            }
+        }
+
+        #[test]
+        fn protected_abort_codes_match_the_move_contract() {
+            let source = include_str!("../../../move/agent_wallet/sources/agent_wallet.move");
+            for (name, code) in [
+                ("E_PROTECTED_MODE", 12),
+                ("E_NOT_PROTECTED", 13),
+                ("E_WRONG_ADAPTER", 14),
+                ("E_STALE_REVISION", 15),
+                ("E_WRONG_POOL", 16),
+                ("E_MIN_OUTPUT", 17),
+                ("E_WRONG_OUTPUT", 18),
+                ("E_INVALID_CHANGE", 19),
+            ] {
+                assert!(source.contains(&format!("const {name}: u64 = {code};")));
+            }
         }
 
         /// Reporting an unrelated failure as a policy decision would be worse than saying nothing:

@@ -13,6 +13,7 @@ pub mod book;
 pub mod book_params;
 pub mod bridge;
 pub mod cetus;
+pub mod cetus_quote;
 pub mod create;
 pub mod deepbook;
 pub mod deployments;
