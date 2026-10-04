@@ -1233,6 +1233,19 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     };
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
     if result["isError"] == json!(true) {
+        // The builder's strict simulation is where a spend past the wallet's means first fails, and
+        // it says so as a raw MoveAbort. Named like every other rule refusal, so an agent reads
+        // "the wallet does not hold that much" in a field rather than parsing an abort code.
+        // The text is the builder's JSON, `{"reason": "...", "refused": true}`, so the abort's
+        // quotes arrive escaped; classify the reason itself.
+        let reason = serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|v| v["reason"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| text.to_owned());
+        if let Some(refusal) = rill_chain::aborts::classify_rule_abort(&reason) {
+            context.last_rejection = Some(refusal.to_string());
+            return rule_refusal(id, &refusal);
+        }
         return tool_error(id, "build_refused", text);
     }
     let envelope: Value = match serde_json::from_str(text) {
