@@ -1274,7 +1274,7 @@ fn run_action_for_owner(
     let wallet = argument(params, "walletId").map(str::to_owned);
     let revision_value = params.get("arguments").and_then(|a| a.get("revision"));
     let revision = revision_value.and_then(Value::as_u64);
-    if revision_value.is_some() && !revision.is_some_and(|revision| revision > 0) {
+    if revision_value.is_some() && revision.is_none_or(|revision| revision == 0) {
         return tool_error(
             id,
             "invalid_arguments",
