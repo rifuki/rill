@@ -541,6 +541,17 @@ cargo test -p rill-ptb  --test book_live     -- --ignored --nocapture
 cargo test -p rill-chain --test package_probe -- --ignored --nocapture
 ```
 
+The whole owner-to-agent flow runs end to end in one command, with both keys from the local Sui
+keystore so nothing waits on a wallet popup. It starts its own server, publishes a guarded swap,
+creates, funds and grants a wallet, has the agent's signer run it once, checks that a tampered
+grant, a run past the budget and a run after revocation are all refused, and revokes the wallet
+even when a step fails:
+
+```sh
+RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh testnet
+RILL_E2E_ALLOW_MAINNET=1 RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh mainnet  # ~0.01 SUI
+```
+
 The contracts are tested by their own toolchain:
 
 ```sh
