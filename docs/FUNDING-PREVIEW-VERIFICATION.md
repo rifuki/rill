@@ -19,3 +19,9 @@ Quotes are snapshots. A later execution can still refuse because prices changed;
 Known SUI and USDC amounts use exact decimal formatting; unknown assets stay explicitly in base units. Changing the setup form hides its previous quote. A preview does not sign or submit a transaction.
 
 Signer status distinguishes owner-signed `rill_run_action`, which requires a valid grant, from generic `rill_execute`, which requires a run-set. Protected abort codes 12 through 19 identify adapter, revision, pool, output-floor, asset, and change failures without proposing an automatic policy bypass.
+
+## Signer DNS regression found during release smoke
+
+The released signer initially timed out listing actions twice because DNS returned an unreachable synthesized IPv6 address before the working IPv4 address. `curl -4` returned HTTP 200 in 0.177 seconds; `curl -6` timed out. The production regression failed before the patch at three seconds.
+
+Commit `569f101` races resolved transport connections and cancels unused attempts. Certificate verification and SNI remain unchanged. Only the winning connection sends an HTTP request. The live regression passed in 0.31 seconds after the patch; actual MCP action listing and portfolio passed in 1.09 and 0.73 seconds. Signer package checks: 211 passed, 13 ignored; both live HTTPS tests and Clippy passed. Native source review had no actionable findings.
