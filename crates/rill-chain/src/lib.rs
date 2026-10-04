@@ -407,6 +407,13 @@ pub mod aborts {
                 ("agent_wallet", 7) => {
                     "This call is the agent's. Sign it with the agent's key: `--as <agent>`."
                 }
+                // The one wallet refusal that is about the amount: the balance is short of it.
+                // "Nothing about the amount will change this one" sent an agent away from the two
+                // answers that work. Found when an end-to-end run hit it with a fixed-size action.
+                ("agent_wallet", 4) => {
+                    "The wallet holds less than this spend. Spend no more than it holds (rill_wallet \
+                     shows the balance), or ask the wallet's owner to add funds."
+                }
                 ("agent_wallet", 10) => {
                     "The prove calls did not match the wallet's live policy. Read what it actually \
                      carries rather than assuming."
@@ -742,6 +749,15 @@ mod advice_tests {
     fn an_amount_limit_is_told_to_spend_less() {
         assert!(refusal("per_tx", 1).advice().contains("Spend less"));
         assert!(refusal("budget", 1).advice().contains("Spend less"));
+    }
+
+    /// A short wallet is the one wallet refusal an amount does fix, and it says so.
+    #[test]
+    fn a_short_wallet_is_told_to_spend_what_it_holds_or_top_up() {
+        let advice = refusal("agent_wallet", 4).advice();
+        assert!(advice.contains("Spend no more than it holds"), "{advice}");
+        assert!(advice.contains("add funds"), "{advice}");
+        assert!(!advice.contains("Nothing about the amount"), "{advice}");
     }
 
     /// A wrong-key refusal names which key, because that is the entire fix.
