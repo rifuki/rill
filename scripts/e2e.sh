@@ -30,6 +30,14 @@ case "$scenario" in
   "" | swap | stake | deepbook | workflow | recovery) ;;
   *) echo "unknown scenario: $scenario (swap, stake, deepbook, workflow or recovery)" >&2; exit 2 ;;
 esac
+# Keep the default smoke allocation unchanged: the combined run and recovery are explicit modes.
+extra_args=(--skip recovery_)
+if [ -z "$scenario" ]; then
+  extra_args+=(--skip workflow_)
+elif [ "$scenario" = recovery ]; then
+  extra_args=(--skip workflow_)
+  : "${RILL_E2E_RECOVERY_RECEIPT:?set RILL_E2E_RECOVERY_RECEIPT to the existing public workflow receipt}"
+fi
 : "${RILL_E2E_OWNER:?set RILL_E2E_OWNER to the owner address in the local Sui keystore}"
 : "${RILL_E2E_AGENT:?set RILL_E2E_AGENT to the agent address in the local Sui keystore}"
 if [ "$network" = mainnet ] && [ "${RILL_E2E_ALLOW_MAINNET:-}" != 1 ]; then
@@ -72,7 +80,7 @@ status=0
 RILL_E2E_NETWORK="$network" RILL_E2E_API="$api" RILL_E2E_DIR="$run_dir" \
   RILL_E2E_WALLET_BIN="${RILL_E2E_WALLET_BIN:-$root/target/debug/rill-wallet}" \
   cargo test --locked -q -p rill --test e2e_live -- --ignored --nocapture --test-threads=1 \
-  ${scenario:+"${scenario}_"} || status=$?
+  ${scenario:+"${scenario}_"} "${extra_args[@]}" || status=$?
 
 echo
 echo "run directory: $run_dir (server.log, e2e-*-receipts.json)"
