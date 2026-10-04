@@ -689,3 +689,40 @@ async fn paying_deep_fees_must_be_in_the_allowed_asset_scope() {
         .to_string()
         .contains("asset_scope"));
 }
+
+#[tokio::test]
+async fn published_actions_skip_gas_coins_deleted_since_the_owner_listing() {
+    let owner = "0xc1".parse::<Address>().unwrap().to_string();
+    let gas = |id: &str| ObjectSummary {
+        reference: ObjectRef {
+            id: id.into(),
+            version: 1,
+            digest: sui_sdk_types::Digest::ZERO.to_string(),
+        },
+        object_type: Some("0x2::coin::Coin<0x2::sui::SUI>".into()),
+        fields: Some(json!({"balance":"1000000000"})),
+        shared_initial_version: None,
+    };
+    let chain = wallet_chain()
+        .with_object_after(100, Some(&owner), gas("0xc3"))
+        .with_object(Some(&owner), gas("0xc4"));
+    let flow = flow(
+        json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":"1000000000"}}],"edges":[]}),
+    );
+    let envelope = rill_server::studio_compile::build_action(
+        &flow,
+        &wallet_options(None),
+        "skill_stake",
+        &chain,
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap();
+    let transaction: sui_sdk_types::Transaction =
+        bcs::from_bytes(&STANDARD.decode(envelope.unsigned_ptb).unwrap()).unwrap();
+    assert_eq!(transaction.gas_payment.objects.len(), 1);
+    assert_eq!(
+        transaction.gas_payment.objects[0].object_id().to_string(),
+        "0xc4".parse::<Address>().unwrap().to_string()
+    );
+}

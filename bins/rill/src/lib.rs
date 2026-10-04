@@ -41,3 +41,5 @@ pub mod wallet_read;
 
 pub mod portfolio_cmd;
 pub mod unstake_cmd;
+
+pub mod workflow;

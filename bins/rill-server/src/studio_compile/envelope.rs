@@ -51,10 +51,13 @@ pub async fn build_action(
         if input_ids.contains(&address(&candidate.reference.id)?.to_string()) {
             continue;
         }
-        let coin = chain
-            .get_object(&candidate.reference.id)
-            .await
-            .map_err(error)?;
+        // A successful preceding transaction may have merged this coin while the owner
+        // index still lists it. Missing gas candidates are not usable gas.
+        let coin = match chain.get_object(&candidate.reference.id).await {
+            Ok(coin) => coin,
+            Err(rill_chain::ChainError::NotFound(_)) => continue,
+            Err(reason) => return Err(error(reason)),
+        };
         let units = match coin.fields.as_ref().and_then(|f| f.get("balance")) {
             Some(Value::String(s)) => parse_u64_string(s).map_err(error)?,
             Some(Value::Number(n)) => n

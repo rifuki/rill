@@ -129,7 +129,8 @@ async fn sign_and_run(
             Err(e)
                 if e.contains("InsufficientCoinBalance")
                     || e.contains("unavailable for consumption")
-                    || e.contains("needs to be rebuilt") =>
+                    || e.contains("needs to be rebuilt")
+                    || e.contains("changed since it was read") =>
             {
                 eprintln!(
                     "owner gas not caught up (attempt {}), retrying",
@@ -412,6 +413,7 @@ async fn scenario(kind: Kind) {
         &mut receipts,
         &mut wallet,
         &mut manager,
+        false,
     )
     .await;
 
@@ -469,18 +471,39 @@ fn swap_runs() -> u64 {
 
 async fn revoke(setup: &Setup, wallet: &str) -> Result<(), String> {
     let (package, _) = rill_ptb::deployments::wallet_deployment(setup.network, None, None)?;
-    revoke_cmd::revoke(
-        &setup.rpc,
-        &setup.owner,
-        &RevokeArgs {
-            package_id: package.to_string(),
-            wallet_id: wallet.into(),
-            recipient: None,
-            gas_budget: 50_000_000,
-            dry_run: false,
-        },
-    )
-    .await
+    let chain = GrpcSui::new(&setup.rpc).map_err(|error| error.to_string())?;
+    for attempt in 0..8 {
+        if wallet_fields(&chain, wallet)
+            .await
+            .is_ok_and(|fields| fields["revoked"] == true)
+        {
+            return Ok(());
+        }
+        let result = revoke_cmd::revoke(
+            &setup.rpc,
+            &setup.owner,
+            &RevokeArgs {
+                package_id: package.to_string(),
+                wallet_id: wallet.into(),
+                recipient: None,
+                gas_budget: 50_000_000,
+                dry_run: false,
+            },
+        )
+        .await;
+        match result {
+            Err(error)
+                if attempt < 7
+                    && (error.contains("changed since it was read")
+                        || error.contains("unavailable for consumption")
+                        || error.contains("needs to be rebuilt")) =>
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+    Err("owner gas did not converge before revocation".into())
 }
 
 fn deepbook_network(network: Network) -> rill_ptb::registry::DeepBookNetwork {
@@ -808,6 +831,7 @@ async fn run(
     receipts: &mut Value,
     wallet_slot: &mut Option<String>,
     manager_slot: &mut Option<Manager>,
+    provision_only: bool,
 ) -> Result<(), String> {
     let api = setup.api.trim_end_matches('/');
     let owner = setup.owner.address().to_string();
@@ -920,7 +944,7 @@ async fn run(
         Err(e) => return Err(format!("refused, but not for its signature: {e}")),
     }
 
-    if keep() {
+    if keep() || provision_only {
         receipts["kept"] = json!({
             "wallet": wallet, "action": action, "budgetMist": plan.budget.to_string(),
             "perTxMist": plan.per_tx.to_string(), "spendMist": plan.spend.to_string(),
@@ -1039,4 +1063,124 @@ async fn run(
     receipts["passed"] = json!(true);
     eprintln!("\n{}: all steps passed", kind.name());
     Ok(())
+}
+
+/// One signer, three separate owner-approved grants, one ordered MCP workflow.
+#[tokio::test]
+#[ignore = "spends real funds on a live Sui network"]
+async fn workflow_swap_stake_order_and_restart_replay() {
+    let setup = setup();
+    let chain = GrpcSui::new(&setup.rpc).expect("fullnode client");
+    let mut rows = Vec::new();
+    let mut report = json!({"network":setup.network_name,"scenario":"workflow","allocations":[]});
+    let result: Result<(), String> = async {
+        for kind in [Kind::Swap, Kind::Stake, Kind::DeepBook] {
+            let mut receipt = json!({"scenario":kind.name()});
+            let mut wallet = None;
+            let mut manager = None;
+            let prepared = run(kind, &setup, &chain, &mut receipt, &mut wallet, &mut manager, true).await;
+            rows.push((wallet, manager, receipt.clone()));
+            report["allocations"].as_array_mut().unwrap().push(receipt);
+            std::fs::write(setup.work_dir.join("e2e-workflow-receipts.json"), serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+            prepared?;
+        }
+        let workflow = json!({
+            "runId":format!("e2e-{}", rand::random::<u64>()), "network":setup.network_name,
+            "signer":setup.agent.to_string(), "owner":setup.owner.address().to_string(),
+            "steps":rows.iter().map(|(wallet, _, receipt)| json!({
+                "actionId":receipt["action"],"walletId":wallet,"revision":receipt["grant"]["revision"]
+            })).collect::<Vec<_>>()
+        });
+        let mut signer = Agent::start(&setup);
+        let mut wrong_revision = workflow.clone();
+        wrong_revision["runId"] = json!(format!("refused-{}", rand::random::<u64>()));
+        wrong_revision["steps"][1]["revision"] = json!(999999);
+        let (refused, failed) = signer.call("rill_run_workflow", wrong_revision);
+        if !failed || refused["steps"][0]["result"]["error"] != "workflow_preflight_refused" {
+            return Err(format!("wrong revision was not refused before spending: {refused}"));
+        }
+        for (wallet, _, _) in &rows {
+            let wallet = wallet.as_deref().ok_or("missing prepared vault")?;
+            if number(&wallet_fields(&chain, wallet).await?, "spent") != 0 { return Err("preflight refusal spent funds".into()); }
+        }
+        report["wrongRevisionRefusedBeforeSpend"] = json!(true);
+        let (executed, failed) = signer.call("rill_run_workflow", workflow.clone());
+        report["workflow"] = executed.clone();
+        if failed || executed["status"] != "completed" {
+            return Err(format!("combined workflow stopped: {executed}"));
+        }
+        for (wallet, _, receipt) in &rows {
+            let wallet = wallet.as_deref().ok_or("missing prepared vault")?;
+            let expected: u64 = receipt["kept"]["spendMist"].as_str().ok_or("missing planned spend")?.parse().map_err(|_| "invalid spend")?;
+            wallet_until(&chain, wallet, "confirmed workflow spend", |fields| number(fields,"spent") == expected).await?;
+        }
+        drop(signer);
+        let mut restarted = Agent::start(&setup);
+        let (replayed, failed) = restarted.call("rill_run_workflow", workflow);
+        if failed || replayed["replayed"] != true || replayed["steps"] != executed["steps"] {
+            return Err(format!("restart did not return the original receipt: {replayed}"));
+        }
+        report["restartReplay"] = json!(true);
+        Ok(())
+    }.await;
+    // Recover every allocation, including after a partial setup or execution failure.
+    let mut cleanup_errors = Vec::new();
+    for (wallet, manager, _) in &rows {
+        if let Some(wallet) = wallet {
+            match revoke(&setup, wallet).await {
+                Ok(()) => {}
+                Err(error) => cleanup_errors.push(error),
+            }
+        }
+        if let Some(manager) = manager {
+            match recover_manager(&setup, &chain, manager).await {
+                Ok((digest, delta)) => {
+                    report["managerRecovery"] =
+                        json!({"digest":digest,"ownerSuiDelta":delta.to_string()})
+                }
+                Err(error) => cleanup_errors.push(error),
+            }
+        }
+    }
+    report["cleanupErrors"] = json!(cleanup_errors);
+    std::fs::write(
+        setup.work_dir.join("e2e-workflow-receipts.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        cleanup_errors.is_empty(),
+        "cleanup failures: {cleanup_errors:?}"
+    );
+    result.unwrap();
+}
+
+/// Recover a previously recorded workflow without repeating its actions.
+#[tokio::test]
+#[ignore = "owner recovery on a live Sui network"]
+async fn recovery_existing_workflow() {
+    let setup = setup();
+    let path = var("RILL_E2E_RECOVERY_RECEIPT").expect("a public workflow receipt path");
+    let mut report: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        report["workflow"]["workflow"]["owner"],
+        setup.owner.address().to_string()
+    );
+    assert_eq!(report["network"], setup.network_name);
+    let chain = GrpcSui::new(&setup.rpc).unwrap();
+    for receipt in report["allocations"].as_array().unwrap() {
+        if let Some(wallet) = receipt["kept"]["wallet"].as_str() {
+            revoke(&setup, wallet).await.unwrap();
+        }
+    }
+    let manager = &report["allocations"][2]["manager"];
+    let manager = Manager {
+        id: manager["id"].as_str().unwrap().into(),
+        trade_cap: manager["tradeCap"].as_str().unwrap().into(),
+        deposit_cap: manager["depositCap"].as_str().unwrap().into(),
+    };
+    let (digest, delta) = recover_manager(&setup, &chain, &manager).await.unwrap();
+    report["managerRecovery"] = json!({"digest":digest,"ownerSuiDelta":delta.to_string()});
+    report["cleanupErrors"] = json!([]);
+    std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
 }

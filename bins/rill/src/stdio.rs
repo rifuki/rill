@@ -59,6 +59,8 @@ pub struct WalletContext {
     /// which is what a plugin starts, so an agent is never handed a tool that would make it the
     /// owner of a wallet it funds itself.
     pub owner_tools: bool,
+    /// Gas references consumed by successful submissions in this process. Builder indexes may lag.
+    pub consumed_gas: HashMap<sui_sdk_types::Address, u64>,
 }
 
 /// One envelope this signer has already handed to the chain.
@@ -80,6 +82,7 @@ impl WalletContext {
             last_rejection: None,
             submitted: HashMap::new(),
             owner_tools: false,
+            consumed_gas: HashMap::new(),
         }
     }
 
@@ -292,6 +295,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_execute" => execute(context, id, &params),
         "rill_actions" => actions(context, id),
         "rill_run_action" => run_action(context, id, &params),
+        "rill_run_workflow" => run_workflow(context, id, &params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
 }
@@ -1244,6 +1248,15 @@ fn actions(context: &mut WalletContext, id: Value) -> Value {
 /// `rill_run_action`: build an action through the Rill API and execute it under the owner-signed
 /// run set, through exactly the validation `rill_execute` applies to a run set loaded from a file.
 fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    run_action_for_owner(context, id, params, None)
+}
+
+fn run_action_for_owner(
+    context: &mut WalletContext,
+    id: Value,
+    params: &Value,
+    owner: Option<&str>,
+) -> Value {
     let Some(api) = api_url() else {
         return tool_error(id, "not_configured", NO_API);
     };
@@ -1259,6 +1272,15 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     };
     let action_id = action_id.to_owned();
     let wallet = argument(params, "walletId").map(str::to_owned);
+    let revision_value = params.get("arguments").and_then(|a| a.get("revision"));
+    let revision = revision_value.and_then(Value::as_u64);
+    if revision_value.is_some() && !revision.is_some_and(|revision| revision > 0) {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            "revision must be a positive integer.",
+        );
+    }
     let overrides = params
         .get("arguments")
         .and_then(|a| a.get("params"))
@@ -1272,6 +1294,7 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let matching: Vec<_> = checked
         .into_iter()
         .filter(|(signed, _)| signed.grant.action_id == action_id)
+        .filter(|(signed, _)| revision.is_none_or(|revision| signed.grant.revision == revision))
         .filter(|(signed, _)| {
             wallet.as_deref().is_none_or(|w| {
                 w.parse::<sui_sdk_types::Address>().ok()
@@ -1322,6 +1345,12 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     }
     usable.sort_by_key(|v| v.grant.revision);
     let verified = usable.pop().expect("one usable grant");
+    if owner.is_some_and(|owner| {
+        owner.parse::<sui_sdk_types::Address>().ok()
+            != verified.owner.parse::<sui_sdk_types::Address>().ok()
+    }) {
+        return tool_error(id, "owner_changed", "The vault owner changed since workflow preflight; no transaction submitted for this step.");
+    }
 
     // The builder is asked for the grant's own build arguments. Only `params` may be supplied by
     // the caller, and the server refuses any that would loosen what was published.
@@ -1353,7 +1382,30 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": { "name": "build_action", "arguments": arguments }
     });
-    let built = match block_on(async move { crate::http::post_json(&url, &request).await }) {
+    let consumed_gas = &context.consumed_gas;
+    let built = match block_on(async {
+        for attempt in 0..40 {
+            let value = crate::http::post_json(&url, &request).await?;
+            let text = value.get("data").unwrap_or(&value)["result"]["content"][0]["text"].as_str();
+            let transaction = text
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .and_then(|envelope| {
+                    envelope["unsignedPtb"]
+                        .as_str()
+                        .and_then(|bytes| decode_for_signing(bytes).ok())
+                });
+            let stale = transaction.as_ref().is_some_and(|tx| {
+                crate::workflow::gas_is_stale(&tx.gas_payment.objects, consumed_gas)
+            });
+            if !stale {
+                return Ok(value);
+            }
+            if attempt < 39 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        Err("The builder has not observed the previous gas transaction yet. No transaction was signed or submitted for this step.".to_string())
+    }) {
         Ok(Ok(value)) => value,
         Ok(Err(e)) | Err(e) => return tool_error(id, "build_failed", &e),
     };
@@ -1418,6 +1470,103 @@ fn run_action(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         );
     }
     response
+}
+
+/// Preflight every exact owner-signed grant, then use the existing action execution path.
+fn run_workflow(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+    let workflow: crate::workflow::Workflow =
+        match serde_json::from_value(params.get("arguments").cloned().unwrap_or(Value::Null)) {
+            Ok(workflow) => workflow,
+            Err(error) => return tool_error(id, "invalid_workflow", &error.to_string()),
+        };
+    if let Err(error) = workflow.validate() {
+        return tool_error(id, "invalid_workflow", &error);
+    }
+    let Some(key) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let signer = key.address().to_string();
+    let equal_address = |a: &str, b: &str| {
+        a.parse::<sui_sdk_types::Address>().ok() == b.parse::<sui_sdk_types::Address>().ok()
+    };
+    if workflow.network != context.network || !equal_address(&workflow.signer, &signer) {
+        return tool_error(
+            id,
+            "workflow_context_mismatch",
+            "The workflow network and signer must match this signer.",
+        );
+    }
+    let Some(path) = crate::config::path() else {
+        return tool_error(
+            id,
+            "not_configured",
+            "A local configuration path is required for workflow receipts.",
+        );
+    };
+    let Some(parent) = path.parent() else {
+        return tool_error(
+            id,
+            "not_configured",
+            "The configuration path has no parent directory.",
+        );
+    };
+    let directory = parent
+        .join("workflow-runs")
+        .join(&workflow.network)
+        .join(&signer);
+    // A repeated run must remain readable even if its grants have since been revoked.
+    // A new run preflights before its first submission inside the durable claim.
+    let mut preflight_done = false;
+    let report = crate::workflow::run(&directory, &workflow, |step| {
+        if !preflight_done {
+            let Some(api) = api_url() else {
+                return json!({"error":"not_configured", "reason":NO_API});
+            };
+            let checked = match checked_grants(context, &signer, &api) {
+                Ok(grants) => grants,
+                Err(error) => return json!({"error":"grants_unavailable", "reason":error}),
+            };
+            for expected in &workflow.steps {
+                let valid = checked.iter().any(|(signed, verdict)| {
+                    signed.grant.action_id == expected.action_id
+                        && signed.grant.revision == expected.revision
+                        && equal_address(&signed.grant.wallet_id, &expected.wallet_id)
+                        && verdict
+                            .as_ref()
+                            .is_ok_and(|grant| equal_address(&grant.owner, &workflow.owner))
+                });
+                if !valid {
+                    return json!({"error":"workflow_preflight_refused", "actionId":expected.action_id,
+                        "reason":"Every step must have the exact usable revision, vault, signer and owner. No workflow transaction submitted."});
+                }
+            }
+            preflight_done = true;
+        }
+        let response = run_action_for_owner(
+            context,
+            json!(1),
+            &json!({"arguments":{
+                "actionId":step.action_id,"walletId":step.wallet_id,"revision":step.revision,"params":step.params
+            }}),
+            Some(&workflow.owner),
+        );
+        if response["result"]["isError"] == true || response.get("error").is_some() {
+            json!({"error":"action_refused", "response":response})
+        } else {
+            response["result"]["structuredContent"].clone()
+        }
+    });
+    match report {
+        Ok(report) => {
+            let failed = report["status"] != "completed";
+            let mut response = tool_ok(id, report);
+            if failed {
+                response["result"]["isError"] = json!(true);
+            }
+            response
+        }
+        Err(error) => tool_error(id, "workflow_refused", &error),
+    }
 }
 
 fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
@@ -1559,10 +1708,14 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         .await
         .map_err(|e| Failed::Submit(e.to_string()))?;
 
-        Ok::<_, Failed>((outcome, simulated.spend_base_units().to_string()))
+        Ok::<_, Failed>((
+            outcome,
+            simulated.spend_base_units().to_string(),
+            transaction.gas_payment.objects,
+        ))
     });
 
-    let (outcome, spend_base_units) = match outcome {
+    let (outcome, spend_base_units, gas_objects) = match outcome {
         Ok(Ok(pair)) => pair,
         Ok(Err(failed)) => {
             return match failed {
@@ -1615,6 +1768,11 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         return failure_response(context, id, "execution_failed", &failure);
     }
 
+    for object in gas_objects {
+        context
+            .consumed_gas
+            .insert(*object.object_id(), object.version());
+    }
     context.submitted.insert(
         digest.clone(),
         Submission {

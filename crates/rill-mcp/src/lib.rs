@@ -519,10 +519,28 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     "properties": {
                         "actionId": { "type": "string", "description": "The actionId from rill_actions." },
                         "walletId": { "type": "string", "description": "Optional. Which wallet's grant to use, when more than one wallet granted this action." },
+                        "revision": { "type": "integer", "minimum": 1, "description": "Optional exact owner-signed grant revision." },
                         "params": { "type": "object", "description": "Optional. Runtime values keyed by node id, as the action's build_action schema allows, for example a tighter minimum output. Amounts are decimal text." }
                     },
                     "required": ["actionId"],
                     "additionalProperties": false
+                })),
+            ),
+            destructive(
+                "rill_run_workflow",
+                "Run an ordered workflow of separately approved actions. THIS SUBMITS REAL TRANSACTIONS and cannot be undone. Every step pins its grant revision and vault, using one owner, network and signer. Stops on failure, preserves earlier successes, and does not reinvest outputs. A durable runId receipt prevents resubmission across restarts. Retry the SAME runId to inspect results; never create a fresh runId to retry uncertain or successful steps.",
+                object_schema(json!({
+                    "type":"object", "additionalProperties":false,
+                    "required":["runId","network","signer","owner","steps"],
+                    "properties":{
+                        "runId":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,96}$"},
+                        "network":{"type":"string","enum":["mainnet","testnet"]},
+                        "signer":{"type":"string"}, "owner":{"type":"string"},
+                        "steps":{"type":"array","minItems":1,"maxItems":10,"items":{
+                            "type":"object","additionalProperties":false,"required":["actionId","walletId","revision"],
+                            "properties":{"actionId":{"type":"string"},"walletId":{"type":"string"},"revision":{"type":"integer","minimum":1},"params":{"type":"object"}}
+                        }}
+                    }
                 })),
             ),
         ],
@@ -613,6 +631,7 @@ mod tests {
             "rill_unstake",
             "rill_execute",
             "rill_run_action",
+            "rill_run_workflow",
         ];
 
         let destructive: Vec<String> = [Surface::Actions, Surface::Owner]

@@ -2,7 +2,7 @@
 #
 # The whole owner-to-agent flow against a live network, in one command that cleans up after itself.
 #
-#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook]
+#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|recovery]
 #
 # Builds the server and the signer, starts a throwaway server on a free loopback port with its own
 # stores, runs the scenarios in `bins/rill/tests/e2e_live.rs` against it one after another (they
@@ -24,11 +24,11 @@ network="${1:-testnet}"
 scenario="${2:-}"
 case "$network" in
   testnet | mainnet) ;;
-  *) echo "usage: scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook]" >&2; exit 2 ;;
+  *) echo "usage: scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|recovery]" >&2; exit 2 ;;
 esac
 case "$scenario" in
-  "" | swap | stake | deepbook) ;;
-  *) echo "unknown scenario: $scenario (swap, stake or deepbook)" >&2; exit 2 ;;
+  "" | swap | stake | deepbook | workflow | recovery) ;;
+  *) echo "unknown scenario: $scenario (swap, stake, deepbook, workflow or recovery)" >&2; exit 2 ;;
 esac
 : "${RILL_E2E_OWNER:?set RILL_E2E_OWNER to the owner address in the local Sui keystore}"
 : "${RILL_E2E_AGENT:?set RILL_E2E_AGENT to the agent address in the local Sui keystore}"
