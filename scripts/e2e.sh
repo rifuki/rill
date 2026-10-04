@@ -9,6 +9,9 @@
 # The owner and the agent are both keys in the local Sui keystore, so no step waits on a wallet
 # popup; the test revokes the wallet it funded even when a step fails.
 #
+# RILL_E2E_WALLET_BIN runs the agent side on another signer binary, such as the release the plugin
+# launcher downloaded, instead of the one just built.
+#
 # Mainnet spends real SUI (a 0.005 SUI swap plus gas, the rest of the 0.0075 SUI budget comes back
 # on revoke) and needs RILL_E2E_ALLOW_MAINNET=1. Receipts land in the run directory printed at the
 # end, as e2e-receipts.json.
@@ -59,7 +62,7 @@ done
 
 status=0
 RILL_E2E_NETWORK="$network" RILL_E2E_API="$api" RILL_E2E_DIR="$run_dir" \
-  RILL_E2E_WALLET_BIN="$root/target/debug/rill-wallet" \
+  RILL_E2E_WALLET_BIN="${RILL_E2E_WALLET_BIN:-$root/target/debug/rill-wallet}" \
   cargo test --locked -q -p rill --test e2e_live -- --ignored --nocapture || status=$?
 
 echo
