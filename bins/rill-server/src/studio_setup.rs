@@ -1,4 +1,5 @@
 //! Two-transaction Studio onboarding: create empty, then attach rules and fund atomically.
+mod defaults;
 mod http;
 mod preview;
 use crate::{
@@ -14,7 +15,8 @@ use axum::{
     response::Response,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-pub use http::{attach, prepare, preview_setup};
+pub use defaults::setup_defaults;
+pub use http::{attach, prepare, preview_setup, setup_options};
 use rill_chain::{ObjectSummary, SuiRead};
 use rill_core::{
     amounts::parse_u64_string,

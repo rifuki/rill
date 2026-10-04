@@ -14,7 +14,15 @@ pub async fn preview_setup(
 ) -> Response {
     handle(state, headers, body, SetupAction::Preview).await
 }
+pub async fn setup_options(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle(state, headers, body, SetupAction::Options).await
+}
 enum SetupAction {
+    Options,
     Preview,
     Prepare,
     Attach,
@@ -38,11 +46,18 @@ async fn handle(state: AppState, headers: HeaderMap, body: Bytes, action: SetupA
     let Some(skill) = body["skillId"].as_str().and_then(|id| state.skills.get(id)) else {
         return api_err_typed(StatusCode::NOT_FOUND, "Skill not found", "NotFound");
     };
+    if matches!(action, SetupAction::Options) {
+        return match setup_defaults(&skill, &owner) {
+            Ok(value) => api_ok(value),
+            Err(error) => studio_api::invalid(error),
+        };
+    }
     let context = match setup_context(&state, &skill).await {
         Ok(context) => context,
         Err(e) => return *e,
     };
     let result = match action {
+        SetupAction::Options => unreachable!("options return before reading chain context"),
         SetupAction::Preview => {
             preview::plan(&body, &skill, &owner, &context, state.chain.as_ref())
                 .await

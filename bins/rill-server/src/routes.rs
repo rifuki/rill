@@ -97,6 +97,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/publish", post(crate::studio_api::publish))
         .route("/api/execute", post(crate::studio_api::execute))
         .route(
+            "/api/setup/options",
+            post(crate::studio_setup::setup_options),
+        )
+        .route(
             "/api/setup/preview",
             post(crate::studio_setup::preview_setup),
         )
