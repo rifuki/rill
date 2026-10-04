@@ -525,7 +525,7 @@ pub struct CapabilityDeclaration {
 
 /// Render a base-unit amount as `"<amount> <SYMBOL>"`, or as raw base units for a coin the token
 /// registry does not know. Guessing decimals would misstate the amount; saying so does not.
-fn format_amount(mist: &str, coin_type: &str) -> String {
+pub fn format_amount(mist: &str, coin_type: &str) -> String {
     let Some(token) = find_token(coin_type) else {
         return format!("{mist} base units of {coin_type}");
     };

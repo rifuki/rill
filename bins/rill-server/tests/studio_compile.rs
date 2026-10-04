@@ -248,6 +248,42 @@ async fn manifest_protocol_scope_checks_real_compiled_targets() {
         .to_string()
         .contains("protocol_scope"));
 }
+/// An owner refused here has to know what to change: the action's amount or the limit.
+#[tokio::test]
+async fn a_spend_over_a_limit_names_the_amount_and_the_limit() {
+    let flow = flow(
+        json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":"3000000000"}}],"edges":[]}),
+    );
+    let message = compile(&flow, &wallet_options(None), &wallet_chain())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("per_tx rule exceeded"), "{message}");
+    assert!(message.contains("spends 3 SUI per run"), "{message}");
+    assert!(
+        message.contains("above the 2 SUI per-transaction limit"),
+        "{message}"
+    );
+
+    let mut options = wallet_options(None);
+    let wallet = options.agent_wallet.as_mut().unwrap();
+    wallet.capability_manifest.rules =
+        serde_json::from_value(json!([{"kind":"budget","totalMist":"500000000"}])).unwrap();
+    let flow = flow_with_stake("1000000000");
+    let message = compile(&flow, &options, &wallet_chain())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("spends 1 SUI per run, above the 0.5 SUI budget"),
+        "{message}"
+    );
+}
+fn flow_with_stake(amount: &str) -> FlowGraph {
+    flow(
+        json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":amount}}],"edges":[]}),
+    )
+}
 #[tokio::test]
 async fn manifest_floor_cannot_be_bypassed_through_downstream_guard() {
     let flow = flow(json!({"nodes":[

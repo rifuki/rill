@@ -1,6 +1,10 @@
 //! Compile Studio graphs into unsigned transaction kinds.
 use rill_chain::SuiRead;
-use rill_core::{envelope::Network, flow::FlowGraph, manifest::CapabilityManifest};
+use rill_core::{
+    envelope::Network,
+    flow::FlowGraph,
+    manifest::{format_amount, CapabilityManifest},
+};
 use serde::Deserialize;
 use sui_sdk_types::{Address, Transaction};
 
@@ -787,15 +791,25 @@ fn enforce_manifest(
     };
     for rule in &wallet.capability_manifest.rules {
         match rule {
+            // Say what spends how much against which limit: the bare "budget rule exceeded" left an
+            // owner who set a 0.05 SUI budget for an action that spends 0.1 SUI with nothing to fix.
             CapabilityRule::Budget { total_mist }
                 if spend > parse_u64_string(total_mist).map_err(error)? =>
             {
-                return Err(error("budget rule exceeded"))
+                return Err(error(format!(
+                    "budget rule exceeded: this action spends {} per run, above the {} budget",
+                    format_amount(&spend.to_string(), &wallet.coin_type),
+                    format_amount(total_mist, &wallet.coin_type),
+                )))
             }
             CapabilityRule::PerTx { max_mist }
                 if spend > parse_u64_string(max_mist).map_err(error)? =>
             {
-                return Err(error("per_tx rule exceeded"))
+                return Err(error(format!(
+                    "per_tx rule exceeded: this action spends {} per run, above the {} per-transaction limit",
+                    format_amount(&spend.to_string(), &wallet.coin_type),
+                    format_amount(max_mist, &wallet.coin_type),
+                )))
             }
             CapabilityRule::ProtocolScope { allowed_packages } => {
                 let allowed = allowed_packages
