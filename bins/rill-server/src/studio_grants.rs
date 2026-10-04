@@ -81,10 +81,40 @@ pub async fn prepare_grant(
             bind[key] = value.clone();
         }
     }
+    // A DeepBook action needs its manager and capabilities. A grant request that names none takes
+    // the ones the action was published with, so `rill grant` and a Studio grant of a DeepBook
+    // action work without restating them; one that names them still decides.
+    for (key, value) in deepbook_defaults(skill) {
+        if bind.get(key).is_none() {
+            bind[key] = json!(value);
+        }
+    }
     let mut grant = grant_plan(&bind, skill, owner, context, chain).await?;
     grant.revision = current_revision(&grant.agent, &grant.wallet_id, &grant.action_id) + 1;
     let message = grant.message();
     Ok(json!({ "grant": grant, "message": message }))
+}
+
+/// The non-empty manager, capability and price fields of a published DeepBook node, by request key.
+fn deepbook_defaults(skill: &PublishedSkill) -> Vec<(&'static str, String)> {
+    let Some(config) = skill.flow["nodes"].as_array().and_then(|nodes| {
+        nodes
+            .iter()
+            .find(|n| n["type"] == "deepbook_limit_order")
+            .map(|n| n["config"].clone())
+    }) else {
+        return Vec::new();
+    };
+    ["balanceManagerId", "tradeCapId", "depositCapId", "price"]
+        .into_iter()
+        .filter_map(|key| {
+            config[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| (key, v.to_owned()))
+        })
+        .collect()
 }
 
 /// Accept a signed grant for storage, or say why not.
@@ -279,4 +309,49 @@ pub async fn list(State(state): State<AppState>, Path(agent): Path<String>) -> R
         Err(e) => return studio_api::invalid(e),
     };
     api_ok(json!({ "agent": agent, "grants": state.grants.list_for_agent(&agent) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(config: Value) -> PublishedSkill {
+        PublishedSkill {
+            id: "skill_db".into(),
+            name: "order".into(),
+            description: "order".into(),
+            flow: json!({"nodes":[{"id":"order","type":"deepbook_limit_order","config":config}],"edges":[]}),
+            tool_defs: None,
+            policy_id: None,
+            owner: None,
+            created_at: "2026-10-04T00:00:00Z".into(),
+        }
+    }
+
+    /// `rill grant` sends no manager; without these a DeepBook action could not be granted at all.
+    #[test]
+    fn a_deepbook_grant_takes_the_published_manager_and_caps() {
+        let defaults = deepbook_defaults(&skill(json!({
+            "balanceManagerId": "0xa", "tradeCapId": "0xb", "depositCapId": "0xc",
+            "price": "3.5", "quantity": "1"
+        })));
+        assert_eq!(
+            defaults,
+            vec![
+                ("balanceManagerId", "0xa".to_owned()),
+                ("tradeCapId", "0xb".to_owned()),
+                ("depositCapId", "0xc".to_owned()),
+                ("price", "3.5".to_owned()),
+            ]
+        );
+    }
+
+    /// Studio publishes these fields empty; an empty one is no default, so the request must name it.
+    #[test]
+    fn empty_published_fields_are_not_defaults() {
+        let defaults = deepbook_defaults(&skill(json!({
+            "balanceManagerId": "", "tradeCapId": " ", "price": "1"
+        })));
+        assert_eq!(defaults, vec![("price", "1".to_owned())]);
+    }
 }
