@@ -101,7 +101,8 @@ impl std::fmt::Display for Refusal {
             ),
             Self::WrongDeployment { grant, signer } => write!(
                 f,
-                "the grant names agent_wallet package {grant}, and this signer uses {signer}"
+                "the grant names agent_wallet package {grant}, and this signer uses {signer}; \
+                 if the package was upgraded, the owner has to grant this action again in Studio"
             ),
             Self::Expired => write!(f, "the grant has expired; the owner can sign a new one"),
             Self::RunSetDisagrees(what) => {
@@ -519,6 +520,20 @@ mod tests {
             verify(&chain, &grant, OTHER, "mainnet", PACKAGE, NOW).await,
             Err(Refusal::NotThisAgent { .. })
         ));
+    }
+
+    /// After an agent_wallet upgrade every saved grant still names the old package, and the owner's
+    /// signature covers it, so nothing short of a new grant fixes it. The agent relays this text,
+    /// so it has to say what the owner does next, not only which ids differ.
+    #[tokio::test]
+    async fn a_grant_on_an_upgraded_package_tells_the_owner_to_grant_again() {
+        let grant = signed();
+        let refusal = verify(&FakeSui::new(), &grant, AGENT, "mainnet", OTHER, NOW)
+            .await
+            .unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(PACKAGE) && text.contains(OTHER), "{text}");
+        assert!(text.contains("grant this action again"), "{text}");
     }
 
     #[tokio::test]

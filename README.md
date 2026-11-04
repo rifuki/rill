@@ -417,8 +417,10 @@ One tool per question, and reads never share a tool with writes:
   "preFlightRules": [ { "module": "recipient_allowlist", "enforcement": "pre-flight",
                         "enforcedBy": "this signer, only on the tools listed for the rule …",
                         "signerRefusesOn": ["rill_spend"] } ],
-  "note": "Two layers hold this wallet's limits, and each rule above says which. … Nothing on
-           chain checks a protocol, an asset, a recipient or a slippage floor. Those rules are
+  "recipientAllowlist": null,
+  "note": "Two layers hold this wallet's limits, and each rule above says which. … A recipient is
+           checked on chain only when the wallet's owner set the list under `recipientAllowlist`
+           … Nothing on chain checks a protocol, an asset, or a slippage floor … Those rules are
            pre-flight …" }
 
 // rill_spend  0.005 SUI
@@ -440,7 +442,10 @@ cannot widen it, the agent that asked cannot widen it, and the refusal arrives f
 **Which layer holds each limit.** That is true of four kinds of rule, and the read says which. The
 budget, the per-transaction cap, the rate limit and the time window are held by the Move contract
 and proved on chain against the real transaction. Nothing on chain checks a protocol, an asset, a
-recipient or a manifest's slippage floor: those four rules are pre-flight. The Rill builder checks
+manifest's recipient rule or a manifest's slippage floor: those four rules are pre-flight. The one
+recipient check the chain makes is the owner's own: from agent_wallet v3 an owner can list the only
+addresses a wallet may pay (`allow_recipient`), after which `rill_spend` must name one of them and
+anything that needs a released coin (`rill_swap`, `rill_stake`) aborts on that wallet. The Rill builder checks
 them when it compiles an action, and the signer refuses a breach only on the tools each rule lists
 under `signerRefusesOn`, and only under a run set for that wallet:
 

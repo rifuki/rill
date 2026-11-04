@@ -39,6 +39,50 @@ pub fn policy_rules_transaction(
     shared: &SharedObjects,
     gas_price: u64,
 ) -> Result<sui_sdk_types::Transaction, BookError> {
+    wallet_view_transaction(
+        package_id,
+        wallet_id,
+        coin_type,
+        shared,
+        gas_price,
+        "policy_rules",
+    )
+}
+
+/// Build the transaction whose simulation returns a wallet's recipient allowlist.
+///
+/// ```text
+/// public fun agent_wallet::recipient_allowlist<T0>(&AgentWallet<T0>): Option<vector<address>>
+/// ```
+///
+/// Exists from package version 3. Against an older package the read fails, which a caller must not
+/// take for "no list": decide that from whether the package can hold one, not from the failure.
+pub fn recipient_allowlist_transaction(
+    package_id: Address,
+    wallet_id: Address,
+    coin_type: &str,
+    shared: &SharedObjects,
+    gas_price: u64,
+) -> Result<sui_sdk_types::Transaction, BookError> {
+    wallet_view_transaction(
+        package_id,
+        wallet_id,
+        coin_type,
+        shared,
+        gas_price,
+        "recipient_allowlist",
+    )
+}
+
+/// A keyless read of one `agent_wallet::<view><T>(&AgentWallet<T>)`.
+fn wallet_view_transaction(
+    package_id: Address,
+    wallet_id: Address,
+    coin_type: &str,
+    shared: &SharedObjects,
+    gas_price: u64,
+    view: &str,
+) -> Result<sui_sdk_types::Transaction, BookError> {
     let mut tx = TransactionBuilder::new();
     tx.set_sender(Address::ZERO);
     tx.set_gas_budget(10_000_000);
@@ -59,8 +103,7 @@ pub fn policy_rules_transaction(
             package_id,
             Identifier::new("agent_wallet")
                 .map_err(|_| BookError::BadIdentifier("agent_wallet".into()))?,
-            Identifier::new("policy_rules")
-                .map_err(|_| BookError::BadIdentifier("policy_rules".into()))?,
+            Identifier::new(view).map_err(|_| BookError::BadIdentifier(view.into()))?,
         )
         .with_type_args(vec![coin]),
         vec![wallet],
@@ -77,9 +120,40 @@ pub fn policy_rules_transaction(
 
     let mut built = tx
         .try_build()
-        .map_err(|_| BookError::BadIdentifier("policy_rules transaction".into()))?;
+        .map_err(|_| BookError::BadIdentifier(format!("{view} transaction")))?;
     built.gas_payment.objects.clear();
     Ok(built)
+}
+
+const RECIPIENT_ALLOWLIST_CALL: &str = "the recipient_allowlist read";
+
+/// Decode `Option<vector<address>>`: `None` when the owner set no list, `Some` (possibly empty)
+/// when the wallet pays out only to the addresses in it.
+///
+/// BCS by hand, like [`parse_type_names`], so the read adds no dependency: a tag byte (0 or 1),
+/// then a ULEB128 count and 32 bytes per address. Strict: trailing bytes mean it was not this type,
+/// and reading part of a list as the whole would name the wrong recipients to the agent.
+pub fn parse_recipient_allowlist(bytes: &[u8]) -> Result<Option<Vec<Address>>, BookError> {
+    let unreadable = || BookError::UnreadableValue {
+        call: RECIPIENT_ALLOWLIST_CALL,
+    };
+    let (tag, rest) = bytes.split_first().ok_or_else(unreadable)?;
+    match tag {
+        0 if rest.is_empty() => return Ok(None),
+        1 => {}
+        _ => return Err(unreadable()),
+    }
+    let mut cursor = 0usize;
+    let count = read_uleb128(rest, &mut cursor).map_err(|_| unreadable())?;
+    let body = &rest[cursor..];
+    if (body.len() as u64) != count.saturating_mul(Address::LENGTH as u64) {
+        return Err(unreadable());
+    }
+    Ok(Some(
+        body.chunks_exact(Address::LENGTH)
+            .map(|raw| Address::from_bytes(raw).map_err(|_| unreadable()))
+            .collect::<Result<_, _>>()?,
+    ))
 }
 
 /// The Move call this module reads, named once so a refusal says which read failed.
@@ -235,6 +309,69 @@ mod tests {
             vec!["budget"],
             "an unrecognised rule is dropped from the emit list, not guessed at"
         );
+    }
+
+    /// Absent and empty are different answers: an empty list still closes the coin path, so the
+    /// decoder must not collapse one into the other.
+    #[test]
+    fn a_recipient_allowlist_decodes_absent_empty_and_listed_apart() {
+        let a: Address = "0xd".parse().unwrap();
+        let b: Address = "0xe".parse().unwrap();
+        assert_eq!(
+            parse_recipient_allowlist(&bcs::to_bytes(&None::<Vec<Address>>).unwrap()).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_recipient_allowlist(&bcs::to_bytes(&Some(Vec::<Address>::new())).unwrap())
+                .unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            parse_recipient_allowlist(&bcs::to_bytes(&Some(vec![a, b])).unwrap()).unwrap(),
+            Some(vec![a, b])
+        );
+    }
+
+    #[test]
+    fn a_malformed_recipient_allowlist_is_refused() {
+        let mut bytes = bcs::to_bytes(&Some(vec![Address::ZERO])).unwrap();
+        bytes.push(0);
+        assert!(matches!(
+            parse_recipient_allowlist(&bytes),
+            Err(BookError::UnreadableValue {
+                call: RECIPIENT_ALLOWLIST_CALL
+            })
+        ));
+        assert!(
+            parse_recipient_allowlist(&[2]).is_err(),
+            "2 is not an Option tag"
+        );
+    }
+
+    #[test]
+    fn the_recipient_allowlist_read_calls_the_view() {
+        let mut shared = SharedObjects::new();
+        let wallet: Address = "0x20".parse().unwrap();
+        shared.insert(wallet, 349_181_939);
+        let tx = recipient_allowlist_transaction(
+            "0xca".parse().unwrap(),
+            wallet,
+            "0x2::sui::SUI",
+            &shared,
+            1_000,
+        )
+        .unwrap();
+        let sui_sdk_types::TransactionKind::ProgrammableTransaction(ptb) = &tx.kind else {
+            panic!("a programmable transaction");
+        };
+        let [sui_sdk_types::Command::MoveCall(call)] = ptb.commands.as_slice() else {
+            panic!("one call");
+        };
+        assert_eq!(
+            (call.module.as_str(), call.function.as_str()),
+            ("agent_wallet", "recipient_allowlist")
+        );
+        assert_eq!(tx.sender, Address::ZERO, "a keyless read");
     }
 
     #[test]

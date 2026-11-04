@@ -145,3 +145,69 @@ fn the_superseded_spend_entry_point_is_absent() {
     assert!(source.contains("public fun request_spend"));
     assert!(source.contains("public fun confirm_spend"));
 }
+
+/// `confirm_spend_to` consumes a `SpendRequest` minted by the non-entry `request_spend` in the same
+/// PTB, so it must be a `public fun`; an `entry fun` could not take that argument at all.
+#[test]
+fn confirm_spend_to_takes_the_five_arguments_the_builder_emits() {
+    let source = move_source("agent_wallet.move");
+    assert!(source.contains("public fun confirm_spend_to"));
+    assert!(!source.contains("entry fun confirm_spend_to"));
+    let params = parameters_of(&source, "confirm_spend_to");
+    assert_eq!(
+        caller_supplied_arity(&params),
+        5,
+        "the builder emits [wallet, request, recipient, version, clock]; Move says: {params}"
+    );
+    for (position, expected) in [
+        "wallet: &mut AgentWallet<T>",
+        "req: SpendRequest",
+        "recipient: address",
+        "version: &Version",
+        "clock: &Clock",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let actual = params.split(',').nth(position).unwrap().trim();
+        assert_eq!(actual, *expected, "argument {position} of confirm_spend_to");
+    }
+}
+
+/// The owner builders' argument lists, positionally. Only `allow_recipient` takes the `Version`:
+/// activating the list is gated, tightening and leaving it are not.
+#[test]
+fn the_recipient_allowlist_owner_calls_take_what_the_builders_emit() {
+    let source = move_source("agent_wallet.move");
+    for (function, expected) in [
+        (
+            "allow_recipient",
+            &["wallet:", "version:", "recipient:"][..],
+        ),
+        ("disallow_recipient", &["wallet:", "recipient:"][..]),
+        ("clear_recipient_allowlist", &["wallet:"][..]),
+    ] {
+        let params = parameters_of(&source, function);
+        assert_eq!(
+            caller_supplied_arity(&params),
+            expected.len(),
+            "{function}: {params}"
+        );
+        for (position, name) in expected.iter().enumerate() {
+            let actual = params.split(',').nth(position).unwrap().trim();
+            assert!(
+                actual.starts_with(name),
+                "{function} argument {position} is {actual}"
+            );
+        }
+    }
+    let read = parameters_of(&source, "recipient_allowlist");
+    assert_eq!(
+        caller_supplied_arity(&read),
+        1,
+        "the read takes only the wallet: {read}"
+    );
+    assert!(source.contains(
+        "public fun recipient_allowlist<T>(wallet: &AgentWallet<T>): Option<vector<address>>"
+    ));
+}

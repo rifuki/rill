@@ -148,4 +148,42 @@ module agent_wallet::protected_tests {
     #[test]
     fun change_returns_to_vault_without_resetting_spend() { let mut sc = setup(); execute_output<OUTPUT>(&mut sc, 50, 20, true); ts::end(sc); }
 
+    // Protected and allowlisted are both owner-chosen destinations, so a protected wallet may also
+    // pay listed recipients. Without a list, confirm_spend_to adds no path at all.
+    const RECIPIENT: address = @0xD;
+
+    fun spend_to(sc: &mut ts::Scenario, recipient: address) {
+        ts::next_tx(sc, AGENT);
+        let v = ts::take_shared<Version>(sc);
+        let mut w = ts::take_shared<AgentWallet<SUI>>(sc);
+        let cap = ts::take_from_sender<AgentCap>(sc);
+        let clock = clock::create_for_testing(ts::ctx(sc));
+        let mut req = aw::request_spend(&w, &cap, &v, 100, &clock, ts::ctx(sc));
+        budget::prove(&mut req, &mut w, &v);
+        aw::confirm_spend_to(&mut w, req, recipient, &v, &clock, ts::ctx(sc));
+        ts::return_shared(w);
+        ts::return_shared(v);
+        ts::return_to_sender(sc, cap);
+        clock::destroy_for_testing(clock);
+    }
+
+    #[test]
+    fun protected_wallet_with_allowlist_pays_listed_recipient() {
+        let mut sc = setup();
+        ts::next_tx(&mut sc, OWNER);
+        let v = ts::take_shared<Version>(&sc);
+        let mut w = ts::take_shared<AgentWallet<SUI>>(&sc);
+        aw::allow_recipient(&mut w, &v, RECIPIENT, ts::ctx(&mut sc));
+        ts::return_shared(w);
+        ts::return_shared(v);
+        spend_to(&mut sc, RECIPIENT);
+        ts::next_tx(&mut sc, RECIPIENT);
+        let out = ts::take_from_sender<sui::coin::Coin<SUI>>(&sc);
+        assert!(coin::value(&out) == 100, 0);
+        coin::burn_for_testing(out);
+        ts::end(sc);
+    }
+
+    #[test, expected_failure(abort_code = 23, location = aw)]
+    fun protected_wallet_without_allowlist_spend_to_aborts() { let mut sc = setup(); spend_to(&mut sc, OWNER); ts::end(sc); }
 }

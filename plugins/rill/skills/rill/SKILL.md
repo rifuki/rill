@@ -116,6 +116,15 @@ published workflow creates a new immutable version requiring a new owner-signed 
 types retain their declared budget rules and signer restrictions; do not describe those as using
 the protected swap adapter.
 
+## Recipient allowlist
+
+A wallet's owner can list, on chain, the only addresses it may pay. `rill_wallet` reports that list
+as `recipientAllowlist` (null means the wallet has none). On such a wallet `rill_spend` needs `to`,
+and `to` must be one of the listed addresses; the contract transfers to it directly. `rill_swap`,
+`rill_stake` and any other action that needs a released coin abort on it, unless they run through
+a protected swap grant. Only the owner can change the list, and not from this signer.
+Do not try another address after a refusal: tell the user which addresses the owner allowed.
+
 ## Before anything that submits outside a grant
 
 `rill_spend`, `rill_swap`, `rill_stake`, `rill_unstake` without `dryRun` and `rill_execute` submit

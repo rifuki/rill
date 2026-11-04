@@ -69,15 +69,70 @@ pub const TESTNET_CETUS_INTEGRATE: &str =
 pub const TESTNET_CETUS_GLOBAL_CONFIG: &str =
     "0xc6273f844b4bc258952c4e477697aa12c918c8e08106fac6b934811298c9820a";
 
-/// The `agent_wallet` package on mainnet, published 2026-10-03 in
-/// `9SFxUDKGNKGwKcmKHZ6dQWj91WeYywUqMH2BPTZonZSG`. Its `Publisher` and `UpgradeCap` are held by the
-/// owner/deployer, and `deploy/mainnet.json` records every id the publication created.
+/// Marks a mainnet id that exists only once the coordinator has published the agent_wallet v3
+/// upgrade. Deliberately not an address, so nothing can build a transaction against it.
+pub const UNPUBLISHED: &str = "unpublished";
+
+/// Whether an id is still [`UNPUBLISHED`]. `const` so the call target below is chosen at compile
+/// time rather than by whichever code path happens to read it.
+pub const fn is_unpublished(id: &str) -> bool {
+    let (a, b) = (id.as_bytes(), UNPUBLISHED.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `next` once it is published, else `current`.
+pub const fn latest<'a>(next: &'a str, current: &'a str) -> &'a str {
+    if is_unpublished(next) {
+        current
+    } else {
+        next
+    }
+}
+
+/// The `agent_wallet` v2 `published-at` on mainnet (upgrade `8FMjfPWQ…`, `deploy/mainnet-v2.json`).
+/// The original publication was 2026-10-03 in `9SFxUDKGNKGwKcmKHZ6dQWj91WeYywUqMH2BPTZonZSG`, and
+/// its id `0xb8b95f9b…` stays the type origin of `AgentWallet`, `AgentCap` and `SpendRequest`.
 ///
-/// Compiled in so that a signer launched by an MCP config needs no environment to find it. An
-/// upgrade keeps this id as the type origin but moves the call target, so after one this becomes
-/// the latest `published-at` and the original stays recorded in `Published.toml`.
-pub const MAINNET_AGENT_WALLET: &str =
+/// Authoritative until the v3 `migrate` runs. After it, every agent call into this package aborts
+/// `version` code 0; owner exits on it keep working because they are not version-gated.
+pub const MAINNET_AGENT_WALLET_V2: &str =
     "0x1bad7dbb6084162202817375332addc489e158caac024f24b9b4c9440d180b7a";
+
+/// The `agent_wallet` v3 `published-at` on mainnet: the recipient allowlist.
+///
+/// Filled by the coordinator from the upgrade receipt, never guessed. The release workflow runs
+/// `deployments::tests::mainnet_v3_ids_are_filled`, so a tag cannot ship with the placeholder.
+pub const MAINNET_AGENT_WALLET_V3: &str = UNPUBLISHED;
+
+/// The `agent_wallet` package the signer calls on mainnet.
+///
+/// Compiled in so that a signer launched by an MCP config needs no environment to find it. It
+/// follows [`MAINNET_AGENT_WALLET_V3`] as soon as that is filled, and v2 until then, because before
+/// `migrate` the chain accepts only v2 and after it only v3: there is no build that serves both.
+pub const MAINNET_AGENT_WALLET: &str = latest(MAINNET_AGENT_WALLET_V3, MAINNET_AGENT_WALLET_V2);
+
+/// The `cetus_adapter` package published against agent_wallet v2 (`deploy/mainnet-v2.json`).
+///
+/// Its `execute_*` and `configure_*` call v2's `confirm_protected`/`configure_protected`, which
+/// check the `Version`, so after the v3 `migrate` every protected swap through it aborts `version`
+/// code 0 until the adapter is upgraded and relinked.
+pub const MAINNET_CETUS_ADAPTER_V1: &str =
+    "0x119d1a38177734b18c1d51895a507a184a619fb5fd8226d37bb94859deb0211f";
+
+/// The `cetus_adapter` `published-at` relinked against agent_wallet v3, filled from its upgrade
+/// receipt. The server reads its adapter from `RILL_CETUS_ADAPTER_PACKAGE_ID`, so that deployment
+/// setting has to move to this id in the same window.
+pub const MAINNET_CETUS_ADAPTER: &str = UNPUBLISHED;
 
 /// The shared `Version` object [`MAINNET_AGENT_WALLET`] gates itself on.
 pub const MAINNET_AGENT_WALLET_VERSION: &str =
@@ -188,6 +243,43 @@ pub fn guard_package(network: rill_core::envelope::Network, given: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The release gate. Ignored in ordinary runs because the ids exist only after the coordinator
+    /// publishes; the release workflow runs it with `--ignored`, so no tag can ship a signer that
+    /// still targets v2 bytecode after `migrate` retires it.
+    #[test]
+    #[ignore = "release gate: fails until the agent_wallet v3 upgrade ids are filled in"]
+    fn mainnet_v3_ids_are_filled() {
+        for (name, id) in [
+            ("MAINNET_AGENT_WALLET_V3", MAINNET_AGENT_WALLET_V3),
+            ("MAINNET_CETUS_ADAPTER", MAINNET_CETUS_ADAPTER),
+        ] {
+            assert!(
+                !is_unpublished(id),
+                "{name} is still the placeholder; fill it from the mainnet upgrade receipt"
+            );
+            id.parse::<sui_sdk_types::Address>()
+                .unwrap_or_else(|_| panic!("{name} is not an address: {id}"));
+        }
+        assert_eq!(MAINNET_AGENT_WALLET, MAINNET_AGENT_WALLET_V3);
+        assert_ne!(MAINNET_CETUS_ADAPTER, MAINNET_CETUS_ADAPTER_V1);
+    }
+
+    /// Unfilled, mainnet keeps calling v2, which is what the chain accepts until `migrate`. Filled,
+    /// one edit moves every default, so there is no second constant to forget.
+    #[test]
+    fn the_mainnet_call_target_follows_v3_once_it_is_filled() {
+        assert_eq!(
+            latest(UNPUBLISHED, MAINNET_AGENT_WALLET_V2),
+            MAINNET_AGENT_WALLET_V2
+        );
+        assert_eq!(latest("0xabc", MAINNET_AGENT_WALLET_V2), "0xabc");
+        assert!(is_unpublished(UNPUBLISHED));
+        assert!(UNPUBLISHED.parse::<sui_sdk_types::Address>().is_err());
+        if is_unpublished(MAINNET_AGENT_WALLET_V3) {
+            assert_eq!(MAINNET_AGENT_WALLET, MAINNET_AGENT_WALLET_V2);
+        }
+    }
 
     #[test]
     fn the_two_generations_are_not_the_same_address() {

@@ -452,6 +452,21 @@ pub mod aborts {
                     "The adapter returned more input change than was reserved. Stop execution \
                      and inspect the adapter's settlement accounting; do not bypass settlement."
                 }
+                ("agent_wallet", 20) => {
+                    "The wallet's owner set an on-chain recipient allowlist, so it pays out only \
+                     by rill_spend to a listed recipient; swaps, stakes and deposits need a \
+                     released coin and cannot run on it. Do not retry or route around it. Only the \
+                     owner can clear the list."
+                }
+                ("agent_wallet", 21) => {
+                    "Pay one of the recipients the owner listed (rill_wallet shows them). Do not \
+                     retry with another address hoping one passes; only the owner can change the \
+                     list."
+                }
+                ("agent_wallet", 22) | ("agent_wallet", 23) => {
+                    "The recipient list is the owner's to manage. Read it again before changing it; \
+                     the agent cannot change it at all."
+                }
                 _ => "Nothing about the amount will change this one.",
             }
         }
@@ -531,6 +546,13 @@ pub mod aborts {
             }
             ("agent_wallet", 18) => "the output asset does not match the protected policy",
             ("agent_wallet", 19) => "the returned input change exceeds the reserved spend",
+            ("agent_wallet", 20) => {
+                "the wallet's owner restricted payouts to listed recipients; this action needs \
+                 a released coin and cannot run on it"
+            }
+            ("agent_wallet", 21) => "that recipient is not on the owner's allowlist",
+            ("agent_wallet", 22) => "that recipient is already allowed",
+            ("agent_wallet", 23) => "this wallet has no recipient allowlist",
             _ => "a rule refused it",
         };
 
@@ -627,6 +649,53 @@ pub mod aborts {
                 ("E_INVALID_CHANGE", 19),
             ] {
                 assert!(source.contains(&format!("const {name}: u64 = {code};")));
+            }
+        }
+
+        #[test]
+        fn recipient_allowlist_abort_codes_match_the_move_contract() {
+            let source = include_str!("../../../move/agent_wallet/sources/agent_wallet.move");
+            for (name, code) in [
+                ("E_RECIPIENT_ALLOWLIST", 20),
+                ("E_RECIPIENT_NOT_ALLOWED", 21),
+                ("E_RECIPIENT_ALREADY_ALLOWED", 22),
+                ("E_NO_RECIPIENT_ALLOWLIST", 23),
+            ] {
+                assert!(
+                    source.contains(&format!("const {name}: u64 = {code};")),
+                    "{name} is not {code} in the Move source"
+                );
+            }
+        }
+
+        /// The agent's natural reaction to "recipient refused" is to try another address. Only
+        /// the owner can change the list, so the advice must say that and must not invite a retry.
+        #[test]
+        fn recipient_allowlist_refusals_send_the_agent_to_the_owner() {
+            for (code, expected) in [
+                (20, "listed recipients"),
+                (21, "not on the owner's allowlist"),
+                (22, "already allowed"),
+                (23, "no recipient allowlist"),
+            ] {
+                let error = PER_TX
+                    .replace("per_tx", "agent_wallet")
+                    .replace("}, 1)", &format!("}}, {code})"));
+                let refusal = classify_rule_abort(&error).expect("wallet refusal");
+                assert!(refusal.meaning.contains(expected), "code {code}: {refusal}");
+                let advice = refusal.advice();
+                assert_ne!(advice, "Nothing about the amount will change this one.");
+                assert!(advice.contains("owner"), "code {code}: {advice}");
+            }
+            for code in [20, 21] {
+                let error = PER_TX
+                    .replace("per_tx", "agent_wallet")
+                    .replace("}, 1)", &format!("}}, {code})"));
+                let advice = classify_rule_abort(&error).unwrap().advice();
+                assert!(
+                    advice.contains("Do not retry"),
+                    "code {code} must not invite a retry: {advice}"
+                );
             }
         }
 

@@ -23,7 +23,12 @@ use sui::event;
 /// Bump on every upgrade that changes on-chain behavior. `migrate` moves a live `Version` object's
 /// `version` field up to match; callers holding a stale `Version` reference get rejected by
 /// `check_is_valid` until they migrate.
-const VERSION: u64 = 2;
+///
+/// 3 adds the owner's recipient allowlist. Old package versions stay callable on Sui, and v2's
+/// `confirm_spend` knows nothing of the allowlist, so the list only binds once `migrate` has moved
+/// the live object past 2 and every v2 agent path aborts here. `allow_recipient` is gated for the
+/// same reason: a list must not be settable while bytecode that ignores it is still authoritative.
+const VERSION: u64 = 3;
 
 /// `check_is_valid` was called against a `Version` object whose `version` no longer matches this
 /// package's compiled `VERSION` — the caller is targeting stale bytecode/state assumptions.
@@ -83,3 +88,7 @@ public fun set_for_testing(self: &mut Version, version: u64) {
 
 #[test_only]
 public fun current_for_testing(): u64 { VERSION }
+
+#[test_only]
+/// The live object's value, so a test can show what older bytecode would compare it against.
+public fun value_for_testing(self: &Version): u64 { self.version }

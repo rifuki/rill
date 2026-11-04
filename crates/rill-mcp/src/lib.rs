@@ -459,7 +459,7 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                         },
                         "to": {
                             "type": "string",
-                            "description": "Recipient address. Defaults to the signer."
+                            "description": "Recipient address. Defaults to the signer, unless the wallet's owner set an on-chain recipient allowlist: then it is required and must be on that list, which rill_wallet shows."
                         }
                     },
                     "required": ["wallet", "cap", "amount"],
@@ -824,6 +824,21 @@ mod tests {
 
     /// The tools that build afresh on every call cannot tell a retry from a second intent, so each
     /// one takes a caller-chosen key. The three that need none keep saying they are not idempotent.
+    /// An agent reads the schema, not the contract. Told only "defaults to the signer", it would
+    /// omit `to` on an allowlisted wallet and be refused, or guess addresses until one passed.
+    #[test]
+    fn rill_spend_says_an_owner_allowlist_makes_to_required() {
+        let spend = tools(Surface::Wallet)
+            .into_iter()
+            .find(|t| t.name == "rill_spend")
+            .expect("rill_spend is offered");
+        let to = spend.input_schema["properties"]["to"]["description"]
+            .as_str()
+            .expect("to is described");
+        assert!(to.contains("on-chain recipient allowlist"), "{to}");
+        assert!(to.contains("required"), "{to}");
+    }
+
     #[test]
     fn every_rebuilding_submitter_requires_an_idempotency_key() {
         let tools: Vec<Tool> = tools(Surface::Owner);

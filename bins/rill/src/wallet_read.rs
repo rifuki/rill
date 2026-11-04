@@ -36,7 +36,9 @@
 use crate::limits::{largest_spend_now, rule_config, wallet_facts, RuleConfig};
 use rill_chain::{grpc::GrpcSui, SuiRead};
 use rill_core::manifest::{CapabilityManifest, CapabilityRule, Enforcement, RuleKind};
-use rill_ptb::policy_read::{parse_type_names, policy_rules_transaction, rule_module};
+use rill_ptb::policy_read::{
+    parse_type_names, policy_rules_transaction, recipient_allowlist_transaction, rule_module,
+};
 use rill_ptb::shared::SharedObjects;
 use serde_json::{json, Map, Value};
 use sui_sdk_types::Address;
@@ -129,6 +131,21 @@ pub async fn read_limits_from(
         .ok_or("the wallet did not report its rules")
         .and_then(|b| parse_type_names(b).map_err(|_| "the rule list did not decode"))?;
 
+    let recipient_allowlist =
+        match read_recipient_allowlist(chain, package_id, wallet, &shared, gas_price).await {
+            Ok(None) => Value::Null,
+            Ok(Some(addresses)) => json!({
+                "enforcement": Enforcement::OnChain.as_str(),
+                "addresses": addresses.iter().map(Address::to_string).collect::<Vec<_>>(),
+            }),
+            // Said in place, not dropped: an absent list and an unread one lead an agent to opposite
+            // conclusions about whether rill_swap can run.
+            Err(why) => json!({
+                "enforcement": Enforcement::OnChain.as_str(),
+                "unavailable": why,
+            }),
+        };
+
     // The wallet's own numbers, and each rule's configured ceiling. Both are reads the chain
     // answers; neither was asked for before, which is why this report used to name rules without a
     // single value beside them. A missing field is reported rather than defaulted: a zero balance
@@ -167,6 +184,7 @@ pub async fn read_limits_from(
     if let Value::Object(labels) = label_rules_with_limits(&names, local, &configs) {
         report.extend(labels);
     }
+    report.insert("recipientAllowlist".into(), recipient_allowlist);
 
     match facts {
         Ok(facts) => {
@@ -212,6 +230,36 @@ pub async fn read_limits_from(
     }
 
     Ok(Value::Object(report))
+}
+
+/// The owner's on-chain recipient allowlist, `None` when the wallet has none.
+async fn read_recipient_allowlist(
+    chain: &impl SuiRead,
+    package_id: &str,
+    wallet: Address,
+    shared: &SharedObjects,
+    gas_price: u64,
+) -> Result<Option<Vec<Address>>, String> {
+    let tx = recipient_allowlist_transaction(
+        package_id
+            .parse()
+            .map_err(|_| format!("{package_id} is not an address"))?,
+        wallet,
+        "0x2::sui::SUI",
+        shared,
+        gas_price,
+    )
+    .map_err(|e| e.to_string())?;
+    let b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&tx).map_err(|e| e.to_string())?)
+    };
+    let outcome = chain
+        .simulate_read(&b64)
+        .await
+        .map_err(|e| format!("reading the wallet's recipient allowlist: {e}"))?;
+    crate::spend_cmd::allowlist_from_read(&outcome)
 }
 
 /// Which rules hold and which layer holds each, from the rule types the chain reported and the
@@ -335,8 +383,11 @@ const NOTE: &str = "Start with `largestSpendNow`: it is the biggest single spend
     proved on chain against the real transaction, nothing in this process and nothing passed to it \
     can widen them, and a spend that exceeds one is aborted by the chain. Their configured values \
     are under each rule's `limits`, in base units, read from the chain rather than from anything \
-    this process was told. Nothing on chain checks a protocol, an asset, a recipient or a slippage \
-    floor. Those rules are pre-flight and are listed under `preFlightRules` only from a run set \
+    this process was told. A recipient is checked on chain only when the wallet's owner set the \
+    list under `recipientAllowlist` (null means none): then rill_spend must name one of those \
+    addresses as its to argument, and rill_swap, rill_stake and anything else that needs a released coin \
+    abort on this wallet. Nothing on chain checks a protocol, an asset, or a slippage floor, nor a \
+    run set's recipient rule. Those rules are pre-flight and are listed under `preFlightRules` only from a run set \
     loaded from a file for this wallet (null means no run set is loaded for this wallet, which \
     says nothing about grants, and not that there are no such rules). Each names under \
     `signerRefusesOn` the tools on which this signer refuses to sign a breach of that loaded \
@@ -420,17 +471,19 @@ mod assembly_tests {
     }
 
     fn node(shared: Option<u64>, rules: &[&str]) -> FakeSui {
+        let rules = type_names(
+            &rules
+                .iter()
+                .map(|m| format!("{}::{m}::Rule", &PACKAGE[2..]))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        // The rules, then the recipient allowlist, which these wallets do not have.
         FakeSui::new()
             .with_object(None, wallet_object(shared))
-            .with_read_return(type_names(
-                &rules
-                    .iter()
-                    .map(|m| format!("{}::{m}::Rule", &PACKAGE[2..]))
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>(),
-            ))
+            .with_read_sequence(vec![rules, vec![0]])
             .with_reference_gas_price(1000)
     }
 
@@ -641,6 +694,32 @@ mod assembly_tests {
     fn an_object_that_is_not_shared_is_refused_by_name() {
         let error = run(&node(None, &["budget"]), None).expect_err("not a wallet");
         assert!(error.contains("is not a shared object"), "{error}");
+    }
+
+    /// The owner's on-chain recipient list is reported beside the rules, so an agent can see that a
+    /// swap or stake (which needs a released coin) will abort 20 before trying, and whom it may pay.
+    /// `null` when the wallet has none, which is a different fact from an empty list.
+    #[test]
+    fn the_owners_recipient_allowlist_is_reported_from_the_chain() {
+        let listed = format!("0x{:064x}", 0xdd);
+        let mut list = vec![1, 1];
+        list.extend_from_slice(listed.parse::<Address>().unwrap().as_bytes());
+        let rules = type_names(&[&format!("{}::budget::Rule", &PACKAGE[2..])]);
+        let chain = FakeSui::new()
+            .with_object(None, wallet_object(Some(3)))
+            .with_read_sequence(vec![rules.clone(), list])
+            .with_reference_gas_price(1000);
+        let out = run(&chain, None).expect("the read assembles");
+        assert_eq!(out["recipientAllowlist"]["enforcement"], "on-chain");
+        assert_eq!(out["recipientAllowlist"]["addresses"], json!([listed]));
+
+        let chain = FakeSui::new()
+            .with_object(None, wallet_object(Some(3)))
+            .with_read_sequence(vec![rules, vec![0]])
+            .with_reference_gas_price(1000);
+        let out = run(&chain, None).expect("the read assembles");
+        assert!(out["recipientAllowlist"].is_null(), "{out}");
+        assert!(out.as_object().unwrap().contains_key("recipientAllowlist"));
     }
 
     /// The gas price is read because the node refuses a read priced below its reference. A node

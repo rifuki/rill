@@ -58,6 +58,10 @@ jobs:
         run: cargo metadata --format-version 1 --locked > /dev/null
       - name: No dependency gained a build script without review
         run: scripts/audit-build-scripts.sh check
+      # The agent_wallet v3 ids exist only after the mainnet upgrade, and until they are filled the
+      # signer still calls v2, which `migrate` retires. Ignored in CI, run here so no tag ships it.
+      - name: Mainnet deployment ids are filled
+        run: cargo test -p rill-ptb --lib --locked deployments::tests::mainnet_v3_ids_are_filled -- --ignored --exact
 
   wallet:
     needs: supply-chain

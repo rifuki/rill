@@ -216,3 +216,102 @@ fn neither_builder_will_spend_from_a_wallet_that_nothing_gates() {
     build_gated_spend_for_modules(&mut tx, &one, 1, &["budget"], &resolved())
         .expect("one module builds");
 }
+
+/// The wallet-pays-recipient sequence: the coin never reaches the PTB, so there is nothing to
+/// transfer and nothing a caller could redirect.
+#[test]
+fn a_spend_to_ends_in_confirm_spend_to_with_no_transfer() {
+    use rill_ptb::spend::{build_gated_spend_to_for_modules, expected_spend_to_targets};
+    use sui_sdk_types::{Command, TransactionKind};
+
+    let b = binding(vec![CapabilityRule::Budget {
+        total_mist: "5000000000".into(),
+    }]);
+    let recipient = addr("0x00000000000000000000000000000000000000000000000000000000000000dd");
+    let mut tx = TransactionBuilder::new();
+    tx.set_sender(addr(
+        "0x0000000000000000000000000000000000000000000000000000000000000009",
+    ));
+    tx.set_gas_budget(10_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(
+        addr("0x000000000000000000000000000000000000000000000000000000000000000a"),
+        1,
+        Digest::ZERO,
+    )]);
+    build_gated_spend_to_for_modules(
+        &mut tx,
+        &b,
+        1_000_000,
+        &["budget", "per_tx"],
+        recipient,
+        &resolved(),
+    )
+    .expect("spend_to should build");
+    let built = tx.try_build().expect("a valid transaction");
+
+    let TransactionKind::ProgrammableTransaction(ptb) = &built.kind else {
+        panic!("a programmable transaction");
+    };
+    let calls: Vec<String> = ptb
+        .commands
+        .iter()
+        .map(|c| match c {
+            Command::MoveCall(call) => format!("{}::{}", call.module, call.function),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "agent_wallet::request_spend",
+            "budget::prove",
+            "per_tx::prove",
+            "agent_wallet::confirm_spend_to"
+        ],
+        "no TransferObjects, no other command"
+    );
+    let Command::MoveCall(last) = ptb.commands.last().unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(
+        last.arguments.len(),
+        5,
+        "wallet, request, recipient, version, clock"
+    );
+    let sui_sdk_types::Argument::Input(i) = last.arguments[2] else {
+        panic!("the recipient is a pure input");
+    };
+    let sui_sdk_types::Input::Pure(value) = &ptb.inputs[i as usize] else {
+        panic!("the recipient is a pure input");
+    };
+    assert_eq!(value, &bcs::to_bytes(&recipient).unwrap());
+
+    assert_eq!(
+        expected_spend_to_targets(addr(PKG), &["budget", "per_tx"]),
+        vec![
+            format!("{PKG}::agent_wallet::request_spend"),
+            format!("{PKG}::budget::prove"),
+            format!("{PKG}::per_tx::prove"),
+            format!("{PKG}::agent_wallet::confirm_spend_to"),
+        ]
+    );
+}
+
+#[test]
+fn a_spend_to_keeps_the_zero_and_no_rules_refusals() {
+    use rill_ptb::spend::build_gated_spend_to_for_modules;
+
+    let b = binding(vec![]);
+    let to = addr("0x00000000000000000000000000000000000000000000000000000000000000dd");
+    let mut tx = TransactionBuilder::new();
+    assert!(matches!(
+        build_gated_spend_to_for_modules(&mut tx, &b, 0, &["budget"], to, &resolved()),
+        Err(SpendError::ZeroAmount)
+    ));
+    let mut tx = TransactionBuilder::new();
+    assert!(matches!(
+        build_gated_spend_to_for_modules(&mut tx, &b, 1, &[], to, &resolved()),
+        Err(SpendError::NoRulesAttached)
+    ));
+}

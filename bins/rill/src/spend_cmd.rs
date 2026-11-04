@@ -9,11 +9,25 @@
 //! `confirm_spend` returns a `Coin<T>`, and a coin left unconsumed aborts execution with
 //! `UnusedValueWithoutDrop`. So this transfers it — to a recipient if one is named, back to the
 //! sender otherwise. There is no path here that builds a spend and forgets the coin.
+//!
+//! # Unless the owner listed the recipients
+//!
+//! A wallet whose owner set an on-chain recipient allowlist refuses `confirm_spend`, because a coin
+//! handed back to the transaction could be sent anywhere. Its payouts end in `confirm_spend_to`,
+//! which transfers inside Move and checks the recipient against the list. The list is read before
+//! building, and a recipient that is not on it is refused here, but that refusal is only courtesy:
+//! the contract is what enforces it.
 
 use rill_chain::{grpc::GrpcSui, SuiRead, SuiWrite};
-use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
+use rill_ptb::policy_read::{
+    attached_modules, parse_recipient_allowlist, parse_type_names, policy_rules_transaction,
+    recipient_allowlist_transaction,
+};
 use rill_ptb::shared::SharedObjects;
-use rill_ptb::spend::{build_gated_spend_for_modules, WalletBinding};
+use rill_ptb::spend::{
+    build_gated_spend_for_modules, build_gated_spend_to_for_modules, expected_spend_to_targets,
+    WalletBinding,
+};
 use rill_ptb::transfer::transfer_coin;
 use sui_sdk_types::{Address, Digest};
 use sui_transaction_builder::{ObjectInput, TransactionBuilder};
@@ -201,6 +215,30 @@ pub async fn spend_json_on(
         )));
     }
 
+    let package_id: Address = args
+        .package_id
+        .parse()
+        .map_err(|_| format!("{} is not an address", args.package_id))?;
+    let allowlist_tx =
+        recipient_allowlist_transaction(package_id, wallet_id, "0x2::sui::SUI", &shared, gas_price)
+            .map_err(|e| e.to_string())?;
+    let allowlist_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&allowlist_tx).map_err(|e| e.to_string())?)
+    };
+    let allowlist = allowlist_from_read(
+        &chain
+            .simulate_read(&allowlist_b64)
+            .await
+            .map_err(|e| format!("reading the wallet's recipient allowlist: {e}"))?,
+    )?;
+    let to = match &args.recipient {
+        Some(r) => Some(r.parse().map_err(|_| format!("{r} is not an address"))?),
+        None => None,
+    };
+    let payout = payout(allowlist.as_deref(), to, sender)?;
+
     let amount_mist = rill_core::amounts::decimal_to_base_units(&args.amount, 9)
         .map_err(|e| format!("the amount: {e}"))?;
 
@@ -238,30 +276,50 @@ pub async fn spend_json_on(
     };
 
     let module_refs: Vec<&str> = modules.iter().map(String::as_str).collect();
-    let coin = build_gated_spend_for_modules(&mut tx, &binding, amount_mist, &module_refs, &shared)
-        .map_err(|e| e.to_string())?;
-
-    let recipient = match &args.recipient {
-        Some(r) => r.parse().map_err(|_| format!("{r} is not an address"))?,
-        None => sender,
+    let (recipient, call_sequence) = match payout {
+        Payout::Transfer(recipient) => {
+            let coin = build_gated_spend_for_modules(
+                &mut tx,
+                &binding,
+                amount_mist,
+                &module_refs,
+                &shared,
+            )
+            .map_err(|e| e.to_string())?;
+            // The released coin, consumed. See the module note.
+            transfer_coin(&mut tx, coin, recipient);
+            let sequence: Vec<String> = std::iter::once(format!(
+                "{}::agent_wallet::request_spend",
+                binding.package_id
+            ))
+            .chain(
+                modules
+                    .iter()
+                    .map(|m| format!("{}::{m}::prove", binding.package_id)),
+            )
+            .chain(std::iter::once(format!(
+                "{}::agent_wallet::confirm_spend",
+                binding.package_id
+            )))
+            .collect();
+            (recipient, sequence)
+        }
+        Payout::SpendTo(recipient) => {
+            build_gated_spend_to_for_modules(
+                &mut tx,
+                &binding,
+                amount_mist,
+                &module_refs,
+                recipient,
+                &shared,
+            )
+            .map_err(|e| e.to_string())?;
+            (
+                recipient,
+                expected_spend_to_targets(binding.package_id, &module_refs),
+            )
+        }
     };
-    // The released coin, consumed. See the module note.
-    transfer_coin(&mut tx, coin, recipient);
-
-    let call_sequence: Vec<String> = std::iter::once(format!(
-        "{}::agent_wallet::request_spend",
-        binding.package_id
-    ))
-    .chain(
-        modules
-            .iter()
-            .map(|m| format!("{}::{m}::prove", binding.package_id)),
-    )
-    .chain(std::iter::once(format!(
-        "{}::agent_wallet::confirm_spend",
-        binding.package_id
-    )))
-    .collect();
 
     let built = tx.try_build().map_err(|e| format!("compiling: {e}"))?;
     let b64 = {
@@ -291,6 +349,9 @@ pub async fn spend_json_on(
         "gasUsed": outcome.gas_used_mist,
         "submitted": false,
     });
+    if allowlist.is_some() {
+        result["recipientAllowlist"] = serde_json::Value::String("on-chain".into());
+    }
 
     if args.dry_run {
         result["note"] = serde_json::Value::String(
@@ -322,4 +383,200 @@ pub async fn spend_json_on(
             .into(),
     );
     Ok(result)
+}
+
+/// Where a released coin goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Payout {
+    /// `confirm_spend`, then a `TransferObjects` this signer builds.
+    Transfer(Address),
+    /// `confirm_spend_to`: the contract transfers, to an owner-listed address only.
+    SpendTo(Address),
+}
+
+/// Decide the payout from the wallet's allowlist (`None` when it has none) and the caller's `to`.
+///
+/// With a list there is no default. The signer is the agent, and paying the agent is a destination
+/// the owner did not choose unless they listed it.
+fn payout(
+    allowlist: Option<&[Address]>,
+    to: Option<Address>,
+    sender: Address,
+) -> Result<Payout, String> {
+    let Some(list) = allowlist else {
+        return Ok(Payout::Transfer(to.unwrap_or(sender)));
+    };
+    let named = if list.is_empty() {
+        "no recipients: its owner emptied the list, so it pays out to nobody".to_string()
+    } else {
+        format!(
+            "owner-approved recipients only: [{}]",
+            list.iter()
+                .map(Address::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    match to {
+        None => Err(format!(
+            "this wallet pays out to {named}. Name one of them with `to`; a spend without one \
+             would pay the agent, which the owner did not list."
+        )),
+        Some(to) if list.contains(&to) => Ok(Payout::SpendTo(to)),
+        Some(to) => Err(format!(
+            "{to} is not a recipient this wallet may pay. It pays out to {named}. Only the \
+             wallet's owner can change that list, on chain. Do not retry with another address."
+        )),
+    }
+}
+
+/// The allowlist, from a simulation of `agent_wallet::recipient_allowlist`.
+///
+/// Only a package that has no `recipient_allowlist` view is taken as no list: the view exists from
+/// package version 3, and a package without it has no `confirm_spend` that could honour a list
+/// either. Any other failed read (a node error, an abort, an unknown reason) says nothing about the
+/// list and is refused, as is a read that ran and answered something undecodable.
+pub(crate) fn allowlist_from_read(
+    outcome: &rill_chain::SimulationOutcome,
+) -> Result<Option<Vec<Address>>, String> {
+    if !outcome.ok {
+        let error = outcome.error.as_deref().unwrap_or("no reason given");
+        let lower = error.to_ascii_lowercase();
+        let no_such_view = [
+            "functionnotfound",
+            "function not found",
+            "linker_error",
+            "linkererror",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        return if no_such_view {
+            Ok(None)
+        } else {
+            Err(format!(
+                "the recipient allowlist could not be read: {error}"
+            ))
+        };
+    }
+    outcome
+        .command_returns
+        .iter()
+        .flatten()
+        .next()
+        .ok_or_else(|| "the wallet did not report its recipient allowlist".to_string())
+        .and_then(|b| {
+            parse_recipient_allowlist(b)
+                .map_err(|_| "the recipient allowlist did not decode".to_string())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rill_chain::{SimulationOutcome, Verification};
+
+    fn a(n: u8) -> Address {
+        format!("0x{n:064x}").parse().unwrap()
+    }
+
+    #[test]
+    fn without_a_list_the_coin_goes_where_it_always_did() {
+        assert_eq!(payout(None, None, a(0xb)), Ok(Payout::Transfer(a(0xb))));
+        assert_eq!(
+            payout(None, Some(a(0xe)), a(0xb)),
+            Ok(Payout::Transfer(a(0xe)))
+        );
+    }
+
+    /// Defaulting to the signer would pay the agent itself, which is exactly the destination an
+    /// owner who set a list did not choose.
+    #[test]
+    fn with_a_list_and_no_recipient_the_spend_is_refused_naming_the_list() {
+        let refusal = payout(Some(&[a(0xd)]), None, a(0xb)).unwrap_err();
+        assert!(refusal.contains("owner-approved recipients"), "{refusal}");
+        assert!(refusal.contains(&a(0xd).to_string()), "{refusal}");
+        assert!(refusal.contains("`to`"), "{refusal}");
+    }
+
+    #[test]
+    fn with_a_list_an_unlisted_recipient_is_refused_and_only_the_owner_can_change_it() {
+        let refusal = payout(Some(&[a(0xd)]), Some(a(0xe)), a(0xb)).unwrap_err();
+        assert!(refusal.contains(&a(0xd).to_string()), "{refusal}");
+        assert!(refusal.contains(&a(0xe).to_string()), "{refusal}");
+        assert!(refusal.contains("Only the wallet's owner"), "{refusal}");
+        assert!(refusal.contains("Do not retry"), "{refusal}");
+    }
+
+    #[test]
+    fn with_a_list_a_listed_recipient_is_paid_inside_move() {
+        assert_eq!(
+            payout(Some(&[a(0xd)]), Some(a(0xd)), a(0xb)),
+            Ok(Payout::SpendTo(a(0xd)))
+        );
+    }
+
+    #[test]
+    fn an_emptied_list_still_pays_nobody() {
+        let refusal = payout(Some(&[]), Some(a(0xd)), a(0xb)).unwrap_err();
+        assert!(refusal.contains("no recipients"), "{refusal}");
+    }
+
+    fn read(ok: bool, returns: Vec<Vec<Vec<u8>>>) -> SimulationOutcome {
+        SimulationOutcome {
+            ok,
+            verification: Verification::Verified,
+            error: None,
+            gas_used_mist: 0,
+            balance_changes: Vec::new(),
+            command_output_count: returns.len(),
+            command_returns: returns,
+        }
+    }
+
+    /// A package older than v3 has no `recipient_allowlist` view, and no `confirm_spend` that could
+    /// honour a list either, so a read that does not run means no list to route around. The chain
+    /// still enforces: on a v3 wallet with a list, `confirm_spend` aborts 20.
+    #[test]
+    fn a_read_the_package_cannot_answer_means_no_list() {
+        for missing in [
+            "FunctionNotFound in command 0",
+            "LINKER_ERROR: Cannot find ModuleId ... recipient_allowlist",
+        ] {
+            let mut outcome = read(false, vec![]);
+            outcome.error = Some(missing.into());
+            assert_eq!(allowlist_from_read(&outcome), Ok(None), "{missing}");
+        }
+    }
+
+    /// Any other failure (a node error, a wallet that does not exist, an abort) says nothing about
+    /// the list, so it must not be taken for "no list": a spend would then skip the owner's list
+    /// on the signer's side and be refused on chain only by luck of the route.
+    #[test]
+    fn any_other_failed_read_is_refused_not_taken_for_no_list() {
+        for other in [
+            None,
+            Some("MoveAbort in 0x2::dynamic_field, code 1"),
+            Some("timeout"),
+        ] {
+            let mut outcome = read(false, vec![]);
+            outcome.error = other.map(str::to_owned);
+            assert!(allowlist_from_read(&outcome).is_err(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_read_that_answers_is_decoded_strictly() {
+        assert_eq!(
+            allowlist_from_read(&read(true, vec![vec![vec![0]]])),
+            Ok(None)
+        );
+        let mut listed = vec![1, 1];
+        listed.extend_from_slice(a(0xd).as_bytes());
+        assert_eq!(
+            allowlist_from_read(&read(true, vec![vec![listed]])),
+            Ok(Some(vec![a(0xd)]))
+        );
+        assert!(allowlist_from_read(&read(true, vec![vec![vec![2]]])).is_err());
+        assert!(allowlist_from_read(&read(true, vec![])).is_err());
+    }
 }

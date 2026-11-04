@@ -210,3 +210,20 @@ fn the_skill_explains_the_step_up_pause_and_its_reach() {
         );
     }
 }
+
+/// An owner's on-chain recipient list changes what the agent may do with `rill_spend` and closes
+/// every tool that needs a released coin. The skill has to say both, and that only the owner can
+/// change the list, or an agent refused once tries the next address.
+#[test]
+fn the_skill_explains_the_owners_recipient_allowlist() {
+    let body = section("## Recipient allowlist");
+    for needed in [
+        "`recipientAllowlist`",
+        "`to`",
+        "`rill_swap`",
+        "Only the owner",
+        "Do not try another address",
+    ] {
+        assert!(body.contains(needed), "the section must say {needed:?}");
+    }
+}

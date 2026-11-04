@@ -1,7 +1,7 @@
 /// Rill agent wallet — an on-chain, capped, revocable budget for an AI agent, gated by a composable
 /// set of owner-attached restriction rules.
 ///
-/// v3 redesign: replaces v2's hardcoded `spend()` asserts (flat budget/per-tx/window/allowed-packages
+/// Design (the rule-based redesign of the original flat wallet): replaces the first wallet's hardcoded `spend()` asserts (flat budget/per-tx/window/allowed-packages
 /// fields baked into the wallet struct) with the Sui Kiosk `TransferPolicy` **Rule + Hot Potato**
 /// pattern. `request_spend` mints a `SpendRequest` — a hot potato with NO abilities (no `drop`,
 /// `store`, `key`, or `copy`) — carrying the spend's metadata. Every rule attached to the wallet's
@@ -33,8 +33,21 @@
 /// their own wallet. Owner ops stay live across any package version; only the agent's ability to move
 /// money is what an upgrade can pause.
 ///
-/// This is a fresh package (struct layout changed from v2; Sui upgrade compatibility forbids changing
-/// existing struct fields in-place), so v3 ships as a new deploy rather than an upgrade of v2.
+/// **Where a released coin can go.** A `SpendRequest` has exactly three exits, and `release_spend`
+/// is private, so these fully determine the destination of every coin the agent moves:
+/// - `confirm_spend` returns the coin to the transaction, which can send it anywhere. Only a wallet
+///   that is neither protected nor in recipient-allowlist mode may use it.
+/// - `confirm_spend_to` transfers the coin inside Move, and only to an address the owner listed
+///   with `allow_recipient`. It requires a list to exist, so it adds no path to a wallet without one.
+/// - `confirm_protected` hands the coin to the owner-bound adapter, whose output settles to the
+///   owner.
+/// Allowlist mode is the existence of the list, not its size: removing the last address leaves the
+/// coin path closed, and only `clear_recipient_allowlist` reopens it.
+///
+/// History: the rule-based design was itself a fresh package, because its struct layout differed
+/// from the first flat wallet and Sui upgrades cannot change existing fields. Everything since,
+/// protected mode (package VERSION 2) and the recipient allowlist (VERSION 3), ships as a
+/// compatible in-place upgrade of this package: additive items and new bodies only.
 module agent_wallet::agent_wallet {
     use std::type_name::{Self, TypeName};
     use sui::balance::{Self, Balance};
@@ -75,6 +88,13 @@ module agent_wallet::agent_wallet {
     const E_MIN_OUTPUT: u64 = 17;
     const E_WRONG_OUTPUT: u64 = 18;
     const E_INVALID_CHANGE: u64 = 19;
+    /// `confirm_spend` was called on a wallet whose owner restricted payouts to listed recipients.
+    /// A coin handed back to the transaction could be sent anywhere, so such a wallet pays out only
+    /// through `confirm_spend_to`.
+    const E_RECIPIENT_ALLOWLIST: u64 = 20;
+    const E_RECIPIENT_NOT_ALLOWED: u64 = 21;
+    const E_RECIPIENT_ALREADY_ALLOWED: u64 = 22;
+    const E_NO_RECIPIENT_ALLOWLIST: u64 = 23;
 
     /// Added through a dynamic field: existing published layouts remain unchanged.
     public struct ProtectedKey has copy, drop, store {}
@@ -101,6 +121,15 @@ module agent_wallet::agent_wallet {
         wallet: ID, revision: u64, amount: u64, output: u64,
         change: u64, recipient: address,
     }
+
+    /// Dynamic-field key on `wallet.id` (never `policy.id`, so it cannot collide with a `RuleKey`)
+    /// for the owner's recipient allowlist, a `VecSet<address>`. Added in v3 for the same reason as
+    /// `ProtectedKey`: the published struct layouts cannot change.
+    public struct RecipientAllowlistKey has copy, drop, store {}
+    public struct RecipientAllowed has copy, drop { wallet: ID, recipient: address }
+    public struct RecipientDisallowed has copy, drop { wallet: ID, recipient: address }
+    public struct RecipientAllowlistCleared has copy, drop { wallet: ID }
+    public struct SpentTo has copy, drop { wallet: ID, recipient: address, amount: u64 }
 
     /// Shared object: the agent's capped, revocable wallet. `T` = the budget coin type (any token).
     /// Deliberately minimal — custody + identity + hard kill-switch only. Every *composable*
@@ -287,7 +316,29 @@ module agent_wallet::agent_wallet {
         ctx: &mut TxContext,
     ): Coin<T> {
         assert!(!is_protected(wallet), E_PROTECTED_MODE);
+        assert!(!has_recipient_allowlist(wallet), E_RECIPIENT_ALLOWLIST);
         release_spend(wallet, req, version, clock, ctx)
+    }
+
+    /// Release the coin straight to an owner-listed recipient. The recipient is supplied by the
+    /// transaction, so it is checked against the list here rather than trusted. Public, not entry:
+    /// the `SpendRequest` comes from `request_spend` and the rules' `prove` in the same PTB.
+    ///
+    /// Allowed on a protected wallet too, because both modes name only owner-chosen destinations.
+    public fun confirm_spend_to<T>(
+        wallet: &mut AgentWallet<T>,
+        req: SpendRequest,
+        recipient: address,
+        version: &Version,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        assert!(has_recipient_allowlist(wallet), E_NO_RECIPIENT_ALLOWLIST);
+        assert!(is_recipient_allowed(wallet, recipient), E_RECIPIENT_NOT_ALLOWED);
+        let amount = req.amount;
+        let out = release_spend(wallet, req, version, clock, ctx);
+        transfer::public_transfer(out, recipient);
+        event::emit(SpentTo { wallet: object::id(wallet), recipient, amount });
     }
 
     fun release_spend<T>(
@@ -415,6 +466,68 @@ module agent_wallet::agent_wallet {
     public fun protected_policy<T>(wallet: &AgentWallet<T>): (TypeName, TypeName, ID, u64, u64) {
         let cfg: &ProtectedPolicy = df::borrow(&wallet.id, ProtectedKey {});
         (cfg.adapter, cfg.output, cfg.pool, cfg.min_output, cfg.revision)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Recipient allowlist: owner-only
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Owner lists a recipient, creating the list (and so entering allowlist mode) on first use.
+    /// Version-gated, unlike every other owner op: activating a guarantee must wait until `migrate`
+    /// has retired the v2 bytecode that would ignore it. There is no default list, not even the
+    /// owner, because an implicit entry is a destination the owner never chose.
+    public fun allow_recipient<T>(
+        wallet: &mut AgentWallet<T>, version: &Version, recipient: address, ctx: &TxContext,
+    ) {
+        assert!(ctx.sender() == wallet.owner, E_NOT_OWNER);
+        version.check_is_valid();
+        if (!has_recipient_allowlist(wallet)) {
+            df::add(&mut wallet.id, RecipientAllowlistKey {}, vec_set::empty<address>());
+        };
+        let set: &mut VecSet<address> = df::borrow_mut(&mut wallet.id, RecipientAllowlistKey {});
+        assert!(!set.contains(&recipient), E_RECIPIENT_ALREADY_ALLOWED);
+        set.insert(recipient);
+        event::emit(RecipientAllowed { wallet: object::id(wallet), recipient });
+    }
+
+    /// Owner removes a recipient. Not version-gated: it only tightens, and the owner must never be
+    /// trapped by a pending upgrade. The list stays even when emptied, so the coin path stays closed.
+    public fun disallow_recipient<T>(
+        wallet: &mut AgentWallet<T>, recipient: address, ctx: &TxContext,
+    ) {
+        assert!(ctx.sender() == wallet.owner, E_NOT_OWNER);
+        assert!(has_recipient_allowlist(wallet), E_NO_RECIPIENT_ALLOWLIST);
+        let set: &mut VecSet<address> = df::borrow_mut(&mut wallet.id, RecipientAllowlistKey {});
+        assert!(set.contains(&recipient), E_RECIPIENT_NOT_ALLOWED);
+        set.remove(&recipient);
+        event::emit(RecipientDisallowed { wallet: object::id(wallet), recipient });
+    }
+
+    /// Owner leaves allowlist mode, reopening `confirm_spend`. Not version-gated, so the owner can
+    /// always undo their own choice whatever state an upgrade is in.
+    public fun clear_recipient_allowlist<T>(wallet: &mut AgentWallet<T>, ctx: &TxContext) {
+        assert!(ctx.sender() == wallet.owner, E_NOT_OWNER);
+        assert!(has_recipient_allowlist(wallet), E_NO_RECIPIENT_ALLOWLIST);
+        let _: VecSet<address> = df::remove(&mut wallet.id, RecipientAllowlistKey {});
+        event::emit(RecipientAllowlistCleared { wallet: object::id(wallet) });
+    }
+
+    public fun has_recipient_allowlist<T>(wallet: &AgentWallet<T>): bool {
+        df::exists(&wallet.id, RecipientAllowlistKey {})
+    }
+
+    /// `none` when the wallet has no list, so one read tells absent from empty: an empty list still
+    /// closes the coin path.
+    public fun recipient_allowlist<T>(wallet: &AgentWallet<T>): Option<vector<address>> {
+        if (!has_recipient_allowlist(wallet)) return option::none();
+        let set: &VecSet<address> = df::borrow(&wallet.id, RecipientAllowlistKey {});
+        option::some(*set.keys())
+    }
+
+    public fun is_recipient_allowed<T>(wallet: &AgentWallet<T>, recipient: address): bool {
+        if (!has_recipient_allowlist(wallet)) return false;
+        let set: &VecSet<address> = df::borrow(&wallet.id, RecipientAllowlistKey {});
+        set.contains(&recipient)
     }
 
     /// Partial withdrawal remains available even during version transitions.

@@ -275,8 +275,46 @@ fn chain_for_spend(agent: &Keystore) -> FakeSui {
             Some(&agent.address().to_string()),
             owned(COIN, SUI_COIN_TYPE),
         )
-        .with_read_return(type_names(&["budget", "per_tx"]))
+        // Two reads, in the order the spend makes them: the rules, then the recipient allowlist,
+        // which this wallet does not have.
+        .with_read_sequence(vec![type_names(&["budget", "per_tx"]), vec![0]])
         .with_reference_gas_price(1_000)
+}
+
+/// The same wallet after its owner listed `recipients`.
+fn chain_for_allowlisted_spend(agent: &Keystore, recipients: &[&str]) -> FakeSui {
+    let mut list = vec![1, recipients.len() as u8];
+    for r in recipients {
+        list.extend_from_slice(r.parse::<sui_sdk_types::Address>().unwrap().as_bytes());
+    }
+    chain_for_spend(agent).with_read_sequence(vec![type_names(&["budget", "per_tx"]), list])
+}
+
+const LISTED: &str = "0x00000000000000000000000000000000000000000000000000000000000000dd";
+const UNLISTED: &str = "0x00000000000000000000000000000000000000000000000000000000000000ee";
+
+/// The last Move call of a submitted transaction, `module::function`.
+fn last_call(b64: &str) -> String {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .expect("base64");
+    let tx: sui_sdk_types::Transaction = bcs::from_bytes(&bytes).expect("a transaction");
+    let sui_sdk_types::TransactionKind::ProgrammableTransaction(ptb) = tx.kind else {
+        panic!("a programmable transaction");
+    };
+    assert!(
+        !ptb.commands
+            .iter()
+            .any(|c| matches!(c, sui_sdk_types::Command::TransferObjects(_))),
+        "a payout to a listed recipient hands no coin to the transaction"
+    );
+    match ptb.commands.last() {
+        Some(sui_sdk_types::Command::MoveCall(call)) => {
+            format!("{}::{}", call.module, call.function)
+        }
+        other => panic!("the last command is not a Move call: {other:?}"),
+    }
 }
 
 /// One `tools/call`, through the transport's own entry point.
@@ -398,6 +436,54 @@ fn an_agent_creates_a_wallet_attaches_its_rules_and_spends_inside_them() {
             "{target} missing from {sequence}"
         );
     }
+}
+
+/// An owner's on-chain allowlist moves the payout into Move: `confirm_spend_to`, no coin in the PTB.
+#[test]
+fn a_spend_from_an_allowlisted_wallet_pays_the_listed_recipient_inside_move() {
+    let agent = key(11);
+    let chain = chain_for_allowlisted_spend(&agent, &[LISTED]);
+    let mut args = spend_args(WALLET, "0.01");
+    args.recipient = Some(LISTED.into());
+
+    let spent = run(spend_json_on(&chain, &agent, &args)).expect("a listed recipient is paid");
+
+    assert_eq!(spent["submitted"], json!(true));
+    assert_eq!(spent["recipient"], json!(LISTED));
+    assert_eq!(spent["recipientAllowlist"], json!("on-chain"));
+    let sequence = spent["callSequence"].as_array().unwrap();
+    assert_eq!(
+        sequence.last().unwrap(),
+        &json!(format!("{PACKAGE}::agent_wallet::confirm_spend_to"))
+    );
+    let submitted = chain.submitted();
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(last_call(&submitted[0]), "agent_wallet::confirm_spend_to");
+}
+
+/// The local refusal is UX, the chain is the enforcement, and the UX must not let an agent learn
+/// the list by guessing: an unlisted recipient is refused before anything is signed.
+#[test]
+fn a_spend_to_an_unlisted_recipient_is_refused_before_anything_is_signed() {
+    let agent = key(11);
+    let chain = chain_for_allowlisted_spend(&agent, &[LISTED]);
+    let mut args = spend_args(WALLET, "0.01");
+    args.recipient = Some(UNLISTED.into());
+
+    let failure = run(spend_json_on(&chain, &agent, &args)).expect_err("unlisted");
+    let message = failure.to_string();
+    assert!(message.contains(LISTED), "{message}");
+    assert!(message.contains("Only the wallet's owner"), "{message}");
+    assert!(chain.submitted().is_empty());
+
+    args.recipient = None;
+    let failure = run(spend_json_on(
+        &chain_for_allowlisted_spend(&agent, &[LISTED]),
+        &agent,
+        &args,
+    ))
+    .expect_err("no recipient on an allowlisted wallet is not a payment to the agent");
+    assert!(failure.to_string().contains("`to`"), "{failure}");
 }
 
 /// A spend the per-transaction cap refuses comes back naming `per_tx`, and nothing is submitted.

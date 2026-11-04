@@ -16,7 +16,9 @@
 //!
 //! Each asserts `ctx.sender() == wallet.owner`. Signed with the agent's key they abort
 //! `E_NOT_OWNER` (1), which the abort table names. None takes the `Version` object: the contract
-//! does not gate owner operations on it, on purpose, so an upgrade cannot trap a wallet.
+//! does not gate owner operations on it, on purpose, so an upgrade cannot trap a wallet. The one
+//! exception is `allow_recipient`, which turns a guarantee on rather than getting the owner out,
+//! and so waits for the upgrade that makes the guarantee binding.
 
 use sui_sdk_types::{Address, Identifier};
 use sui_transaction_builder::{Argument, Function, TransactionBuilder};
@@ -159,6 +161,74 @@ pub fn build_extend_expiry(
         "extend_expiry",
         coin_type,
         vec![wallet, expiry],
+    )?;
+    Ok(())
+}
+
+/// Add an address to the wallet's recipient allowlist, creating the list on first use.
+///
+/// Creating it closes `confirm_spend` for this wallet: from then on the agent pays out only through
+/// `confirm_spend_to`, so swaps, stakes and deposits that need a released coin stop working unless
+/// the wallet is also protected. The one owner call here that takes the `Version`: activating the
+/// list is refused until the v3 `migrate` has retired bytecode that would ignore it.
+pub fn build_allow_recipient(
+    tx: &mut TransactionBuilder,
+    package_id: Address,
+    wallet_id: Address,
+    coin_type: &str,
+    version_id: Address,
+    recipient: Address,
+    shared: &SharedObjects,
+) -> Result<(), LifecycleError> {
+    let wallet = tx.object(shared.input(wallet_id, true)?);
+    let version = tx.object(shared.input(version_id, false)?);
+    let recipient = tx.pure(&recipient);
+    call(
+        tx,
+        package_id,
+        "allow_recipient",
+        coin_type,
+        vec![wallet, version, recipient],
+    )?;
+    Ok(())
+}
+
+/// Remove an address from the list. The list stays even when emptied, so payouts stay closed.
+pub fn build_disallow_recipient(
+    tx: &mut TransactionBuilder,
+    package_id: Address,
+    wallet_id: Address,
+    coin_type: &str,
+    recipient: Address,
+    shared: &SharedObjects,
+) -> Result<(), LifecycleError> {
+    let wallet = tx.object(shared.input(wallet_id, true)?);
+    let recipient = tx.pure(&recipient);
+    call(
+        tx,
+        package_id,
+        "disallow_recipient",
+        coin_type,
+        vec![wallet, recipient],
+    )?;
+    Ok(())
+}
+
+/// Drop the list entirely, which reopens `confirm_spend`.
+pub fn build_clear_recipient_allowlist(
+    tx: &mut TransactionBuilder,
+    package_id: Address,
+    wallet_id: Address,
+    coin_type: &str,
+    shared: &SharedObjects,
+) -> Result<(), LifecycleError> {
+    let wallet = tx.object(shared.input(wallet_id, true)?);
+    call(
+        tx,
+        package_id,
+        "clear_recipient_allowlist",
+        coin_type,
+        vec![wallet],
     )?;
     Ok(())
 }
@@ -326,6 +396,70 @@ mod tests {
         )
         .expect("should build");
         tx.try_build().expect("valid transaction");
+    }
+
+    fn calls(tx: TransactionBuilder) -> Vec<(String, usize)> {
+        let built = tx.try_build().expect("valid transaction");
+        let sui_sdk_types::TransactionKind::ProgrammableTransaction(ptb) = built.kind else {
+            panic!("a programmable transaction");
+        };
+        ptb.commands
+            .iter()
+            .filter_map(|c| match c {
+                sui_sdk_types::Command::MoveCall(call) => {
+                    Some((call.function.to_string(), call.arguments.len()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Owner-only, and only `allow` takes the Version: activating the list waits for the upgrade's
+    /// `migrate`, while removing an entry or clearing the list never does.
+    #[test]
+    fn recipient_allowlist_owner_calls_build() {
+        let mut shared = resolved();
+        shared.insert(addr(0x30), 400_030);
+        let mut tx = builder();
+        build_allow_recipient(
+            &mut tx,
+            addr(0xca),
+            addr(0x20),
+            "0x2::sui::SUI",
+            addr(0x30),
+            addr(0xd),
+            &shared,
+        )
+        .expect("allow");
+        build_disallow_recipient(
+            &mut tx,
+            addr(0xca),
+            addr(0x20),
+            "0x2::sui::SUI",
+            addr(0xd),
+            &resolved(),
+        )
+        .expect("disallow");
+        build_clear_recipient_allowlist(
+            &mut tx,
+            addr(0xca),
+            addr(0x20),
+            "0x2::sui::SUI",
+            &resolved(),
+        )
+        .expect("clear");
+        assert_eq!(
+            calls(tx),
+            [
+                ("allow_recipient".to_string(), 3),
+                ("disallow_recipient".to_string(), 2),
+                ("clear_recipient_allowlist".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            expected_lifecycle_target(addr(0xca), "allow_recipient"),
+            format!("{}::agent_wallet::allow_recipient", addr(0xca))
+        );
     }
 
     /// None of these takes the Version object — the contract does not gate owner operations on it,

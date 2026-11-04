@@ -50,6 +50,32 @@ Required order:
 
 An actual old-package call after migration must be tested on a chain deployment; setting version values in a unit test is not equivalent to executing historic bytecode.
 
+## Version 3: owner recipient allowlist
+
+Package behavior version becomes **3**. An owner can list the only addresses a non-protected wallet may pay. The list is a `VecSet<address>` in a dynamic field on the wallet UID (`RecipientAllowlistKey`), beside `ProtectedKey`, so no published layout or public signature changes. A `SpendRequest` then has three exits:
+
+- `confirm_spend` returns the coin to the PTB, and aborts `E_PROTECTED_MODE` (12) on a protected wallet and `E_RECIPIENT_ALLOWLIST` (20) on a wallet with a list.
+- `confirm_spend_to<T>(wallet, req, recipient: address, version, clock, ctx)` transfers inside Move to a listed recipient only: `E_RECIPIENT_NOT_ALLOWED` (21) otherwise, `E_NO_RECIPIENT_ALLOWLIST` (23) on a wallet without a list. It is allowed on a protected wallet that also has a list, since both modes name only owner-chosen destinations.
+- `confirm_protected`, unchanged.
+
+Owner calls: `allow_recipient(wallet, version, recipient, ctx)` creates the list on first use and is version-gated, so a list cannot be set while v2 bytecode, which ignores it, is still authoritative. `disallow_recipient(wallet, recipient, ctx)` and `clear_recipient_allowlist(wallet, ctx)` are not gated, so the owner is never trapped. Removing the last address leaves an empty list, which still closes `confirm_spend`; only `clear_recipient_allowlist` reopens it. There is no default list. Views: `has_recipient_allowlist`, `recipient_allowlist` (`Option<vector<address>>`, so absent and empty read apart), `is_recipient_allowed`.
+
+A wallet with a list can no longer run anything that needs a released coin (a generic Cetus swap, a Haedal stake, a DeepBook deposit): any coin handed to the PTB could be sent anywhere. It becomes payout-only, plus protected swaps if the owner also configures protected mode.
+
+Upgrade order, one maintenance window:
+
+1. `sui client upgrade --dry-run` for agent_wallet with UpgradeCap `0x7b7c04fb…8eef`; confirm the policy is still compatible.
+2. Upgrade agent_wallet. Fill `MAINNET_AGENT_WALLET_V3` in `crates/rill-ptb/src/deployments.rs` from the receipt.
+3. Upgrade cetus_adapter with UpgradeCap `0x298d4d14…e446`, its `agent_wallet` dependency resolved to the v3 published-at. Its source is unchanged, but it is linked to v2, whose `confirm_protected` checks the `Version`, so without this every protected swap aborts `version` code 0 after step 5. Fill `MAINNET_CETUS_ADAPTER` and move the server's `RILL_CETUS_ADAPTER_PACKAGE_ID` to it.
+4. Release the signer, server and plugin pin. The release workflow refuses to build while either id is still the placeholder.
+5. Publisher-gated `version::migrate` on `0x86430a81…ba94`.
+6. Every Studio grant saved before this window has to be granted again; list them from the server's grant store (`GRANTS_STORE_PATH`, else `grants.json` beside the skills store) and tell each owner before step 5, then each owner re-grants in Studio once the server runs on the v3 ids.
+7. Smoke on mainnet: allow, `confirm_spend_to` a listed address, an unlisted one refused (21), `confirm_spend` refused (20), clear, and one re-granted protected Cetus swap run through `rill_run_action`.
+
+Agent spending through new code is unavailable between steps 2 and 5, and through any client still on the old ids after step 5. Owner exits on old ids keep working because they are not version-gated.
+
+Every grant saved before the upgrade is such a client. Its run set pins `walletPackageId` and the exact `allowedTargets`, such as `0x1bad…::agent_wallet::confirm_spend` and, for a protected swap, `0x119d…::swap::execute_a_to_b` (the adapter Studio read at grant time). The owner's signature covers the run set, so the server cannot rebind a grant to the v3 ids without that owner signing again. Moving `MAINNET_AGENT_WALLET_V3`, `MAINNET_CETUS_ADAPTER` and `RILL_CETUS_ADAPTER_PACKAGE_ID` changes only grants made afterwards. A released signer refuses an old grant before building it, naming both packages and telling the owner to grant again; a signer from before the release instead builds it and aborts in `version` with code 0 once step 5 has run. The new types (`RecipientAllowlistKey`, `RecipientAllowed`, `RecipientDisallowed`, `RecipientAllowlistCleared`, `SpentTo`) take the v3 package as their defining id, which matters for event filters; `AgentWallet`, `AgentCap` and `SpendRequest` keep `0xb8b95f9b…`.
+
 ## Dependencies and verification
 
 The official [Cetus interface](https://github.com/CetusProtocol/cetus-clmm-interface/tree/5ef409e5aa97cf0c545c5ff64560cb65eaa981e7/sui/cetus_clmm) is pinned to immutable commit `5ef409e5aa97cf0c545c5ff64560cb65eaa981e7`. IntegerMate and MoveSTL transitive dependencies are pinned from its official lockfile. The dependency uses the published Cetus original package ID `0x1eabed72c53feb3805120a081dc15963c204dc8d091542592abaf7a35689b2fb`. The upstream interface commit records mainnet implementation `0x260693ec785a6e6c9d81d58c7d2ff72f1288ae0fa6a9725abe05a6478b11f084`, version 15. Those upstream metadata values are not live chain verification.

@@ -130,6 +130,72 @@ pub fn build_gated_spend_for_modules(
     modules: &[&str],
     shared: &SharedObjects,
 ) -> Result<Argument, SpendError> {
+    let proved = build_proved_request(tx, binding, amount_base_units, modules, shared)?;
+    Ok(tx.move_call(
+        Function::new(
+            binding.package_id,
+            ident("agent_wallet")?,
+            ident("confirm_spend")?,
+        )
+        .with_type_args(vec![proved.coin_type]),
+        vec![proved.wallet, proved.request, proved.version, proved.clock],
+    ))
+}
+
+/// Emit the gated sequence ending in `confirm_spend_to`, which pays `recipient` inside Move.
+///
+/// For a wallet whose owner set a recipient allowlist: the generic `confirm_spend` aborts on such a
+/// wallet, because a coin handed back to the transaction could be sent anywhere. Nothing is
+/// returned, since no coin reaches the PTB, so there is no `TransferObjects` to emit or to get wrong.
+/// The recipient is still the caller's claim; the contract checks it against the owner's list.
+pub fn build_gated_spend_to_for_modules(
+    tx: &mut TransactionBuilder,
+    binding: &WalletBinding,
+    amount_base_units: u64,
+    modules: &[&str],
+    recipient: Address,
+    shared: &SharedObjects,
+) -> Result<(), SpendError> {
+    let proved = build_proved_request(tx, binding, amount_base_units, modules, shared)?;
+    let recipient = tx.pure(&recipient);
+    tx.move_call(
+        Function::new(
+            binding.package_id,
+            ident("agent_wallet")?,
+            ident("confirm_spend_to")?,
+        )
+        .with_type_args(vec![proved.coin_type]),
+        vec![
+            proved.wallet,
+            proved.request,
+            recipient,
+            proved.version,
+            proved.clock,
+        ],
+    );
+    Ok(())
+}
+
+/// The handles a `confirm_*` call needs once every rule has stamped the request.
+struct ProvedRequest {
+    request: Argument,
+    wallet: Argument,
+    version: Argument,
+    clock: Argument,
+    coin_type: sui_sdk_types::TypeTag,
+}
+
+/// `request_spend` and one `prove` per module: the part every exit from a `SpendRequest` shares.
+///
+/// The zero and empty-list refusals live here so that no exit built on it can skip them. See
+/// [`build_gated_spend_for_modules`] for why the empty case must be refused locally.
+fn build_proved_request(
+    tx: &mut TransactionBuilder,
+    binding: &WalletBinding,
+    amount_base_units: u64,
+    modules: &[&str],
+    shared: &SharedObjects,
+) -> Result<ProvedRequest, SpendError> {
     if amount_base_units == 0 {
         return Err(SpendError::ZeroAmount);
     }
@@ -175,15 +241,13 @@ pub fn build_gated_spend_for_modules(
         );
     }
 
-    Ok(tx.move_call(
-        Function::new(
-            binding.package_id,
-            ident("agent_wallet")?,
-            ident("confirm_spend")?,
-        )
-        .with_type_args(vec![coin_type]),
-        vec![wallet, request, version, clock],
-    ))
+    Ok(ProvedRequest {
+        request,
+        wallet,
+        version,
+        clock,
+        coin_type,
+    })
 }
 
 /// Emit `request_spend` → one `prove` per attached rule → `confirm_spend`, returning the released
@@ -291,4 +355,14 @@ pub fn expected_spend_targets(binding: &WalletBinding) -> Result<Vec<String>, Sp
     }
     targets.push(format!("{pkg}::agent_wallet::confirm_spend"));
     Ok(targets)
+}
+
+/// The targets [`build_gated_spend_to_for_modules`] emits, in order, for a pinned sequence.
+pub fn expected_spend_to_targets(package_id: Address, modules: &[&str]) -> Vec<String> {
+    std::iter::once(format!("{package_id}::agent_wallet::request_spend"))
+        .chain(modules.iter().map(|m| format!("{package_id}::{m}::prove")))
+        .chain(std::iter::once(format!(
+            "{package_id}::agent_wallet::confirm_spend_to"
+        )))
+        .collect()
 }
