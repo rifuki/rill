@@ -10,7 +10,7 @@
     "versionObjectId": "0x86430a8195900cd52d607a81993b6125a51628a9db93e10a1afedd2c5a95ba94",
     "upgradeCapId": "0x7b7c04fb9a6e7974566f6a6c294b1743c37fef225077cb26375cedac8a5f8eef",
     "upgradeDigest": "8WMPLW4LC1g1uQ1zgkm5xNuamcB5p4w3qxtrh3e2jWbV",
-    "migrationDigest": null
+    "migrationDigest": "JDLd6rpBeZ73xKmeWhW6ztANS1bJ1Smr8G2DqvdDBAw5"
   },
   "cetusAdapter": {
     "packageId": "0x8a04636a5399ad4416e1254a0f3ac6745327501c1547fcbe1a991b4c48103e3f",
@@ -27,5 +27,12 @@
     "upgradeDigest": "2EQfn2ZXP71hKoVNm11gjwv6HNqKRpRP4uJ3pXzF49vR",
     "migrationDigest": "6gzp6FrbZsnNxNrLq972yW9EbuVwnPJKBenarte6VRTH",
     "sponsoredStepUpDigest": "H8eNH9D8cEF3MJLnyatSdvqJKNrAUBRHEcC3j61Mitw1"
+  },
+  "mainnetSmoke": {
+    "protectedSwapViaAdapterV2": "991Tjz74kEdakbzCswHxzjgRV37YtJFzgCWqCf9sDY4B",
+    "sponsoredStepUp": "A88yU2fKswC9T5y3PJ3kaMpfyWBtJkEgkVBZ2FMMaHaQ",
+    "allowRecipient": "E6H21NpZKMoaKfG4caRqW7M3qVJ8YpNrhL6EEePVkeoG",
+    "spendToListedRecipient": "Dsgo8ZiPPTvxB85ty1gTh4kK4yJMVXyW5C8wq7qGNhrK",
+    "clearAndRevoke": "AKTnyaGhP2QbCgkz5v17FPB7PV87Y8cps75HXeEmGUba"
   }
 }
