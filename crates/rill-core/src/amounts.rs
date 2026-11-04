@@ -188,6 +188,21 @@ impl Decimal {
         }
         u64::try_from(num / den).map_err(|_| AmountError::ExceedsU64(self.to_string()))
     }
+
+    /// Order two decimals by value, so "1.50" equals "1.5" without knowing any token's scale.
+    ///
+    /// The side with fewer fractional digits is scaled up to match the other. A scaling that does
+    /// not fit a `u128` is an error: an ordering guessed past that point would decide whether an
+    /// owner's bound holds.
+    pub fn cmp_exact(&self, other: &Decimal) -> Result<std::cmp::Ordering, AmountError> {
+        let scale = |d: &Decimal, to: u32| {
+            pow10(to - d.exponent)
+                .and_then(|factor| d.mantissa.checked_mul(factor))
+                .ok_or_else(|| AmountError::Overflow(d.to_string()))
+        };
+        let exponent = self.exponent.max(other.exponent);
+        Ok(scale(self, exponent)?.cmp(&scale(other, exponent)?))
+    }
 }
 
 impl fmt::Display for Decimal {
@@ -254,4 +269,27 @@ pub fn deepbook_quantity_to_base_units(
     base_scalar: u128,
 ) -> Result<u64, AmountError> {
     Decimal::parse(quantity)?.scale_by_ratio(base_scalar, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn cmp(a: &str, b: &str) -> Result<Ordering, AmountError> {
+        Decimal::parse(a)
+            .unwrap()
+            .cmp_exact(&Decimal::parse(b).unwrap())
+    }
+
+    #[test]
+    fn decimal_cmp_exact() {
+        assert_eq!(cmp("1.50", "1.5"), Ok(Ordering::Equal));
+        assert_eq!(cmp("0.9", "1"), Ok(Ordering::Less));
+        assert_eq!(cmp("10", "9.999999999"), Ok(Ordering::Greater));
+        assert_eq!(cmp("0", "0.000"), Ok(Ordering::Equal));
+        // Scaling 1 by 10^39 does not fit a u128, so the comparison refuses rather than guesses.
+        let wide = format!("0.{}1", "0".repeat(38));
+        assert!(matches!(cmp("1", &wide), Err(AmountError::Overflow(_))));
+    }
 }

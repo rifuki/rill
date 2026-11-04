@@ -461,6 +461,17 @@ fn argument<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+/// The caller's runtime `params`, where null counts as none: `rill_workflow` builds each step's
+/// call with `json!`, which writes a step without `params` as null, and such a step runs on the
+/// grant's own params exactly as before bounds were checked.
+fn runtime_overrides(params: &Value) -> Option<Value> {
+    params
+        .get("arguments")
+        .and_then(|a| a.get("params"))
+        .filter(|overrides| !overrides.is_null())
+        .cloned()
+}
+
 /// A count, which is the one kind of argument that is honestly a number.
 ///
 /// Amounts are never read here. They are decimal text all the way to the chain, because a JSON
@@ -1379,10 +1390,7 @@ fn run_action_for_owner(
             "revision must be a positive integer.",
         );
     }
-    let overrides = params
-        .get("arguments")
-        .and_then(|a| a.get("params"))
-        .cloned();
+    let overrides = runtime_overrides(params);
     let signer = keystore.address().to_string();
 
     let checked = match checked_grants(context, &signer, &api) {
@@ -1456,10 +1464,24 @@ fn run_action_for_owner(
     }
 
     // The builder is asked for the grant's own build arguments. Only `params` may be supplied by
-    // the caller, and the server refuses any that would loosen what was published.
+    // the caller. Each one is checked here against the bounds the owner signed, before the builder
+    // sees it, and the builder checks it again against the published action.
+    if let Some(overrides) = &overrides {
+        if let Err(why) = crate::grants::check_overrides(&verified.grant.build_arguments, overrides)
+        {
+            let reason = format!(
+                "The grant for {action_id} does not allow this runtime value: {why}. Run it \
+                 without that value, or ask the wallet's owner to publish and grant a new one."
+            );
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, rill_core::runtime_bounds::REFUSED, &reason);
+        }
+    }
     let mut arguments = verified.grant.build_arguments.clone();
     if let Some(object) = arguments.as_object_mut() {
         object.remove("actionId");
+        // The bounds are the signer's to enforce; the builder enforces its own from the action.
+        object.remove("runtimeBounds");
     }
     if let Some(overrides) = overrides {
         let merged = arguments
@@ -1949,6 +1971,32 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_without_params_carries_no_runtime_overrides() {
+        let step = crate::workflow::Step {
+            action_id: "swap".into(),
+            wallet_id: "0x1".into(),
+            revision: 2,
+            params: None,
+        };
+        // How rill_workflow hands a step to run_action_for_owner: `json!` writes an absent
+        // `params` as null, which must not reach check_overrides as a value to bound.
+        let call = json!({"arguments":{
+            "actionId":step.action_id,"walletId":step.wallet_id,"revision":step.revision,"params":step.params
+        }});
+        assert_eq!(runtime_overrides(&call), None);
+        assert_eq!(
+            runtime_overrides(&json!({"arguments":{"params":null}})),
+            None
+        );
+        assert_eq!(runtime_overrides(&json!({"arguments":{}})), None);
+        let given = json!({"swap": {"amount_in": "1"}});
+        assert_eq!(
+            runtime_overrides(&json!({"arguments":{"params":given}})),
+            Some(given)
+        );
+    }
 
     #[test]
     fn a_limit_order_placement_is_reported_as_placed_not_filled() {

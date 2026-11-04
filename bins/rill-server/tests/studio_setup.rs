@@ -548,15 +548,20 @@ async fn live_deepbook_capability_fields_match_setup_validation() {
     assert_eq!(observed, expected);
 }
 
-#[tokio::test]
-async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
+fn deepbook_skill() -> PublishedSkill {
     let mut skill = skill();
     skill.flow["nodes"] = json!([{"id":"order","type":"deepbook_limit_order","config":{"poolKey":"DEEP_SUI","price":"0.01","quantity":"1","depositSui":"1","isBid":true}}]);
+    skill
+}
+fn deepbook_body(price: &str) -> Value {
     let mut body = body();
-    body["price"] = json!("0.123456789012");
+    body["price"] = json!(price);
     body["balanceManagerId"] = json!("0x20");
     body["tradeCapId"] = json!("0x21");
     body["depositCapId"] = json!("0x22");
+    body
+}
+fn deepbook_chain() -> FakeSui {
     let package = deployments::TESTNET_DEEPBOOK_MANAGER_TYPE_PACKAGE;
     let deposit_package = deployments::TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE;
     let chain = object(
@@ -590,7 +595,15 @@ async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
         json!({}),
         None,
     );
-    let chain = object(chain, "0x6", "0x2::clock::Clock", json!({}), None);
+    object(chain, "0x6", "0x2::clock::Clock", json!({}), None)
+}
+#[tokio::test]
+async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
+    let skill = deepbook_skill();
+    // A bid may be pinned at or below the published 0.01, to the price's full precision.
+    let body = deepbook_body("0.009876543210");
+    let deposit_package = deployments::TESTNET_DEEPBOOK_DEPOSIT_CAP_TYPE_PACKAGE;
+    let chain = deepbook_chain();
     prepare_plan(&body, &skill, &addr("0x1"), &context(), &chain)
         .await
         .unwrap();
@@ -599,7 +612,7 @@ async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
         .unwrap();
     let _: rill_cli::runset::RunSet = serde_json::from_value(result["runSet"].clone()).unwrap();
     let args = &result["buildArguments"];
-    assert_eq!(args["params"]["order"]["price"], "0.123456789012");
+    assert_eq!(args["params"]["order"]["price"], "0.009876543210");
     assert_eq!(args["params"]["order"]["depositCapId"], addr("0x22"));
     assert!(result["runSet"]["allowedTargets"]
         .as_array()
@@ -628,6 +641,67 @@ async fn deepbook_attach_pins_the_full_order_and_exports_runtime_bindings() {
         .contains("another balance manager"));
 }
 
+#[tokio::test]
+async fn deepbook_grant_signs_runtime_bounds_and_every_reference_value() {
+    let skill = deepbook_skill();
+    let body = deepbook_body("0.009");
+    let result = attach_plan(&body, &skill, &addr("0x1"), &context(), &deepbook_chain())
+        .await
+        .unwrap();
+    let args = &result["buildArguments"];
+    let bounds = &args["runtimeBounds"]["order"];
+    assert_eq!(bounds["quantity"]["max"], "1");
+    assert_eq!(bounds["depositSui"]["max"], "1");
+    assert_eq!(bounds["poolKey"]["eq"], "DEEP_SUI");
+    assert_eq!(bounds["isBid"]["eq"], true);
+    assert_eq!(bounds["payWithDeep"]["eq"], false);
+    // A bid never pays more than the price the owner signed.
+    assert_eq!(bounds["price"]["max"], "0.009");
+    assert_eq!(bounds["tradeCapId"]["eq"], addr("0x21"));
+    assert_eq!(bounds["clientOrderId"]["u64"], true);
+    let params = &args["params"]["order"];
+    for key in ["quantity", "depositSui", "poolKey", "isBid", "price"] {
+        assert!(params.get(key).is_some(), "params lack {key}: {params}");
+    }
+    // The signer accepts a tighter order and refuses a larger one, from the signed bounds alone.
+    rill_cli::grants::check_overrides(args, &json!({"order":{"quantity":"0.5"}})).unwrap();
+    assert!(rill_cli::grants::check_overrides(args, &json!({"order":{"quantity":"2"}})).is_err());
+    // Every value the signer forwards by default passes the builder's own bounds.
+    rill_server::studio_api::resolve_runtime_flow(&skill.flow, &args["params"]).unwrap();
+}
+#[tokio::test]
+async fn attach_refuses_a_price_worse_than_published() {
+    let skill = deepbook_skill();
+    let error = attach_plan(
+        &deepbook_body("0.02"),
+        &skill,
+        &addr("0x1"),
+        &context(),
+        &deepbook_chain(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("price"), "{error}");
+}
+#[tokio::test]
+async fn haedal_grant_signs_its_stake_amount_bound() {
+    let result = attach_plan(
+        &body(),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &chain("0", "0x1", "0x2"),
+    )
+    .await
+    .unwrap();
+    let args = &result["buildArguments"];
+    assert_eq!(args["params"]["stake"]["amount"], "1000000000");
+    assert_eq!(
+        args["runtimeBounds"]["stake"]["amount"]["max"],
+        "1000000000"
+    );
+    rill_server::studio_api::resolve_runtime_flow(&skill().flow, &args["params"]).unwrap();
+}
 #[tokio::test]
 async fn mainnet_setup_uses_explicit_wallet_deployment() {
     let mut ctx = context();

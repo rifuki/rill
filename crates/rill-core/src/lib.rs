@@ -16,4 +16,5 @@ pub mod grant;
 pub mod mainnet;
 pub mod manifest;
 pub mod release;
+pub mod runtime_bounds;
 pub mod tokens;

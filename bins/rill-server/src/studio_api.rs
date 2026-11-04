@@ -13,8 +13,9 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use rill_core::{
-    flow::{topological_sort, FlowGraph},
+    flow::{topological_sort, FlowGraph, FlowNode},
     manifest::{to_declaration, to_on_chain_rule_params, to_signer_policy, CapabilityManifest},
+    runtime_bounds,
 };
 use rill_ptb::{deployments, registry::DeepBookNetwork};
 use rill_store::{PublishedSkill, SkillStore};
@@ -242,23 +243,22 @@ pub fn tool_definition(skill: &PublishedSkill) -> Value {
     if let Ok(flow) = serde_json::from_value::<FlowGraph>(skill.flow.clone()) {
         for node in flow.nodes {
             let mut properties = serde_json::Map::new();
-            for key in runtime_keys(&node.kind) {
-                let mut field = json!({"type":if matches!(*key,"isBid"|"payWithDeep"){"boolean"}else{"string"}});
-                if let Some(default) = node
-                    .inputs
-                    .as_ref()
-                    .and_then(|v| v.get(*key))
-                    .or_else(|| node.config.as_ref().and_then(|v| v.get(*key)))
-                {
-                    if !default.is_null() {
-                        field["default"] = default.clone();
-                    }
+            for (key, rule) in runtime_bounds::keys(&node.kind) {
+                let mut field =
+                    json!({"type":if matches!(key,"isBid"|"payWithDeep"){"boolean"}else{"string"}});
+                if let Some(default) = runtime_bounds::published(&node, key) {
+                    field["default"] = default.clone();
                 }
-                if *key == "min_amount_out" {
-                    field["description"] =
-                        json!("May tighten the published floor, never lower it.");
-                }
-                properties.insert((*key).into(), field);
+                // Documentation only: resolve_runtime_flow and the signer enforce these bounds.
+                field["description"] = json!(match rule {
+                    runtime_bounds::Rule::Fixed => "Fixed at publish; only the published value is accepted.",
+                    runtime_bounds::Rule::Object => "Fixed when the owner grants the action. The agent's signer pins the signed object; this builder only checks that one is named.",
+                    runtime_bounds::Rule::AtMost => "At most the published value; may only be lowered.",
+                    runtime_bounds::Rule::AtLeast => "May tighten the published floor, never lower it.",
+                    runtime_bounds::Rule::Price => "Never worse than the published price: an ask may only rise, a bid may only fall.",
+                    runtime_bounds::Rule::AnyU64 => "Any u64 in decimal text.",
+                });
+                properties.insert(key.into(), field);
             }
             if !properties.is_empty() {
                 nodes.insert(
@@ -457,27 +457,44 @@ pub async fn resolve(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
-fn runtime_keys(kind: &str) -> &[&str] {
-    match kind {
-        "cetus_swap" => &["amount_in", "min_amount_out"],
-        "haedal_stake" => &["amount"],
-        "deepbook_limit_order" => &[
-            "poolKey",
-            "balanceManagerId",
-            "tradeCapId",
-            "depositCapId",
-            "price",
-            "quantity",
-            "isBid",
-            "payWithDeep",
-            "clientOrderId",
-            "depositSui",
-        ],
-        _ => &[],
+/// Check one runtime override against the node the owner published.
+///
+/// This is where every bound in `rill_core::runtime_bounds` is enforced for the builder, which also
+/// serves the unauthenticated public MCP. The signer checks the same overrides again, against the
+/// bounds the owner signed into the grant, before it asks for a build. Object ids are the one
+/// exception here: the published skill holds placeholders and the owner names the real objects
+/// per wallet when granting, so the builder cannot pin them. They are pinned only by the signer,
+/// through the signed bounds and the run set's allowed object ids.
+fn check_override(node: &FlowNode, key: &str, value: &Value) -> Result<(), String> {
+    let refused = |why: String| {
+        format!(
+            "{}: Node {}: {why}",
+            rill_core::runtime_bounds::REFUSED,
+            node.id
+        )
+    };
+    let rule = runtime_bounds::rule(&node.kind, key).ok_or_else(|| {
+        refused(format!(
+            "{key} is not a runtime parameter of {}; it stays as published",
+            node.kind
+        ))
+    })?;
+    if value.is_object() || value.is_array() {
+        return Err(refused(format!("{key} must be a single value")));
     }
+    if rule == runtime_bounds::Rule::Object {
+        return match value {
+            Value::String(s) if !s.is_empty() => Ok(()),
+            _ => Err(refused(format!("{key} must be an object id"))),
+        };
+    }
+    runtime_bounds::limit(node, key)
+        .and_then(|bound| bound.check(key, value))
+        .map_err(refused)
 }
 
-fn resolve_runtime_flow(stored: &Value, params: &Value) -> Result<FlowGraph, String> {
+/// Apply runtime overrides to a copy of the published flow, refusing any outside its bounds.
+pub fn resolve_runtime_flow(stored: &Value, params: &Value) -> Result<FlowGraph, String> {
     let mut flow: FlowGraph = serde_json::from_value(stored.clone()).map_err(|e| e.to_string())?;
     if let Some(params) = Some(params).and_then(Value::as_object) {
         let action_count = flow
@@ -494,44 +511,19 @@ fn resolve_runtime_flow(stored: &Value, params: &Value) -> Result<FlowGraph, Str
                 }
             });
             if let Some(overrides) = overrides {
+                // Every value is checked against the published node before any is written, so a
+                // later override cannot move the reference an earlier one was checked against.
                 for (key, value) in overrides {
-                    if value.is_object() || !runtime_keys(&node.kind).contains(&key.as_str()) {
-                        return Err(format!(
-                            "Node {}: {key} is not a runtime parameter",
-                            node.id
-                        ));
-                    }
-                    if key == "min_amount_out" {
-                        let published = node
-                            .inputs
-                            .as_ref()
-                            .and_then(|v| v.get(key))
-                            .or_else(|| node.config.as_ref().and_then(|v| v.get(key)));
-                        if let Some(published) = published.and_then(Value::as_str) {
-                            let minimum = rill_core::amounts::parse_u64_string(published)
-                                .map_err(|e| e.to_string())?;
-                            let actual = value.as_str().ok_or("min_amount_out must be a string")?;
-                            if rill_core::amounts::parse_u64_string(actual)
-                                .map_err(|e| e.to_string())?
-                                < minimum
-                            {
-                                return Err(
-                                    "min_amount_out cannot lower the published swap floor".into()
-                                );
-                            }
-                        }
-                    }
+                    check_override(node, key, value)?;
                 }
                 let config = node.config.get_or_insert_with(|| json!({}));
                 let map = config
                     .as_object_mut()
                     .ok_or("node config must be an object")?;
                 for (key, value) in overrides {
-                    if !value.is_object() {
-                        map.insert(key.clone(), value.clone());
-                        if let Some(inputs) = node.inputs.as_mut().and_then(Value::as_object_mut) {
-                            inputs.insert(key.clone(), value.clone());
-                        }
+                    map.insert(key.clone(), value.clone());
+                    if let Some(inputs) = node.inputs.as_mut().and_then(Value::as_object_mut) {
+                        inputs.insert(key.clone(), value.clone());
                     }
                 }
             }
@@ -645,5 +637,95 @@ mod runtime_tests {
             resolve_runtime_flow(&stored, &json!({"swap":{"integratePackageId":"0x2"}})).is_err()
         );
         assert!(resolve_runtime_flow(&stored, &json!({"swap":{"min_amount_out":"101"}})).is_ok());
+    }
+
+    fn order(config: Value) -> Value {
+        json!({"nodes":[{"id":"order","type":"deepbook_limit_order","config":config}],"edges":[]})
+    }
+
+    fn refused(stored: &Value, params: Value) -> String {
+        resolve_runtime_flow(stored, &params).expect_err("the override must be refused")
+    }
+
+    #[test]
+    fn runtime_floor_fails_closed_on_non_string_published_floor() {
+        let stored = json!({"nodes":[{"id":"swap","type":"cetus_swap","config":{"min_amount_out":100}}],"edges":[]});
+        assert!(refused(&stored, json!({"swap":{"min_amount_out":"1"}}))
+            .contains("runtime_override_refused"));
+    }
+
+    #[test]
+    fn runtime_cannot_raise_deepbook_quantity_or_deposit_above_published() {
+        let stored = order(json!({"poolKey":"SUI_USDC","quantity":"1","depositSui":"1"}));
+        let quantity = refused(&stored, json!({"order":{"quantity":"1.5"}}));
+        assert!(quantity.contains("runtime_override_refused"), "{quantity}");
+        assert!(quantity.contains("quantity"), "{quantity}");
+        assert!(refused(&stored, json!({"order":{"depositSui":"2"}})).contains("depositSui"));
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"quantity":"0.5"}})).is_ok());
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"quantity":"1.0"}})).is_ok());
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"depositSui":"0.25"}})).is_ok());
+    }
+
+    #[test]
+    fn runtime_cannot_change_deepbook_pool_side_or_fee_asset() {
+        let stored = order(json!({"poolKey":"SUI_USDC","isBid":false,"payWithDeep":false}));
+        assert!(refused(&stored, json!({"order":{"poolKey":"DEEP_SUI"}})).contains("poolKey"));
+        assert!(refused(&stored, json!({"order":{"isBid":true}})).contains("isBid"));
+        assert!(refused(&stored, json!({"order":{"payWithDeep":true}})).contains("payWithDeep"));
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"isBid":"false"}})).is_ok());
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"poolKey":"SUI_USDC"}})).is_ok());
+        // An absent side is an ask, as the compiler reads it, so it stays one.
+        let unset = order(json!({"poolKey":"SUI_USDC"}));
+        assert!(refused(&unset, json!({"order":{"isBid":true}})).contains("isBid"));
+    }
+
+    #[test]
+    fn runtime_cannot_raise_cetus_amount_in_or_haedal_amount() {
+        let swap = json!({"nodes":[{"id":"swap","type":"cetus_swap","config":{"amount_in":"100","min_amount_out":"1"}}],"edges":[]});
+        assert!(refused(&swap, json!({"swap":{"amount_in":"101"}})).contains("amount_in"));
+        assert!(resolve_runtime_flow(&swap, &json!({"swap":{"amount_in":"50"}})).is_ok());
+        let stake = json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":"1000000000"}}],"edges":[]});
+        assert!(refused(&stake, json!({"stake":{"amount":"2000000000"}})).contains("amount"));
+        assert!(resolve_runtime_flow(&stake, &json!({"stake":{"amount":"1000000000"}})).is_ok());
+    }
+
+    #[test]
+    fn runtime_price_is_never_worse_than_published() {
+        let ask = order(json!({"poolKey":"SUI_USDC","price":"2","isBid":false}));
+        assert!(refused(&ask, json!({"order":{"price":"1.99"}})).contains("price"));
+        assert!(resolve_runtime_flow(&ask, &json!({"order":{"price":"2.5"}})).is_ok());
+        assert!(resolve_runtime_flow(&ask, &json!({"order":{"price":"2.0"}})).is_ok());
+        let bid = order(json!({"poolKey":"SUI_USDC","price":"2","isBid":true}));
+        assert!(refused(&bid, json!({"order":{"price":"2.01"}})).contains("price"));
+        assert!(resolve_runtime_flow(&bid, &json!({"order":{"price":"1.5"}})).is_ok());
+    }
+
+    #[test]
+    fn runtime_bound_without_published_value_is_refused() {
+        let stored = order(json!({"poolKey":"SUI_USDC"}));
+        assert!(refused(&stored, json!({"order":{"quantity":"1"}})).contains("quantity"));
+        assert!(refused(&stored, json!({"order":{"price":"1"}})).contains("price"));
+        let unpooled = order(json!({"quantity":"1"}));
+        assert!(refused(&unpooled, json!({"order":{"poolKey":"SUI_USDC"}})).contains("poolKey"));
+    }
+
+    #[test]
+    fn runtime_client_order_id_is_free_but_must_be_a_u64() {
+        let stored = order(json!({"poolKey":"SUI_USDC"}));
+        assert!(resolve_runtime_flow(&stored, &json!({"order":{"clientOrderId":"42"}})).is_ok());
+        assert!(refused(&stored, json!({"order":{"clientOrderId":"-1"}})).contains("clientOrderId"));
+        assert!(refused(
+            &stored,
+            json!({"order":{"clientOrderId":"18446744073709551616"}})
+        )
+        .contains("clientOrderId"));
+    }
+
+    #[test]
+    fn runtime_unknown_key_is_refused_by_name() {
+        let stored = order(json!({"poolKey":"SUI_USDC"}));
+        let reason = refused(&stored, json!({"order":{"deepbookPackageId":"0x2"}}));
+        assert!(reason.contains("runtime_override_refused"), "{reason}");
+        assert!(reason.contains("deepbookPackageId"), "{reason}");
     }
 }

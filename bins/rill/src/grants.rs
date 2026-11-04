@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use rill_chain::{SignatureCheck, SuiRead};
 use rill_core::grant::{Grant, SignedGrant};
+use rill_core::runtime_bounds::{self, Limit, Rule};
 use serde_json::Value;
 use sui_sdk_types::Address;
 
@@ -264,6 +265,100 @@ pub fn apply_floor(
     Ok(())
 }
 
+/// Refuse an agent's runtime override unless the owner signed a bound that it keeps within.
+///
+/// The builder checks the same overrides against the published node, but the builder is the party
+/// a grant exists to constrain, so the signer checks them first, from the grant alone, and sends
+/// nothing it would refuse. What this covers is the params object an agent passes. The values the
+/// builder then encodes into the transaction are not re-read from its bytes here; that check is a
+/// later release.
+///
+/// A grant signed before bounds were signed with it has no `runtimeBounds`. For those the signer
+/// falls back to the strictest table it can build from the signed `params`: see [`legacy_bound`].
+pub fn check_overrides(build_arguments: &Value, overrides: &Value) -> Result<(), String> {
+    let overrides = overrides
+        .as_object()
+        .ok_or("runtime params must be an object keyed by node id")?;
+    let signed = build_arguments.get("runtimeBounds");
+    for (node, values) in overrides {
+        // A flat value would reach a single-action builder unscoped, outside any node's bounds.
+        let values = values.as_object().ok_or_else(|| {
+            format!("{node} must be an object of runtime values keyed by a node id")
+        })?;
+        for (key, value) in values {
+            let bound = match signed {
+                Some(bounds) => signed_bound(bounds, node, key)?,
+                None => legacy_bound(build_arguments, node, key)?,
+            };
+            bound
+                .check(key, value)
+                .map_err(|why| format!("{node}.{key}: {why}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn signed_bound(bounds: &Value, node: &str, key: &str) -> Result<Limit, String> {
+    let bounds = bounds
+        .as_object()
+        .ok_or("the grant's runtimeBounds is not an object")?;
+    let bound = bounds
+        .get(node)
+        .and_then(|n| n.get(key))
+        .ok_or_else(|| format!("{node}.{key} is not an owner-bounded runtime parameter"))?;
+    serde_json::from_value(bound.clone())
+        .map_err(|e| format!("{node}.{key} has a bound this signer cannot read: {e}"))
+}
+
+/// The bound for a grant signed before `runtimeBounds` existed. Its signed `params` carry only the
+/// object ids, the price and a swap's `amount_in`, so:
+///
+/// - `amount_in`, a price and an object id are held to the signed value: at most it for the
+///   amount, exactly it for the rest, since the order side was never signed and a price can only
+///   be "not worse" relative to a side.
+/// - An amount or floor the grant never signed (`quantity`, `depositSui`, `amount`,
+///   `min_amount_out`) is checked here only for form. Its bound is enforced by the builder alone,
+///   against the published node, until the owner signs a new grant that carries bounds.
+/// - `clientOrderId` must be a `u64`.
+/// - A fixed key (`poolKey`, `isBid`, `payWithDeep`) is refused: the grant never signed it, and
+///   repeating the published value changes nothing.
+fn legacy_bound(build_arguments: &Value, node: &str, key: &str) -> Result<Limit, String> {
+    let rule = runtime_bounds::rule_for_key(key)
+        .ok_or_else(|| format!("{node}.{key} is not an owner-bounded runtime parameter"))?;
+    let signed = build_arguments
+        .get("params")
+        .and_then(|p| p.get(node))
+        .and_then(|n| n.get(key))
+        .filter(|v| !v.is_null());
+    let unsigned =
+        || format!("{node}.{key} was not signed in this grant; the owner can grant it again");
+    Ok(match rule {
+        Rule::AtMost => Limit {
+            max: match signed {
+                Some(value) => Some(value.as_str().ok_or_else(unsigned)?.to_owned()),
+                None => None,
+            },
+            min: signed.is_none().then(|| "0".to_owned()),
+            u64: runtime_bounds::base_units(key),
+            ..Limit::default()
+        },
+        Rule::AtLeast => Limit {
+            min: Some("0".to_owned()),
+            u64: true,
+            ..Limit::default()
+        },
+        Rule::Price | Rule::Object => Limit {
+            eq: Some(signed.ok_or_else(unsigned)?.clone()),
+            ..Limit::default()
+        },
+        Rule::Fixed => return Err(unsigned()),
+        Rule::AnyU64 => Limit {
+            u64: true,
+            ..Limit::default()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +540,82 @@ mod tests {
             check(&chain, &grant).await.unwrap_err(),
             Refusal::RunSetDisagrees("wallet".into())
         );
+    }
+
+    fn bounded() -> Value {
+        json!({
+            "sender": AGENT,
+            "params": {"order": {"price": "1.5", "tradeCapId": CAP}},
+            "runtimeBounds": {
+                "order": {
+                    "quantity": {"max": "1"},
+                    "isBid": {"eq": false},
+                    "price": {"min": "1", "max": "2"},
+                    "tradeCapId": {"eq": CAP},
+                    "clientOrderId": {"u64": true}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn check_overrides_enforces_signed_bounds() {
+        let args = bounded();
+        let ok = |o: Value| check_overrides(&args, &o);
+        assert!(ok(json!({"order": {"quantity": "0.5"}})).is_ok());
+        assert!(ok(json!({"order": {"quantity": "1.00"}})).is_ok());
+        assert!(ok(json!({"order": {"quantity": "2"}})).is_err());
+        assert!(ok(json!({"order": {"isBid": true}})).is_err());
+        assert!(ok(json!({"order": {"isBid": "false"}})).is_ok());
+        assert!(ok(json!({"order": {"price": "2.5"}})).is_err());
+        assert!(ok(json!({"order": {"price": "0.9"}})).is_err());
+        assert!(ok(json!({"order": {"price": "1.99"}})).is_ok());
+        assert!(ok(json!({"order": {"tradeCapId": "0xb2"}})).is_ok());
+        assert!(ok(json!({"order": {"tradeCapId": OTHER}})).is_err());
+        assert!(ok(json!({"order": {"clientOrderId": "9"}})).is_ok());
+        assert!(ok(json!({"order": {"clientOrderId": "x"}})).is_err());
+        let absent = ok(json!({"order": {"depositSui": "0.1"}})).unwrap_err();
+        assert!(absent.contains("order.depositSui"), "{absent}");
+        assert!(ok(json!({"other": {"quantity": "0.5"}})).is_err());
+        // A flat value is how a single-action override reaches the builder unscoped.
+        assert!(ok(json!({"quantity": "0.5"})).is_err());
+        assert!(ok(json!("0.5")).is_err());
+    }
+
+    #[test]
+    fn check_overrides_refuses_bounds_it_cannot_read() {
+        let mut args = bounded();
+        args["runtimeBounds"]["order"]["quantity"] = json!({"atMost": "1"});
+        assert!(check_overrides(&args, &json!({"order": {"quantity": "0.5"}})).is_err());
+        args["runtimeBounds"] = json!("everything");
+        assert!(check_overrides(&args, &json!({"order": {"quantity": "0.5"}})).is_err());
+    }
+
+    #[test]
+    fn check_overrides_legacy_grant_without_bounds() {
+        let args = json!({
+            "sender": AGENT,
+            "params": {
+                "swap": {"amount_in": "100"},
+                "order": {"price": "1.5", "tradeCapId": CAP, "balanceManagerId": WALLET}
+            }
+        });
+        let ok = |o: Value| check_overrides(&args, &o);
+        assert!(ok(json!({"swap": {"amount_in": "50"}})).is_ok());
+        assert!(ok(json!({"swap": {"amount_in": "101"}})).is_err());
+        // Floors and amounts the legacy grant never signed are bounded by the builder alone.
+        assert!(ok(json!({"swap": {"min_amount_out": "7"}})).is_ok());
+        assert!(ok(json!({"swap": {"min_amount_out": "7.5"}})).is_err());
+        assert!(ok(json!({"order": {"quantity": "0.5"}})).is_ok());
+        assert!(ok(json!({"order": {"clientOrderId": "3"}})).is_ok());
+        assert!(ok(json!({"order": {"clientOrderId": "-3"}})).is_err());
+        // Without the side in the signed params, the signed price is the only safe one.
+        assert!(ok(json!({"order": {"price": "1.5"}})).is_ok());
+        assert!(ok(json!({"order": {"price": "1.6"}})).is_err());
+        assert!(ok(json!({"order": {"tradeCapId": OTHER}})).is_err());
+        assert!(ok(json!({"order": {"depositCapId": CAP}})).is_err());
+        assert!(ok(json!({"order": {"poolKey": "SUI_USDC"}})).is_err());
+        assert!(ok(json!({"order": {"isBid": false}})).is_err());
+        assert!(ok(json!({"order": {"integratePackageId": "0x2"}})).is_err());
     }
 }

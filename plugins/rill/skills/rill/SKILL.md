@@ -39,6 +39,26 @@ owner. Report it and never route around it; the owner fixes it by granting again
 `rill_run_action` answers with the same code, and a workflow pinned to a superseded revision is
 refused before any step runs.
 
+### Runtime values
+
+`rill_run_action` takes optional `params`, keyed by node id, to adjust a granted action within the
+owner's bounds. Nothing else can change:
+
+- An amount (`amount_in`, `amount`, `quantity`, `depositSui`) may only be lowered.
+- A floor (`min_amount_out`) may only be raised.
+- A DeepBook `price` may never be worse than the owner's: an ask may only rise, a bid only fall.
+- What is traded and where (`poolKey`, `isBid`, `payWithDeep`, the balance manager and its caps)
+  is fixed. `clientOrderId` is free but must be a whole number written as decimal text (a u64).
+- Any other key is refused.
+
+The signer checks these against the bounds the owner signed into the grant before asking for a
+build, and the builder checks them again against the published action, except the balance manager
+and its caps: those exist only in the signed grant, so only the signer pins them. For a grant signed before
+bounds were signed with it, the signer pins the price and object ids and caps `amount_in`; every
+other amount and floor is then bounded by the builder alone. A refusal reads
+`runtime_override_refused` and names the value and its bound. Report it; never retry with a value
+the bound refused.
+
 ## Pair the signer
 
 When Studio gives the user a pairing request, call `rill_pair { requestId }`. It signs a

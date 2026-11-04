@@ -224,6 +224,17 @@ fn grant(
                 {
                     return Err("price must be a positive plain decimal string".into());
                 }
+                // The signer sends this price to the builder as a runtime override, and the builder
+                // refuses one worse than the published price, so a worse one is refused here,
+                // before the owner signs a grant that could never build.
+                rill_core::runtime_bounds::limit(node, "price")
+                    .and_then(|bound| bound.check("price", &json!(price)))
+                    .map_err(|e| {
+                        format!(
+                            "price cannot be worse than the action's published price ({e}); \
+                             publish a new version to change it"
+                        )
+                    })?;
                 set_node_value(node, "price", json!(price))?;
             }
         }
@@ -729,32 +740,26 @@ async fn bind(
     )
     .map_err(err)?;
     let runset = json!({"label":skill.name,"network":context.network,"sender":grant.agent.to_string(),"actionId":skill.id,"walletPackageId":package.to_string(),"walletId":wallet_id.to_string(),"agentCapId":cap_id.to_string(),"versionId":version.to_string(),"capabilityManifest":grant.manifest,"allowedTargets":decoded.targets,"allowedObjectIds":decoded.object_inputs,"maxAmountBaseUnits":grant.per_tx.to_string(),"declaredSpendBaseUnits":compiled.root_spend_mist.to_string(),"minimumRemainingBaseUnits":grant.reserve.to_string(),"gasCeilingBaseUnits":compiled.transaction.gas_payment.budget.to_string()});
-    let params: serde_json::Map<String, Value> = grant
-        .flow
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind.as_str(), "deepbook_limit_order" | "cetus_swap"))
-        .map(|node| {
-            let mut values = serde_json::Map::new();
-            for key in [
-                "balanceManagerId",
-                "tradeCapId",
-                "depositCapId",
-                "price",
-                "amount_in",
-            ] {
-                if let Some(value) = node
-                    .inputs
-                    .as_ref()
-                    .and_then(|inputs| inputs.get(key))
-                    .or_else(|| node.config.as_ref().and_then(|config| config.get(key)))
-                {
-                    values.insert(key.into(), value.clone());
-                }
-            }
-            (node.id.clone(), Value::Object(values))
-        })
-        .collect();
+    // Every runtime value the builder would otherwise read from the published node, so the owner
+    // signs the exact defaults the signer forwards, and the bound on each, so the signer can refuse
+    // an agent's override without asking the server it exists to constrain.
+    let mut params = serde_json::Map::new();
+    let mut bounds = serde_json::Map::new();
+    for node in &grant.flow.nodes {
+        if rill_core::runtime_bounds::keys(&node.kind).next().is_none() {
+            continue;
+        }
+        let values: serde_json::Map<String, Value> = rill_core::runtime_bounds::keys(&node.kind)
+            .filter_map(|(key, _)| {
+                rill_core::runtime_bounds::published(node, key).map(|v| (key.to_owned(), v.clone()))
+            })
+            .collect();
+        params.insert(node.id.clone(), Value::Object(values));
+        bounds.insert(
+            node.id.clone(),
+            Value::Object(rill_core::runtime_bounds::limits(node)),
+        );
+    }
     let mut build_arguments = json!({
         "actionId": skill.id,
         "sender": grant.agent.to_string(),
@@ -763,7 +768,8 @@ async fn bind(
             "capId": cap_id.to_string(), "versionId": version.to_string(),
             "coinType": grant.manifest.wallet_coin_type, "capabilityManifest": grant.manifest
         },
-        "params": params
+        "params": params,
+        "runtimeBounds": bounds
     });
     if let Some(p) = &protection {
         build_arguments["agentWallet"]["protectedSwap"] = json!(p);
