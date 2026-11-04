@@ -8,9 +8,16 @@
 //! 1. the owner signs in and publishes a guarded Cetus swap (floor and asset scope included);
 //! 2. the server prepares an empty wallet, then the rules and funding, and the owner signs both;
 //! 3. the owner signs a grant, and a tampered copy of it is refused;
-//! 4. the agent's signer, started exactly as the plugin starts it, lists the grant and runs it once;
-//! 5. a second run exceeds what the budget has left and is refused before anything is signed;
+//! 4. the agent's signer, started exactly as the plugin starts it, lists the grant and runs it once,
+//!    and the same idempotencyKey answers that run again without a second submission, while the
+//!    key with different arguments is refused as a conflict;
+//! 5. a second run exceeds what the budget has left and is refused before anything is signed, and
+//!    a restarted signer still answers the first run's key from disk;
 //! 6. the owner revokes, the remaining budget comes back, and the agent is refused after that.
+//!
+//! The `stepup` scenario, run only when named, replaces steps 4 and 5 with the owner's step-up
+//! approval: the run pauses above the grant's threshold, the owner signs the approval's own text
+//! from the keystore, and the approved transaction lands once.
 //!
 //! Whatever fails after step 2, the wallet is revoked on the way out, so a failed run leaves no
 //! funds behind. Mainnet costs real SUI (one 0.005 SUI swap plus gas) and needs
@@ -28,6 +35,7 @@ use rill_cli::http;
 use rill_cli::keystore::Keystore;
 use rill_cli::revoke_cmd::{self, RevokeArgs};
 use rill_core::envelope::Network;
+use rill_core::step_up::StepUpApproval;
 use serde_json::{json, Value};
 use sui_sdk_types::{
     Address, Digest, GasPayment, ObjectReference, Transaction, TransactionExpiration,
@@ -335,6 +343,46 @@ fn live_key(step: &str) -> String {
     format!("e2e-{step}-{}", rand::random::<u64>())
 }
 
+/// Call `rill_run_action` again with arguments it already answered, and require that stored
+/// answer back: marked replayed and naming the same digest. A signer that ran it again would
+/// answer a new digest, or refuse it as over budget or already submitted.
+fn expect_replay(signer: &mut Agent, arguments: &Value, digest: &str) -> Result<(), String> {
+    let (again, failed) = signer.call("rill_run_action", arguments.clone());
+    if failed || again["replayed"] != true || again["digest"].as_str() != Some(digest) {
+        return Err(format!(
+            "the same idempotencyKey did not replay {digest}: {again}"
+        ));
+    }
+    Ok(())
+}
+
+/// The wallet's budget and spent counter as `before` read them, read from a node that has caught
+/// up with `before`, so a lagging one is not mistaken for a change. It does not wait for a second
+/// submission to propagate: the digest equality and `replayed` flag are the proof that nothing ran
+/// again, and this read only catches a change the node already shows.
+async fn expect_wallet_unchanged(
+    chain: &GrpcSui,
+    wallet: &str,
+    before: &Value,
+    what: &str,
+) -> Result<(), String> {
+    let spent = number(before, "spent");
+    let after = wallet_until(chain, wallet, "the earlier read's spend", |f| {
+        number(f, "spent") >= spent
+    })
+    .await?;
+    for field in ["budget", "spent"] {
+        if number(&after, field) != number(before, field) {
+            return Err(format!(
+                "{what} moved the wallet's {field}: {} -> {}",
+                number(before, field),
+                number(&after, field)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn grant_entry(actions: &Value, action: &str, wallet: &str) -> Value {
     actions["actions"]
         .as_array()
@@ -356,6 +404,9 @@ enum Kind {
     /// A DeepBook ask resting well above the market, from a BalanceManager the owner provisioned
     /// and delegated. The owner cancels it and withdraws the deposit at the end.
     DeepBook,
+    /// The swap again, under a grant whose step-up threshold is below its amount, so the run pauses
+    /// for the owner's approval and submits only once the owner has signed it.
+    StepUp,
 }
 
 impl Kind {
@@ -364,6 +415,7 @@ impl Kind {
             Kind::Swap => "swap",
             Kind::Stake => "stake",
             Kind::DeepBook => "deepbook",
+            Kind::StepUp => "stepup",
         }
     }
 }
@@ -377,6 +429,8 @@ struct Plan {
     spend: u64,
     /// Extra fields onboarding needs, such as a DeepBook manager and its capabilities.
     attach: Value,
+    /// The grant's step-up threshold, in mist; a run spending more waits for the owner.
+    step_up_above: Option<u64>,
 }
 
 /// A BalanceManager this run provisioned, which the owner empties again before the run ends.
@@ -403,6 +457,13 @@ async fn stake_an_owner_grants_and_the_agent_runs_within_its_limits() {
 #[ignore = "spends on a live network; run through scripts/e2e.sh"]
 async fn deepbook_an_owner_grants_and_the_agent_runs_within_its_limits() {
     scenario(Kind::DeepBook).await;
+}
+
+/// Not part of the default run: `scripts/e2e.sh <network> stepup` selects it.
+#[tokio::test]
+#[ignore = "spends on a live network; run through scripts/e2e.sh"]
+async fn stepup_the_owner_approves_a_run_above_the_threshold_and_it_submits_once() {
+    scenario(Kind::StepUp).await;
 }
 
 async fn scenario(kind: Kind) {
@@ -748,8 +809,10 @@ async fn plan(
         .ok_or("no USDC in the Cetus registry")?
         .to_owned();
     match kind {
-        Kind::Swap => {
+        Kind::Swap | Kind::StepUp => {
             let spend = 5_000_000;
+            // The step-up wallet affords one run: what it proves is the pause before that run.
+            let runs = if kind == Kind::StepUp { 1 } else { swap_runs() };
             // Floored at 90% of a quote: tight enough to mean something, loose enough that the
             // price moving between here and the swap does not fail the run.
             let quoted = quote_usdc(api, &pool, spend).await?;
@@ -762,15 +825,16 @@ async fn plan(
                     "min_amount_out": min_out.to_string()
                 }}],"edges":[]}),
                 manifest: json!({"walletCoinType":"0x2::sui::SUI","rules":[
-                    {"kind":"budget","totalMist": (spend * swap_runs() + spend / 2).to_string()},
+                    {"kind":"budget","totalMist": (spend * runs + spend / 2).to_string()},
                     {"kind":"per_tx","maxMist": spend.to_string()},
                     {"kind":"slippage_floor","minOutMist": min_out.to_string(),"coinType": usdc},
                     {"kind":"asset_scope","allowedCoinTypes":["0x2::sui::SUI", usdc]}
                 ]}),
-                budget: spend * swap_runs() + spend / 2,
+                budget: spend * runs + spend / 2,
                 per_tx: spend,
                 spend,
                 attach: json!({}),
+                step_up_above: (kind == Kind::StepUp).then_some(spend / 2),
             })
         }
         Kind::Stake => {
@@ -790,6 +854,7 @@ async fn plan(
                 per_tx: min,
                 spend: min,
                 attach: json!({}),
+                step_up_above: None,
             })
         }
         Kind::DeepBook => {
@@ -825,6 +890,7 @@ async fn plan(
                     "balanceManagerId": manager.id, "tradeCapId": manager.trade_cap,
                     "depositCapId": manager.deposit_cap, "price": price
                 }),
+                step_up_above: None,
             })
         }
     }
@@ -930,7 +996,7 @@ async fn run(
             budget_mist: plan.budget.to_string(),
             per_tx_mist: plan.per_tx.to_string(),
             expires_at_ms: Some(expires.clone()),
-            step_up_above_mist: None,
+            step_up_above_mist: plan.step_up_above.map(|mist| mist.to_string()),
             submit: true,
         },
     )
@@ -964,6 +1030,10 @@ async fn run(
         return Ok(());
     }
 
+    if kind == Kind::StepUp {
+        return step_up_run(setup, chain, receipts, &plan, &action, &wallet).await;
+    }
+
     step("the agent lists and runs the grant");
     let hasui_before = coin_total(chain, &agent, "::hasui::HASUI").await;
     let owner_usdc_before = coin_total(chain, &owner, "::usdc::USDC").await;
@@ -974,21 +1044,36 @@ async fn run(
     if entry["usable"] != Value::Bool(true) {
         return Err(format!("the fresh grant is not usable: {entry}"));
     }
-    let (ran, failed) = signer.call(
-        "rill_run_action",
-        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("run")}),
-    );
+    let run_arguments =
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("run")});
+    let (ran, failed) = signer.call("rill_run_action", run_arguments.clone());
     if failed {
         return Err(format!("the granted run was refused: {ran}"));
     }
-    let digest = ran["digest"].as_str().ok_or("the run returned no digest")?;
+    let digest = ran["digest"]
+        .as_str()
+        .ok_or("the run returned no digest")?
+        .to_owned();
     let spend = plan.spend;
-    wallet_until(chain, &wallet, "one run's spend", |f| {
+    let landed = wallet_until(chain, &wallet, "one run's spend", |f| {
         number(f, "spent") == spend
     })
     .await?;
     receipts["run"] = json!({"digest": digest, "spentMist": spend.to_string()});
     eprintln!("ran {digest}");
+
+    step("the same idempotencyKey replays the run and submits nothing");
+    expect_replay(&mut signer, &run_arguments, &digest)?;
+    let mut changed = run_arguments.clone();
+    changed["walletId"] = json!(Address::ZERO.to_string());
+    let (conflict, failed) = signer.call("rill_run_action", changed);
+    if !failed || conflict["code"] != "idempotency_key_conflict" || conflict.get("digest").is_some()
+    {
+        return Err(format!(
+            "a reused key with different arguments was not refused as a conflict: {conflict}"
+        ));
+    }
+    expect_wallet_unchanged(chain, &wallet, &landed, "the replay and the conflict").await?;
 
     if kind == Kind::Swap && std::env::var("RILL_E2E_EXPECT_PROTECTED").as_deref() == Ok("1") {
         let owner_after =
@@ -1032,6 +1117,17 @@ async fn run(
     receipts["overBudget"] = json!({"code": refused["code"], "rule": refused["rule"], "abortCode": refused["abortCode"]});
     eprintln!("refused: {} {}", refused["rule"], refused["abortCode"]);
 
+    // Restarted only now: the over-budget build above needs the gas this process consumed, which
+    // it remembers only in memory, to wait out a builder that has not seen the first run yet.
+    step("after a restart, the same idempotencyKey still replays the run");
+    // The stored receipt is on disk beside the signer's config, so a fresh process must answer
+    // from it too. One that only remembered in memory would build and submit a second run here.
+    drop(signer);
+    let mut signer = Agent::start(setup);
+    expect_replay(&mut signer, &run_arguments, &digest)?;
+    expect_wallet_unchanged(chain, &wallet, &landed, "the replay after a restart").await?;
+    receipts["replay"] = json!({"digest": digest, "afterRestart": true, "conflictRefused": true});
+
     step("owner revokes");
     revoke(setup, &wallet).await?;
     wallet_until(chain, &wallet, "revoked and emptied", |f| {
@@ -1072,6 +1168,241 @@ async fn run(
 
     receipts["passed"] = json!(true);
     eprintln!("\n{}: all steps passed", kind.name());
+    Ok(())
+}
+
+/// The owner's step-up approval, end to end on a live network. The run above the threshold pauses
+/// and submits nothing, its key replays the pause, the owner approves outside a browser, and the
+/// approved transaction lands once and only once. `scenario` revokes the wallet if this fails.
+async fn step_up_run(
+    setup: &Setup,
+    chain: &GrpcSui,
+    receipts: &mut Value,
+    plan: &Plan,
+    action: &str,
+    wallet: &str,
+) -> Result<(), String> {
+    let api = setup.api.trim_end_matches('/');
+    let owner = setup.owner.address().to_string();
+    let agent = setup.agent.to_string();
+    let threshold = plan
+        .step_up_above
+        .ok_or("the step-up plan names no threshold")?;
+    let budget = plan.budget;
+    let funded = wallet_until(chain, wallet, "its funding", |f| {
+        number(f, "budget") == budget
+    })
+    .await?;
+    // The swap's output is counted on both sides, so the check holds whichever of them the
+    // deployment settles it to.
+    let usdc_before = coin_total(chain, &owner, "::usdc::USDC").await
+        + coin_total(chain, &agent, "::usdc::USDC").await;
+
+    let mut signer = Agent::start(setup);
+    let (actions, _) = signer.call("rill_actions", json!({}));
+    let entry = grant_entry(&actions, action, wallet);
+    if entry["usable"] != Value::Bool(true) {
+        return Err(format!("the fresh grant is not usable: {entry}"));
+    }
+
+    step("stepup: a run above the threshold pauses for the owner");
+    let paused_arguments =
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("stepup-pause")});
+    let (paused, failed) = signer.call("rill_run_action", paused_arguments.clone());
+    if failed
+        || paused["code"] != "step_up_required"
+        || paused["submitted"] != false
+        || paused["replayed"] != false
+        || paused.get("digest").is_some()
+    {
+        return Err(format!(
+            "the run above the threshold did not pause: {paused}"
+        ));
+    }
+    let spend_named = paused["spendBaseUnits"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| format!("the pause names no spend: {paused}"))?;
+    let threshold_named = paused["thresholdBaseUnits"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok());
+    if threshold_named != Some(threshold) || spend_named <= threshold {
+        return Err(format!(
+            "the pause does not name the grant's threshold {threshold} below its spend: {paused}"
+        ));
+    }
+    let approval_id = paused["approvalId"]
+        .as_str()
+        .ok_or_else(|| format!("the pause carries no approvalId: {paused}"))?
+        .to_owned();
+    let origin = paused["approvalOrigin"]
+        .as_str()
+        .ok_or_else(|| format!("the pause names no approvalOrigin: {paused}"))?;
+    if paused["approvalUrl"].as_str() != Some(&format!("{origin}/approve?request={approval_id}")) {
+        return Err(format!(
+            "the approval link is not the approve page on its origin: {paused}"
+        ));
+    }
+    receipts["stepUp"] = json!({
+        "approvalId": approval_id, "pinnedDigest": paused["pinnedDigest"],
+        "transactionDigest": paused["transactionDigest"], "spendMist": spend_named.to_string(),
+        "thresholdMist": threshold.to_string(),
+    });
+    eprintln!("paused for approval {approval_id}");
+
+    step("stepup: the pause's key replays the pause, not a run");
+    let (again, failed) = signer.call("rill_run_action", paused_arguments);
+    if failed
+        || again["replayed"] != true
+        || again["code"] != "step_up_required"
+        || again["approvalId"] != approval_id.as_str()
+    {
+        return Err(format!("the paused key did not replay its pause: {again}"));
+    }
+
+    let continuing = |label: &str| json!({"actionId": action, "approvalId": approval_id, "idempotencyKey": live_key(label)});
+    step("stepup: before the owner approves, a continuing call waits");
+    let (waiting, failed) = signer.call("rill_run_action", continuing("stepup-early"));
+    if failed
+        || waiting["code"] != "step_up_pending"
+        || waiting["submitted"] != false
+        || waiting.get("digest").is_some()
+    {
+        return Err(format!(
+            "a call before the owner approved did not wait: {waiting}"
+        ));
+    }
+    expect_wallet_unchanged(
+        chain,
+        wallet,
+        &funded,
+        "the pause, its replay and the early call",
+    )
+    .await?;
+
+    step("stepup: the owner signs the approval's own text from the keystore");
+    let shown = data(http::get_json(&format!("{api}/api/step-up/{approval_id}")).await?);
+    if shown["status"] != "pending" {
+        return Err(format!(
+            "the request is not pending before approval: {shown}"
+        ));
+    }
+    let approval: StepUpApproval = serde_json::from_value(shown["approval"].clone())
+        .map_err(|e| format!("the server shows no step-up approval ({e}): {shown}"))?;
+    // Studio does not sign the server's text as given: it rebuilds it from the approval and
+    // refuses a mismatch. The signer verifies against its own copy, the one it paused with, so
+    // anything else shown here would be signed and then refused.
+    if serde_json::to_value(&approval).map_err(|e| e.to_string())? != paused["approval"] {
+        return Err(format!(
+            "the server shows a different approval than the signer paused on: {shown}"
+        ));
+    }
+    let message = approval.message();
+    if shown["message"].as_str() != Some(message.as_str()) {
+        return Err(format!(
+            "the server's text is not the approval's own: {shown}"
+        ));
+    }
+    let signature = setup
+        .owner
+        .sign_personal_message(message.as_bytes())
+        .map_err(|e| e.to_string())?
+        .to_base64();
+    let approved = data(
+        http::post_json(
+            &format!("{api}/api/step-up/{approval_id}/approve"),
+            &json!({ "signature": signature }),
+        )
+        .await?,
+    );
+    if approved["status"] != "approved" {
+        return Err(format!("the owner's approval was not taken: {approved}"));
+    }
+
+    step("stepup: the approved run submits");
+    let approved_arguments = continuing("stepup-approved");
+    let (ran, failed) = signer.call("rill_run_action", approved_arguments.clone());
+    if failed || ran["submitted"] != true || ran["approvalId"] != approval_id.as_str() {
+        return Err(format!("the approved run did not submit: {ran}"));
+    }
+    let digest = ran["digest"]
+        .as_str()
+        .ok_or_else(|| format!("the approved run returned no digest: {ran}"))?
+        .to_owned();
+    let spend = plan.spend;
+    let landed = wallet_until(chain, wallet, "the approved run's spend", |f| {
+        number(f, "spent") == spend
+    })
+    .await?;
+    let mut usdc_after = usdc_before;
+    for _ in 0..40 {
+        usdc_after = coin_total(chain, &owner, "::usdc::USDC").await
+            + coin_total(chain, &agent, "::usdc::USDC").await;
+        if usdc_after > usdc_before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    if usdc_after <= usdc_before {
+        return Err(format!(
+            "the approved swap delivered no USDC ({usdc_before} -> {usdc_after})"
+        ));
+    }
+    receipts["run"] = json!({
+        "digest": digest, "spentMist": spend.to_string(),
+        "usdcReceived": (usdc_after - usdc_before).to_string(),
+    });
+    eprintln!("ran {digest} after the owner's approval");
+
+    step("stepup: the approved key replays, and the approval runs nothing twice");
+    expect_replay(&mut signer, &approved_arguments, &digest)?;
+    let (twice, failed) = signer.call("rill_run_action", continuing("stepup-twice"));
+    if !failed
+        || twice.get("digest").is_some()
+        || !matches!(
+            twice["code"].as_str(),
+            Some("unknown_approval" | "already_submitted")
+        )
+    {
+        return Err(format!(
+            "a used approval under a new key was not refused: {twice}"
+        ));
+    }
+    expect_wallet_unchanged(
+        chain,
+        wallet,
+        &landed,
+        "the replay and the second call on one approval",
+    )
+    .await?;
+    receipts["stepUp"]["usedApprovalRefused"] = twice["code"].clone();
+
+    step("owner revokes");
+    revoke(setup, wallet).await?;
+    wallet_until(chain, wallet, "revoked and emptied", |f| {
+        f["revoked"] == Value::Bool(true) && number(f, "budget") == 0
+    })
+    .await?;
+
+    step("the agent is refused after revocation");
+    let (actions, _) = signer.call("rill_actions", json!({}));
+    let entry = grant_entry(&actions, action, wallet);
+    if entry["usable"] != Value::Bool(false) {
+        return Err(format!(
+            "a revoked wallet's grant still reads as usable: {entry}"
+        ));
+    }
+    let (after, failed) = signer.call(
+        "rill_run_action",
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("stepup-after-revoke")}),
+    );
+    if !failed {
+        return Err(format!("a revoked wallet still ran: {after}"));
+    }
+    receipts["afterRevoke"] = json!({"code": after["code"], "reason": entry["refusedBecause"]});
+
+    receipts["passed"] = json!(true);
+    eprintln!("\nstepup: all steps passed");
     Ok(())
 }
 

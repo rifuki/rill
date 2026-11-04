@@ -2,12 +2,12 @@
 #
 # The whole owner-to-agent flow against a live network, in one command that cleans up after itself.
 #
-#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|recovery]
+#   RILL_E2E_OWNER=0x… RILL_E2E_AGENT=0x… scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|stepup|recovery]
 #
 # Builds the server and the signer, starts a throwaway server on a free loopback port with its own
 # stores, runs the scenarios in `bins/rill/tests/e2e_live.rs` against it one after another (they
 # share the owner's key, so never in parallel), and stops the server whatever happened. Name a
-# scenario to run only that one.
+# scenario to run only that one. `workflow`, `stepup` and `recovery` run only when named.
 # The owner and the agent are both keys in the local Sui keystore, so no step waits on a wallet
 # popup; the test revokes the wallet it funded even when a step fails.
 #
@@ -16,7 +16,8 @@
 #
 # Mainnet spends real SUI and needs RILL_E2E_ALLOW_MAINNET=1: the swap turns 0.005 SUI into USDC, the
 # stake turns 1 SUI into haSUI held by the agent, and the DeepBook ask rests above the market until
-# the owner cancels it and withdraws its 1.1 SUI. Every wallet's remainder comes back on revoke.
+# the owner cancels it and withdraws its 1.1 SUI. The stepup scenario swaps 0.005 SUI once, after
+# the owner approves it from the keystore. Every wallet's remainder comes back on revoke.
 # Receipts land in the run directory printed at the end, one e2e-<scenario>-receipts.json each.
 set -euo pipefail
 
@@ -24,19 +25,24 @@ network="${1:-testnet}"
 scenario="${2:-}"
 case "$network" in
   testnet | mainnet) ;;
-  *) echo "usage: scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|recovery]" >&2; exit 2 ;;
+  *) echo "usage: scripts/e2e.sh [testnet|mainnet] [swap|stake|deepbook|workflow|stepup|recovery]" >&2; exit 2 ;;
 esac
 case "$scenario" in
-  "" | swap | stake | deepbook | workflow | recovery) ;;
-  *) echo "unknown scenario: $scenario (swap, stake, deepbook, workflow or recovery)" >&2; exit 2 ;;
+  "" | swap | stake | deepbook | workflow | stepup | recovery) ;;
+  *) echo "unknown scenario: $scenario (swap, stake, deepbook, workflow, stepup or recovery)" >&2; exit 2 ;;
 esac
-# Keep the default smoke allocation unchanged: the combined run and recovery are explicit modes.
+# Keep the default smoke allocation unchanged: the combined run, step-up and recovery are explicit
+# modes.
 extra_args=(--skip recovery_)
 if [ -z "$scenario" ]; then
-  extra_args+=(--skip workflow_)
+  extra_args+=(--skip workflow_ --skip stepup_)
 elif [ "$scenario" = recovery ]; then
   extra_args=(--skip workflow_)
   : "${RILL_E2E_RECOVERY_RECEIPT:?set RILL_E2E_RECOVERY_RECEIPT to the existing public workflow receipt}"
+elif [ "$scenario" != workflow ]; then
+  # The filter is a substring, and `swap_` is also inside `workflow_swap_stake_…`: without this,
+  # naming the swap would fund the whole combined workflow too.
+  extra_args+=(--skip workflow_)
 fi
 : "${RILL_E2E_OWNER:?set RILL_E2E_OWNER to the owner address in the local Sui keystore}"
 : "${RILL_E2E_AGENT:?set RILL_E2E_AGENT to the agent address in the local Sui keystore}"
