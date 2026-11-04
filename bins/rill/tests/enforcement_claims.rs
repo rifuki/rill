@@ -170,3 +170,45 @@ fn the_execute_tool_keeps_its_chain_client_inside_one_runtime() {
         "the client must be built in this path, inside that one runtime"
     );
 }
+
+/// A confirmed DeepBook placement is reported as a placement, in the signer's own answer.
+///
+/// "Submitted and confirmed" on an order reads as a completed trade, when the digest proves only
+/// that the order rests on the book. Anchored on the success literal rather than on `fn execute(`,
+/// because the success branch is the thing that matters and the function that holds it may be
+/// split or renamed; every shipped function that reports a `callSequence` must say which it was.
+#[test]
+fn execute_reports_order_placement_separately() {
+    let shipped = shipped(STDIO);
+    let mut checked = 0;
+    for (at, _) in shipped.match_indices("\"callSequence\"") {
+        let start = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+            .iter()
+            .filter_map(|item| shipped[..at].rfind(item))
+            .max()
+            .expect("a callSequence answer sits inside a function");
+        // The function ends at the first closing brace in column zero after the literal.
+        let end = at
+            + shipped[at..]
+                .find("\n}")
+                .expect("the function holding callSequence must close");
+        let body = &shipped[start..end];
+        assert!(
+            body.contains("\"orderPlaced\""),
+            "a success answer with a callSequence must say whether it placed an order"
+        );
+        assert!(
+            body.contains("places_order("),
+            "orderPlaced must come from the call sequence, not from a constant"
+        );
+        assert!(
+            body.contains("ORDER_PLACED_NOTE"),
+            "a placement must carry the note that says it is not a fill"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no shipped answer reports a callSequence; re-anchor this guard on the success answer"
+    );
+}

@@ -1569,6 +1569,21 @@ fn run_workflow(context: &mut WalletContext, id: Value, params: &Value) -> Value
     }
 }
 
+/// Whether a confirmed transaction placed a DeepBook limit order. Its digest proves the order was
+/// placed, not that it filled, and "Submitted and confirmed" alone reads as a completed trade.
+pub(crate) fn places_order(targets: &[String]) -> bool {
+    targets
+        .iter()
+        .any(|target| target.ends_with("::pool::place_limit_order"))
+}
+
+/// No retry rule here: the envelope cache lives in one process and granted actions are rebuilt on
+/// every call, so a promise that a second call is refused would not hold across them.
+const ORDER_PLACED_NOTE: &str = "Order placed on DeepBook and confirmed. This digest proves the \
+    placement, not a fill: the order may rest unfilled, fill in part or fill in full. This signer \
+    has no tool that reads order status or cancels an order; cancelling and withdrawing are the \
+    owner's, in Studio.";
+
 fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     let Some(run_set) = context.run_set.as_ref() else {
         // Names what is missing and where it goes. "No run-set is loaded" alone tells an agent it
@@ -1780,10 +1795,12 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         },
     );
 
+    let order = places_order(&targets);
     tool_ok(
         id,
         json!({
             "submitted": true,
+            "orderPlaced": order,
             "digest": outcome.digest,
             "pinnedDigest": digest,
             "callSequence": targets,
@@ -1792,9 +1809,13 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
             // What the code does, said in the answer. This used to read "calling again with the
             // same envelope submits a second transaction", which described a footgun instead of
             // removing it; the second call is now refused and answered with this digest.
-            "note": "Submitted and confirmed. This cannot be undone. Calling again with this same \
-                     envelope is refused and answered with this digest, so a retry cannot become a \
-                     second transaction; build a new action if another spend is intended."
+            "note": if order {
+                ORDER_PLACED_NOTE
+            } else {
+                "Submitted and confirmed. This cannot be undone. Calling again with this same \
+                 envelope is refused and answered with this digest, so a retry cannot become a \
+                 second transaction; build a new action if another spend is intended."
+            }
         }),
     )
 }
@@ -1845,6 +1866,32 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_order_placement_is_reported_as_placed_not_filled() {
+        let deepbook = "0x2c8d603bc51326b8c13cef9dd07031a408a48dddb541963357661df5d3204809";
+        assert!(places_order(&[
+            format!("{deepbook}::balance_manager::generate_proof_as_owner"),
+            format!("{deepbook}::pool::place_limit_order"),
+            "0x1::agent_wallet::confirm_spend".into(),
+        ]));
+        // A swap moves the same coins through a pool, and is a fill by construction.
+        assert!(!places_order(&[
+            "0x1eabed72::pool_script_v2::swap_a2b".into(),
+            format!("{deepbook}::pool::swap_exact_base_for_quote"),
+        ]));
+        assert!(!places_order(&[]));
+
+        for needed in ["not a fill", "no tool that reads order status", "Studio"] {
+            assert!(
+                ORDER_PLACED_NOTE.contains(needed),
+                "the placement note must say {needed:?}"
+            );
+        }
+        // Only one process remembers an envelope, and actions are rebuilt per call, so the note
+        // must not promise that a retry is refused.
+        assert!(!ORDER_PLACED_NOTE.contains("refused"));
+    }
 
     #[test]
     fn unstake_rejects_unknown_and_numeric_arguments_before_chain_reads() {
