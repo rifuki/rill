@@ -222,3 +222,39 @@ fn unstake_schema_requires_decimal_amount_and_floor_without_extra_fields() {
         serde_json::json!("string")
     );
 }
+
+/// The step-up continuation is part of the tool's contract: the argument that carries it, and the
+/// sentences an agent needs to use it without retrying the pause or claiming more than it binds.
+#[test]
+fn run_action_offers_the_step_up_continuation_and_states_its_reach() {
+    let tool = by_name(Surface::Wallet)
+        .remove("rill_run_action")
+        .expect("the signer offers rill_run_action");
+    let schema = serde_json::Value::Object((*tool.input_schema).clone());
+    let approval = &schema["properties"]["approvalId"];
+    assert_eq!(approval["type"], "string", "{schema}");
+    assert_eq!(approval["pattern"], "^[A-Za-z0-9_-]{1,96}$");
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("approvalId")),
+        "a first run has no approval to name"
+    );
+    let description = tool.description.as_deref().unwrap_or_default();
+    for needed in [
+        "pending_owner_approval",
+        "step_up_required",
+        "approvalUrl",
+        "NEW idempotencyKey",
+        "5 minutes",
+        "step_up_expired",
+        "rill_run_workflow",
+        "whoever can read the agent's key is bound only by the wallet's on-chain rules",
+    ] {
+        assert!(
+            description.contains(needed),
+            "the description must say {needed:?}"
+        );
+    }
+}

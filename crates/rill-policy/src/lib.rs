@@ -527,6 +527,11 @@ impl BytePinned {
         &self.pinned_digest
     }
 
+    /// The spend the envelope declared, already held to both of the run set's ceilings.
+    pub fn spend_base_units(&self) -> u64 {
+        self.spend_base_units
+    }
+
     /// Re-simulate the exact transaction that will be signed, against live state.
     ///
     /// The build-time simulation was run by the server, which the signer does not trust. This one

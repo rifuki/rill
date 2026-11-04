@@ -115,6 +115,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/grants/prepare", post(crate::studio_grants::prepare))
         .route("/api/grants", post(crate::studio_grants::store))
         .route("/api/grants/{agent}", get(crate::studio_grants::list))
+        .route("/api/step-up", post(crate::studio_step_up::open))
+        .route("/api/step-up/{id}", get(crate::studio_step_up::show))
+        .route(
+            "/api/step-up/{id}/approve",
+            post(crate::studio_step_up::approve_route),
+        )
         .route(
             "/api/mcp/{id}",
             get(crate::studio_api::public_mcp_get).post(crate::studio_api::public_mcp),

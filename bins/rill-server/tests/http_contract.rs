@@ -50,6 +50,7 @@ fn fresh_dir() -> std::path::PathBuf {
 fn config_in(dir: &std::path::Path) -> Config {
     Config {
         consent_url: "http://localhost:5173/authorize".into(),
+        studio_url: None,
         port: 3939,
         network: Network::Testnet,
         public_base_url: "https://api.rill.test".into(),
@@ -285,6 +286,7 @@ async fn a_body_above_the_cap_is_refused() {
 fn mainnet_config(secret: &str, guard: Option<&str>) -> Config {
     Config {
         consent_url: "http://localhost:5173/authorize".into(),
+        studio_url: None,
         port: 3939,
         network: Network::Mainnet,
         public_base_url: "https://api.rill.test".into(),

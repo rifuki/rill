@@ -35,7 +35,18 @@ pub struct Decoded {
     /// coin is the sender's own and is bounded by the gas budget — but it is worth knowing rather
     /// than assuming the list is everything the transaction touches.
     pub object_inputs: Vec<String>,
+    /// The total every `agent_wallet::request_spend` in the transaction asks to release, read from
+    /// the literal `amount` argument the bytes carry.
+    ///
+    /// `None` when any of those amounts is not a pure `u64` input, or the total overflows: nothing
+    /// can say what such a transaction spends before it runs, and a caller comparing a limit
+    /// against this must treat unknown as over it. `Some(0)` is a transaction that requests
+    /// nothing.
+    pub requested_spend_base_units: Option<u64>,
 }
+
+/// Where `agent_wallet::request_spend(wallet, cap, version, amount, clock)` takes its amount.
+const REQUEST_SPEND_AMOUNT: usize = 3;
 
 /// Decode the bytes that will be signed.
 pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
@@ -65,6 +76,7 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
 
     let mut targets = Vec::new();
     let mut commands = Vec::new();
+    let mut requested_spend = Some(0u64);
 
     for command in &programmable.commands {
         commands.push(name_of(command).to_string());
@@ -76,6 +88,12 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
                 "{}::{}::{}",
                 call.package, call.module, call.function
             ));
+            if call.module.as_str() == "agent_wallet" && call.function.as_str() == "request_spend" {
+                let amount = pure_u64_argument(programmable, call, REQUEST_SPEND_AMOUNT);
+                requested_spend = requested_spend
+                    .zip(amount)
+                    .and_then(|(total, amount)| total.checked_add(amount));
+            }
         }
     }
 
@@ -95,7 +113,45 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
         targets,
         commands,
         object_inputs,
+        requested_spend_base_units: requested_spend,
     })
+}
+
+/// A Move call's argument at `index`, when it is a pure input holding exactly a `u64`.
+///
+/// The one reader for a literal argument, so every limit that compares against a value in the
+/// bytes reads it the same way. An argument that is the result of an earlier command, or a pure
+/// input of any other width, is `None`: its value is not knowable from the bytes alone.
+pub fn pure_u64_argument(
+    programmable: &sui_sdk_types::ProgrammableTransaction,
+    call: &sui_sdk_types::MoveCall,
+    index: usize,
+) -> Option<u64> {
+    let Argument::Input(input) = call.arguments.get(index)? else {
+        return None;
+    };
+    match programmable.inputs.get(usize::from(*input))? {
+        sui_sdk_types::Input::Pure(value) => {
+            let bytes: [u8; 8] = value.as_slice().try_into().ok()?;
+            Some(u64::from_le_bytes(bytes))
+        }
+        _ => None,
+    }
+}
+
+/// Sui's own digest of the unsigned transaction, base58, as a wallet or explorer names it.
+///
+/// Computed from the same bytes the signer pins, so an owner's wallet that recomputes it from
+/// those bytes can tell whether what it is shown is what will be signed.
+pub fn transaction_digest(unsigned_ptb_base64: &str) -> Result<String, Rejection> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(unsigned_ptb_base64.trim())
+        .map_err(|_| Rejection::UndecodableTransaction("not base64".into()))?;
+    let transaction: Transaction =
+        bcs::from_bytes(&bytes).map_err(|e| Rejection::UndecodableTransaction(e.to_string()))?;
+    Ok(transaction.digest().to_string())
 }
 
 fn touches_gas_coin(command: &Command) -> bool {
@@ -288,6 +344,93 @@ mod tests {
         tx.transfer_objects(vec![coin], to);
         let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
         assert!(check_command_kinds(&decoded).is_ok());
+    }
+
+    /// `agent_wallet::request_spend(wallet, cap, version, amount, clock)`, the call every builder
+    /// releases funds with.
+    fn request_spend(tx: &mut TransactionBuilder, amount: sui_transaction_builder::Argument) {
+        let wallet = tx.object(ObjectInput::shared(addr(0x20), 1, true));
+        let cap = tx.object(ObjectInput::owned(addr(0x21), 1, Digest::ZERO));
+        let version = tx.object(ObjectInput::shared(addr(0x22), 1, false));
+        let clock = tx.object(ObjectInput::shared(addr(0x06), 1, false));
+        tx.move_call(
+            Function::new(
+                addr(0xca),
+                Identifier::new("agent_wallet").unwrap(),
+                Identifier::new("request_spend").unwrap(),
+            ),
+            vec![wallet, cap, version, amount, clock],
+        );
+    }
+
+    /// The amount the owner's threshold is compared with comes from the bytes the key will sign,
+    /// not from what the server declared about them.
+    #[test]
+    fn requested_spend_is_read_from_request_spend_bytes() {
+        let mut tx = builder();
+        let amount = tx.pure(&70_000_000u64);
+        request_spend(&mut tx, amount);
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert_eq!(decoded.requested_spend_base_units, Some(70_000_000));
+
+        let mut tx = builder();
+        let first = tx.pure(&70_000_000u64);
+        request_spend(&mut tx, first);
+        let second = tx.pure(&5u64);
+        request_spend(&mut tx, second);
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert_eq!(
+            decoded.requested_spend_base_units,
+            Some(70_000_005),
+            "two requests in one transaction are one spend as far as a threshold is concerned"
+        );
+
+        // An amount computed inside the transaction is not a literal, so nothing can say what it
+        // is before execution. Unknown is reported as unknown, never as zero.
+        let mut tx = builder();
+        let gas = tx.gas();
+        let half = tx.pure(&1u64);
+        let computed = tx.split_coins(gas, vec![half]).into_iter().next().unwrap();
+        request_spend(&mut tx, computed);
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert_eq!(decoded.requested_spend_base_units, None);
+
+        let mut tx = builder();
+        let overflow = tx.pure(&u64::MAX);
+        request_spend(&mut tx, overflow);
+        let again = tx.pure(&1u64);
+        request_spend(&mut tx, again);
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert_eq!(
+            decoded.requested_spend_base_units, None,
+            "an overflow is unknown"
+        );
+
+        // A transaction that requests nothing requests zero.
+        let mut tx = builder();
+        tx.move_call(
+            Function::new(
+                addr(0xca),
+                Identifier::new("m").unwrap(),
+                Identifier::new("f").unwrap(),
+            ),
+            vec![],
+        );
+        let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
+        assert_eq!(decoded.requested_spend_base_units, Some(0));
+    }
+
+    /// Studio recomputes this digest from the same bytes before the owner signs, so both sides
+    /// must name the transaction the way Sui does.
+    #[test]
+    fn the_transaction_digest_is_the_one_sui_computes() {
+        let tx = builder().try_build().unwrap();
+        let expected = tx.digest().to_string();
+        assert_eq!(transaction_digest(&encode(tx)).unwrap(), expected);
+        assert!(matches!(
+            transaction_digest("!!!"),
+            Err(Rejection::UndecodableTransaction(_))
+        ));
     }
 
     #[test]

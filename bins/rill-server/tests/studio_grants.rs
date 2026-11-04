@@ -180,6 +180,54 @@ async fn prepare_numbers_from_the_clock_after_the_store_is_lost() {
     );
 }
 
+/// The owner's step-up threshold is written into the run set the owner signs, and only one that
+/// can ever apply: a threshold at or above the per-transaction cap would never ask for anything.
+#[tokio::test]
+async fn prepare_writes_a_step_up_threshold_below_the_per_tx_cap_into_the_run_set() {
+    let with = |threshold: &str| {
+        let mut request = request();
+        request["stepUpAboveMist"] = json!(threshold);
+        request
+    };
+    let result = prepare_grant(
+        &with("500000000"),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &bounded(),
+        |_, _, _| 0,
+    )
+    .await
+    .unwrap();
+    let grant = grant_of(&result);
+    assert_eq!(grant.run_set["stepUpAboveBaseUnits"], "500000000");
+    assert_eq!(result["message"], json!(grant.message()));
+    assert!(grant
+        .message()
+        .contains("above 500000000 base units, each transaction also needs my separate approval"));
+
+    for refused in ["1000000000", "2000000000", "abc", "1.5"] {
+        let error = prepare_grant(
+            &with(refused),
+            &skill(),
+            &addr("0x1"),
+            &context(),
+            &bounded(),
+            |_, _, _| 0,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("stepUpAboveMist"), "{refused}: {error}");
+        assert!(
+            !error.contains("  "),
+            "the message must read as one sentence: {error}"
+        );
+    }
+
+    let plain = grant_of(&prepared(&bounded(), 0).await.unwrap());
+    assert!(plain.run_set.get("stepUpAboveBaseUnits").is_none());
+}
+
 #[tokio::test]
 async fn prepare_refuses_a_wallet_that_has_no_rules_yet() {
     let error = prepared(&chain(json!([]), false), 0).await.unwrap_err();

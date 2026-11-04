@@ -182,3 +182,31 @@ fn both_plugin_manifests_carry_one_version() {
     assert_eq!(version(CLAUDE_MANIFEST), version(CODEX_MANIFEST));
     assert!(!SKILL.contains('\u{2014}'), "SKILL.md carries an em dash");
 }
+
+/// The owner's step-up pause, as the agent must handle it: the link goes to the owner, the
+/// continuation is a new key with the approvalId, the window is the envelope's, and the skill
+/// says how far the pause reaches instead of implying it binds the key.
+#[test]
+fn the_skill_explains_the_step_up_pause_and_its_reach() {
+    let step_up = section("### Owner step-up approval");
+    for needed in [
+        "`pending_owner_approval`",
+        "`step_up_required`",
+        "`approvalUrl`",
+        "`approvalId`",
+        "a new `idempotencyKey`",
+        "replaying it returns the pause",
+        "5 minutes",
+        "`step_up_expired`",
+        "`step_up_pending`",
+        "Do not rebuild",
+        "`rill_run_action` and `rill_run_workflow`",
+        "`use_granted_action`",
+        "bound only by the wallet's on-chain rules",
+    ] {
+        assert!(
+            step_up.contains(needed),
+            "the step-up section must say {needed:?}"
+        );
+    }
+}

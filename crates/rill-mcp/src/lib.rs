@@ -603,14 +603,24 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  re-simulates it, signs and submits. THIS SUBMITS A REAL TRANSACTION and cannot be \
                  undone. A refusal naming a rule or the grant is the wallet working; report it \
                  rather than retrying. Every call builds a fresh transaction, so only the key \
-                 tells a retry from a second run. ", keyed_retry!()),
+                 tells a retry from a second run. ", keyed_retry!(), " Above the owner's step-up \
+                 threshold (stepUpAboveBaseUnits in rill_actions) this answers \
+                 pending_owner_approval with code step_up_required and submits nothing: give the \
+                 owner approvalUrl, then call again with the same actionId, the approvalId and a \
+                 NEW idempotencyKey, since the first key's outcome is that pause. The owner has \
+                 the 5 minutes the transaction is valid for; after that step_up_expired means run \
+                 the action again. The signer submits only after it verifies the current owner's \
+                 signature over that exact transaction. This pause binds this tool and \
+                 rill_run_workflow; whoever can read the agent's key is bound only by the \
+                 wallet's on-chain rules."),
                 json!({
                     "type": "object",
                     "properties": {
                         "actionId": { "type": "string", "description": "The actionId from rill_actions." },
                         "walletId": { "type": "string", "description": "Optional. Which wallet's grant to use, when more than one wallet granted this action." },
                         "revision": { "type": "integer", "minimum": 1, "description": "Optional exact owner-signed grant revision." },
-                        "params": { "type": "object", "description": "Optional. Runtime values keyed by node id, as the action's build_action schema allows, for example a tighter minimum output. Amounts are decimal text." }
+                        "params": { "type": "object", "description": "Optional. Runtime values keyed by node id, as the action's build_action schema allows, for example a tighter minimum output. Amounts are decimal text." },
+                        "approvalId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$", "description": "Optional. The approvalId a step_up_required answer gave, once the owner has approved it in Studio. Runs exactly the transaction the owner approved; pass it with actionId and a new idempotencyKey only." }
                     },
                     "required": ["actionId"],
                     "additionalProperties": false

@@ -24,6 +24,7 @@ fn app_state() -> AppState {
         network: Network::Testnet,
         public_base_url: "https://api.rill.test".into(),
         consent_url: "http://localhost:5173/authorize".into(),
+        studio_url: None,
         sui_rpc_url: "https://fullnode.testnet.sui.io:443".into(),
         oauth_secret: "test-studio-secret-at-least-32-characters".into(),
         oauth_secret_from_env: true,

@@ -18,6 +18,14 @@ use sha2::{Digest, Sha256};
 /// mistaken for this one, and a signature over this one can never be replayed as a later one.
 pub const MESSAGE_HEADER: &str = "Rill action grant v1";
 
+/// The run set key holding the owner's step-up threshold, in base units as decimal text.
+///
+/// Inside the run set rather than a field of [`Grant`]: `Grant` refuses unknown fields, and a
+/// signer that parses the grant list whole would then refuse every grant because of one. Inside
+/// the run set it is hashed with everything else, and an older signer refuses only that grant,
+/// because its run set refuses the unknown key.
+pub const STEP_UP_KEY: &str = "stepUpAboveBaseUnits";
+
 /// What the owner signs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -95,12 +103,24 @@ impl Grant {
     ///
     /// Written for the person approving it: the action, the wallet, the asset and the ceiling in
     /// words, then the digest that binds every other detail of the run set.
+    ///
+    /// A step-up threshold gets a line of its own, and only when the run set has one. The digest
+    /// already covers it, but an owner who adds a human check should read that they did; a grant
+    /// without one keeps the exact text its signature was made over.
     pub fn message(&self) -> String {
+        let step_up = match self.run_set.get(STEP_UP_KEY) {
+            Some(_) => format!(
+                "above {} base units, each transaction also needs my separate approval,\n",
+                self.run_set_text(STEP_UP_KEY)
+            ),
+            None => String::new(),
+        };
         format!(
             "{MESSAGE_HEADER}\n\
              Agent {agent} may run \"{name}\" ({id})\n\
              from wallet {wallet} on {network},\n\
              spending {coin}, at most {per_tx} base units per transaction,\n\
+             {step_up}\
              until {expiry}. Revision {revision}.\n\
              Digest: {digest}",
             agent = self.agent,
@@ -130,7 +150,7 @@ impl Grant {
 }
 
 /// `YYYY-MM-DD HH:MM UTC` for milliseconds since the epoch, without a date crate in the pure core.
-fn utc_minute(ms: u64) -> String {
+pub(crate) fn utc_minute(ms: u64) -> String {
     let secs = ms / 1000;
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Howard Hinnant's days-to-civil, for the proleptic Gregorian calendar.
@@ -160,7 +180,7 @@ pub fn content_digest(value: &Value) -> String {
         .collect()
 }
 
-fn write_canonical(value: &Value, out: &mut String) {
+pub(crate) fn write_canonical(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
@@ -253,6 +273,32 @@ mod tests {
                 grant().digest()
             )
         );
+    }
+
+    /// The threshold rides inside the run set, so a grant without it keeps the text and digest it
+    /// was signed over, and one with it tells the owner, in words, what they are adding.
+    #[test]
+    fn a_step_up_threshold_is_written_into_the_message_and_its_absence_changes_nothing() {
+        let mut stepped = grant();
+        stepped.run_set["stepUpAboveBaseUnits"] = json!("10000000");
+        assert_eq!(
+            stepped.message(),
+            format!(
+                "Rill action grant v1\n\
+                 Agent 0x3e may run \"cetus swap\" (skill_abc)\n\
+                 from wallet 0x49 on mainnet,\n\
+                 spending 0x2::sui::SUI, at most 50000000 base units per transaction,\n\
+                 above 10000000 base units, each transaction also needs my separate approval,\n\
+                 until 2026-10-04 19:44 UTC. Revision 1.\n\
+                 Digest: {}",
+                stepped.digest()
+            )
+        );
+        assert_ne!(stepped.digest(), grant().digest());
+
+        // The fixture without the key renders exactly what the tests above pin.
+        assert!(!grant().message().contains("separate approval"));
+        assert!(!grant().canonical_json().contains("stepUp"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ fn fresh_dir() -> std::path::PathBuf {
 fn config_in(dir: &std::path::Path) -> Config {
     Config {
         consent_url: "http://localhost:5173/authorize".into(),
+        studio_url: None,
         port: 3939,
         network: Network::Testnet,
         public_base_url: "http://localhost:3939".into(),

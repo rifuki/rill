@@ -90,12 +90,39 @@ pub async fn prepare_grant(
         }
     }
     let mut grant = grant_plan(&bind, skill, owner, context, chain).await?;
+    if let Some(threshold) = step_up_threshold(request, &grant.run_set)? {
+        grant.run_set[rill_core::grant::STEP_UP_KEY] = json!(threshold);
+    }
     grant.revision = next_revision(
         current_revision(&grant.agent, &grant.wallet_id, &grant.action_id),
         context.now_ms,
     );
     let message = grant.message();
     Ok(json!({ "grant": grant, "message": message }))
+}
+
+/// The owner's optional step-up threshold, `stepUpAboveMist`, held to what the signer will accept:
+/// a whole number of base units below the run set's per-transaction cap. One at or above the cap
+/// would never ask for anything, and a signer refuses the whole grant over a threshold it cannot
+/// read, so both are refused here while the owner can still change them.
+fn step_up_threshold(request: &Value, run_set: &Value) -> Result<Option<String>, String> {
+    let Some(value) = request.get("stepUpAboveMist") else {
+        return Ok(None);
+    };
+    let threshold = value
+        .as_str()
+        .and_then(|text| rill_core::amounts::parse_u64_string(text).ok())
+        .ok_or("stepUpAboveMist must be a whole number of mist written as text")?;
+    let cap = run_set["maxAmountBaseUnits"]
+        .as_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or("the run set has no per-transaction cap")?;
+    if threshold >= cap {
+        return Err(format!(
+            "stepUpAboveMist {threshold} must be below perTxMist {cap}; a threshold at or above the per-transaction cap never applies"
+        ));
+    }
+    Ok(Some(threshold.to_string()))
 }
 
 /// The revision a newly prepared grant carries: one above the stored revision, and never below the

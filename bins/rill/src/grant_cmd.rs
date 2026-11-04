@@ -20,6 +20,8 @@ pub struct GrantArgs {
     pub budget_mist: String,
     pub per_tx_mist: String,
     pub expires_at_ms: Option<String>,
+    /// Above this many mist, each transaction also waits for the owner's own approval in Studio.
+    pub step_up_above_mist: Option<String>,
     /// Sign and store. Without it the grant is prepared and shown, and nothing is signed.
     pub submit: bool,
 }
@@ -53,10 +55,9 @@ pub async fn sign_in(api: &str, keystore: &Keystore) -> Result<String, String> {
         .ok_or_else(|| "signing in returned no token".to_owned())
 }
 
-pub async fn grant(keystore: &Keystore, args: &GrantArgs) -> Result<Value, String> {
-    let api = args.api.trim_end_matches('/');
-    let token = sign_in(api, keystore).await?;
-
+/// What `rill grant` asks the server to prepare. Optional limits are sent only when given, so the
+/// server's defaults stay the defaults.
+pub fn grant_request(args: &GrantArgs) -> Value {
     let mut request = json!({
         "actionId": args.action_id,
         "walletId": args.wallet_id,
@@ -66,6 +67,17 @@ pub async fn grant(keystore: &Keystore, args: &GrantArgs) -> Result<Value, Strin
     if let Some(expiry) = &args.expires_at_ms {
         request["expiresAtMs"] = json!(expiry);
     }
+    if let Some(threshold) = &args.step_up_above_mist {
+        request["stepUpAboveMist"] = json!(threshold);
+    }
+    request
+}
+
+pub async fn grant(keystore: &Keystore, args: &GrantArgs) -> Result<Value, String> {
+    let api = args.api.trim_end_matches('/');
+    let token = sign_in(api, keystore).await?;
+
+    let request = grant_request(args);
     let prepared =
         http::post_json_as(&format!("{api}/api/grants/prepare"), &request, &token).await?;
     let prepared = data(&prepared);
@@ -84,6 +96,7 @@ pub async fn grant(keystore: &Keystore, args: &GrantArgs) -> Result<Value, Strin
         "agent": grant.agent,
         "revision": grant.revision,
         "expiresAtMs": grant.expires_at_ms,
+        "stepUpAboveBaseUnits": grant.run_set.get(rill_core::grant::STEP_UP_KEY),
         "message": message,
         "submitted": false,
     });
@@ -108,4 +121,29 @@ pub async fn grant(keystore: &Keystore, args: &GrantArgs) -> Result<Value, Strin
     report["stored"] = data(&stored).clone();
     report["note"] = json!("Signed and stored. The agent's signer lists it with rill_actions.");
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(step_up: Option<&str>) -> GrantArgs {
+        GrantArgs {
+            api: "http://127.0.0.1:1".into(),
+            action_id: "skill_x".into(),
+            wallet_id: "0x1".into(),
+            budget_mist: "100".into(),
+            per_tx_mist: "50".into(),
+            expires_at_ms: None,
+            step_up_above_mist: step_up.map(str::to_owned),
+            submit: false,
+        }
+    }
+
+    /// A terminal owner has the same choice as Studio, and leaving it out changes nothing.
+    #[test]
+    fn a_step_up_threshold_is_sent_only_when_given() {
+        assert_eq!(grant_request(&args(Some("10")))["stepUpAboveMist"], "10");
+        assert!(grant_request(&args(None)).get("stepUpAboveMist").is_none());
+    }
 }

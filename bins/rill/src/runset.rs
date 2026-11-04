@@ -56,6 +56,26 @@ pub struct RunSet {
     /// What must remain in the wallet afterwards. No on-chain rule expresses this.
     pub minimum_remaining_base_units: String,
     pub gas_ceiling_base_units: String,
+    /// The owner's step-up threshold: a transaction spending more than this needs the owner's own
+    /// approval of those exact bytes, in Studio, before this signer signs it.
+    ///
+    /// Not part of [`LocalPolicy`]: it is not a ceiling the envelope is held to but a pause, and
+    /// the signer applies it after the bytes are pinned, where the amount is read from them.
+    /// Signers before this field existed refuse it as an unknown key, so they refuse a stepped
+    /// grant rather than run it without the pause.
+    /// A key that is present must hold a string: `null` would otherwise load as no threshold
+    /// while the grant message the owner signed says a step-up applies.
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub step_up_above_base_units: Option<String>,
+}
+
+/// An optional field that, when present, must be a string. Absent is `None` through `default`.
+fn present_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    <String as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,7 +167,27 @@ impl RunSet {
             "minimumRemainingBaseUnits",
         )?;
         amount(&self.gas_ceiling_base_units, "gasCeilingBaseUnits")?;
+        let max = amount(&self.max_amount_base_units, "maxAmountBaseUnits")?;
+        if let Some(threshold) = self.step_up_threshold()? {
+            if threshold >= max {
+                return Err(RunSetError::BadAmount {
+                    field: "stepUpAboveBaseUnits",
+                    reason: format!(
+                        "{threshold} is not below the per-transaction cap {max}; a threshold at \
+                         or above the per-transaction cap never applies"
+                    ),
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// The step-up threshold in base units, or `None` when the owner set none.
+    pub fn step_up_threshold(&self) -> Result<Option<u64>, RunSetError> {
+        self.step_up_above_base_units
+            .as_deref()
+            .map(|value| amount(value, "stepUpAboveBaseUnits"))
+            .transpose()
     }
 
     /// Confirm the run-set and the loaded key describe the same wallet.
@@ -323,6 +363,53 @@ mod tests {
             RunSet::from_path(&write(&v)),
             Err(RunSetError::Malformed(_))
         ));
+    }
+
+    /// The owner's step-up threshold is part of the run set, and only a threshold that can ever
+    /// apply is accepted: one at or above the per-transaction cap would never ask for anything.
+    #[test]
+    fn a_run_set_may_carry_a_step_up_threshold_below_its_per_tx_cap() {
+        let mut v = valid();
+        v["maxAmountBaseUnits"] = json!("50");
+        v["stepUpAboveBaseUnits"] = json!("10");
+        let run_set = RunSet::from_value(&v).expect("a threshold below the cap loads");
+        assert_eq!(run_set.step_up_threshold(), Ok(Some(10)));
+
+        v["stepUpAboveBaseUnits"] = json!("50");
+        assert!(matches!(
+            RunSet::from_value(&v),
+            Err(RunSetError::BadAmount {
+                field: "stepUpAboveBaseUnits",
+                ..
+            })
+        ));
+        // A null threshold is not "no threshold": the grant message would still say a step-up
+        // applies while nothing gates the spend.
+        v["stepUpAboveBaseUnits"] = serde_json::Value::Null;
+        assert!(
+            RunSet::from_value(&v).is_err(),
+            "an explicit null threshold must not load as no threshold"
+        );
+        v["stepUpAboveBaseUnits"] = json!(10);
+        assert!(
+            RunSet::from_value(&v).is_err(),
+            "a threshold must be a string"
+        );
+        v["stepUpAboveBaseUnits"] = json!("abc");
+        assert!(matches!(
+            RunSet::from_value(&v),
+            Err(RunSetError::BadAmount { .. })
+        ));
+
+        let plain = RunSet::from_value(&valid()).expect("a run set without the key still loads");
+        assert_eq!(plain.step_up_threshold(), Ok(None));
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("stepUpAboveBaseUnits")
+                .is_none(),
+            "a run set without a threshold serializes without the key"
+        );
     }
 
     #[test]

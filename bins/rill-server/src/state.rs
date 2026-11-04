@@ -37,6 +37,10 @@ const MIN_OWNER_SECRET_CHARS: usize = 32;
 
 pub struct Config {
     pub consent_url: String,
+    /// Where Rill Studio is served, for links this server hands out: `RILL_STUDIO_URL`. `None`
+    /// takes the origin of [`Config::consent_url`], which is Studio's own consent page. Read
+    /// through [`Config::studio_origin`].
+    pub studio_url: Option<String>,
     pub port: u16,
     pub network: Network,
     pub public_base_url: String,
@@ -145,6 +149,7 @@ impl Config {
         Self {
             consent_url: std::env::var("RILL_CONSENT_URL")
                 .unwrap_or_else(|_| "http://localhost:5173/authorize".into()),
+            studio_url: trimmed_env("RILL_STUDIO_URL"),
             port,
             network,
             sui_rpc_url: std::env::var("SUI_RPC_URL").unwrap_or_else(|_| match network {
@@ -199,6 +204,19 @@ impl Config {
     /// a normalisation that only happens in `from_env` is one a test cannot see.
     pub fn base(&self) -> &str {
         self.public_base_url.trim_end_matches('/')
+    }
+
+    /// Rill Studio's origin, with no trailing slash: the configured one, else the origin of the
+    /// consent page, which Studio serves. An approval link built from anything else would send an
+    /// owner to a page that is not the one they trust with their wallet.
+    pub fn studio_origin(&self) -> String {
+        if let Some(url) = &self.studio_url {
+            return url.trim_end_matches('/').to_owned();
+        }
+        match url::Url::parse(&self.consent_url) {
+            Ok(url) => url.origin().ascii_serialization(),
+            Err(_) => self.consent_url.trim_end_matches('/').to_owned(),
+        }
     }
 
     /// The MCP endpoint tokens are audience-bound to: the one URL a user pastes into an agent.
@@ -335,6 +353,9 @@ pub struct AppState {
     /// Owner-signed action grants, served to the signers they name.
     pub grants: Arc<rill_store::grants::FileGrantStore>,
     pub pairing: Arc<rill_store::pairing::PairingStore>,
+    /// Transactions an agent's signer paused on above its owner's step-up threshold, held in
+    /// memory for the minutes their envelopes live.
+    pub step_ups: Arc<rill_store::step_up::StepUpStore>,
     /// Loaded at boot — a corrupt file must surface at startup, not on the first sign-in. Read
     /// once the OAuth endpoints are wired.
     pub oauth: Arc<FileOAuthStore>,
@@ -367,6 +388,7 @@ impl AppState {
                 )
                 .expect("pairing store must load at startup"),
             ),
+            step_ups: Arc::new(rill_store::step_up::StepUpStore::new()),
             oauth: Arc::new(FileOAuthStore::load(&config.oauth_store_path, now_ms)),
             chain: Arc::new(chain),
             deepbook_package_id: std::env::var("DEEPBOOK_PACKAGE_ID")

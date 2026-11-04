@@ -34,6 +34,7 @@ fn config_with(base: &str) -> Config {
     std::fs::create_dir_all(&dir).unwrap();
     Config {
         consent_url: "http://localhost:5173/authorize".into(),
+        studio_url: None,
         port: 3939,
         network: Network::Testnet,
         public_base_url: base.into(),

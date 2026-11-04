@@ -1,6 +1,6 @@
 ---
 name: rill
-description: Use when the user wants an AI agent to move money on Sui through a Rill agent wallet, such as running an action the wallet's owner granted, checking a wallet's limits, quoting or making a swap, placing a DeepBook limit order, or sending a payment. Covers setup when the signer is not ready, granted actions, disclosing and waiting for the user's yes before a spend, swap, stake, unstake or envelope submits outside an owner grant, reporting what granted actions ran, what a limit order digest means, retrying a submission only with its own idempotencyKey, and what a refusal means.
+description: Use when the user wants an AI agent to move money on Sui through a Rill agent wallet, such as running an action the wallet's owner granted, checking a wallet's limits, quoting or making a swap, placing a DeepBook limit order, or sending a payment. Covers setup when the signer is not ready, granted actions, an owner's step-up approval above a threshold, disclosing and waiting for the user's yes before a spend, swap, stake, unstake or envelope submits outside an owner grant, reporting what granted actions ran, what a limit order digest means, retrying a submission only with its own idempotencyKey, and what a refusal means.
 ---
 
 # Rill agent wallet
@@ -59,6 +59,33 @@ bounds were signed with it, the signer pins the price and object ids and caps `a
 other amount and floor is then bounded by the builder alone. A refusal reads
 `runtime_override_refused` and names the value and its bound. Report it; never retry with a value
 the bound refused.
+
+### Owner step-up approval
+
+An owner may set a step-up threshold in a grant; `rill_actions` shows it as `stepUpAboveBaseUnits`.
+Below it a granted action runs as usual. Above it `rill_run_action` answers
+`pending_owner_approval` with code `step_up_required` and submits nothing.
+
+1. Give the owner `approvalUrl` with the amount (`spendBaseUnits`). They approve that exact
+   transaction in Rill Studio with their own wallet, within the 5 minutes it is valid for.
+2. Then call `rill_run_action { actionId, approvalId, idempotencyKey }`, with a new
+   `idempotencyKey`: the first key's outcome is the pause, and replaying it returns the pause
+   again. The call with `approvalId` and a new `idempotencyKey` is a new attempt at the same
+   approved transaction. Pass nothing else: the owner approved those exact bytes.
+3. `step_up_pending` means the owner has not approved yet; ask them, then call again with the same
+   `approvalId` and another new key. `step_up_expired` means the 5 minutes passed: run the action
+   again with a new key, and the owner is asked again. `grant_changed`, `approval_not_owner` and
+   `step_up_digest_mismatch` are refusals; report them.
+
+Do not rebuild, change the amount to slip under the threshold, or try another tool while you wait.
+In a workflow, a step above the threshold stops the run at that step.
+
+The pause binds `rill_run_action` and `rill_run_workflow`. `rill_spend`, `rill_swap`, `rill_stake`
+and a hand-supplied `rill_execute` are already refused with `use_granted_action` on a wallet that
+holds a usable grant when a Rill API is configured, so they are no way around it either. It is the
+signer that pauses, though, not the chain: anyone who can read the agent's keystore, such as an
+agent with a shell or the `rill-wallet` CLI, can sign without the pause, and is then
+bound only by the wallet's on-chain rules.
 
 ## Pair the signer
 

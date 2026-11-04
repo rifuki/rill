@@ -20,6 +20,7 @@
 pub mod file;
 pub mod grants;
 pub mod pairing;
+pub mod step_up;
 
 use serde::{Deserialize, Serialize};
 
@@ -164,6 +165,10 @@ pub enum StoreError {
         current: u64,
         given: u64,
     },
+    /// Nothing live is held under this id.
+    NotFound(String),
+    /// The operation was already done and may be done only once, or the id is taken.
+    Conflict(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -186,6 +191,8 @@ impl std::fmt::Display for StoreError {
                 "revision {given} is not newer than revision {current} already held for this \
                  agent, wallet and action"
             ),
+            Self::NotFound(what) => write!(f, "{what} is not held, or has expired"),
+            Self::Conflict(why) => write!(f, "{why}"),
         }
     }
 }

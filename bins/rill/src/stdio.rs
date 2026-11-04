@@ -80,6 +80,11 @@ pub struct WalletContext {
     /// The Rill API grants are read from, when it is not the one `RILL_API_URL` names. Like
     /// `rpc_url`, it lets a test pin the API instead of inheriting whatever the shell exports.
     pub api_url: Option<String>,
+    /// Transactions above an owner's step-up threshold, pinned and held for the owner's approval,
+    /// by the approval id the Rill API issued. Process-scoped like `submitted`: a restarted signer
+    /// has forgotten them, and the agent runs the action again. Expired ones are dropped on every
+    /// `rill_run_action`.
+    pub pending_step_up: HashMap<String, crate::step_up::PendingStepUp>,
 }
 
 /// One envelope this signer has already handed to the chain.
@@ -105,6 +110,7 @@ impl WalletContext {
             state_dir: None,
             rpc_url: None,
             api_url: None,
+            pending_step_up: HashMap::new(),
         }
     }
 
@@ -334,7 +340,13 @@ fn dispatch(context: &mut WalletContext, id: Value, name: &str, params: &Value) 
         "rill_stake" => stake(context, id, params),
         "rill_portfolio" => portfolio(context, id, params),
         "rill_unstake" => unstake(context, id, params),
-        "rill_execute" => execute(context, id, params, EnvelopeSource::HandSupplied),
+        "rill_execute" => execute(
+            context,
+            id,
+            params,
+            EnvelopeSource::HandSupplied,
+            StepUp::None,
+        ),
         "rill_actions" => actions(context, id),
         "rill_run_action" => run_action(context, id, params),
         "rill_run_workflow" => run_workflow(context, id, params),
@@ -1753,6 +1765,8 @@ fn action_entry((signed, verdict): &CheckedGrant) -> Value {
         "revision": grant.revision,
         "expiresAtMs": grant.expires_at_ms,
         "maxPerTransactionBaseUnits": grant.run_set.get("maxAmountBaseUnits"),
+        // So an agent knows ahead of a run which ones will pause for the owner.
+        "stepUpAboveBaseUnits": grant.run_set.get(rill_core::grant::STEP_UP_KEY),
         "usable": verdict.is_ok(),
     });
     match verdict {
@@ -1872,6 +1886,14 @@ fn run_action_for_owner(
         );
     };
     let action_id = action_id.to_owned();
+    let now = now_ms();
+    context.pending_step_up.retain(|approval_id, pending| {
+        !pending.approval.is_expired(now) || argument(params, "approvalId") == Some(approval_id)
+    });
+    if let Some(approval_id) = argument(params, "approvalId") {
+        let approval_id = approval_id.to_owned();
+        return continue_step_up(context, id, params, &action_id, &approval_id, &api, owner);
+    }
     let wallet = argument(params, "walletId").map(str::to_owned);
     let revision_value = params.get("arguments").and_then(|a| a.get("revision"));
     let revision = revision_value.and_then(Value::as_u64);
@@ -2062,16 +2084,46 @@ fn run_action_for_owner(
         }
     };
 
+    let step_up = match verified.run_set.step_up_threshold() {
+        Ok(Some(threshold)) => StepUp::Gate {
+            threshold,
+            grant: crate::step_up::StepUpGrant {
+                action_name: verified.grant.action_name.clone(),
+                revision: verified.grant.revision,
+                digest: verified.grant.digest(),
+            },
+        },
+        Ok(None) => StepUp::None,
+        Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
+    };
+
     // The owner-signed run set stands in for a file for this one call, then the signer's own
     // configuration is put back whatever happened.
     let saved = context.run_set.replace(verified.run_set.clone());
     let mut response = execute(
         context,
-        id,
+        id.clone(),
         &json!({ "arguments": { "envelope": envelope } }),
         EnvelopeSource::Grant,
+        step_up,
     );
     context.run_set = saved;
+    let paused = &response["result"]["structuredContent"];
+    if paused["code"] == "step_up_required" {
+        response = open_step_up(
+            context,
+            id,
+            &paused.clone(),
+            envelope,
+            verified.run_set.clone(),
+            &api,
+        );
+    }
+    with_grant(response, &verified)
+}
+
+/// The grant a run used, added to its answer so the agent can report which approval it ran under.
+fn with_grant(mut response: Value, verified: &crate::grants::VerifiedGrant) -> Value {
     if let Some(structured) = response
         .get_mut("result")
         .and_then(|r| r.get_mut("structuredContent"))
@@ -2086,6 +2138,289 @@ fn run_action_for_owner(
                 "owner": verified.owner,
             }),
         );
+    }
+    response
+}
+
+/// Open the owner's approval request for a paused run and hold the pinned envelope until then.
+///
+/// The request is signed by the agent's key over [`StepUpApproval::request_message`], so only
+/// this agent can put a request in front of its owner. That is a personal message under its own
+/// header, never a transaction signature. If the API cannot take the request, nothing is held and
+/// nothing was signed: the agent can run the action again.
+///
+/// [`StepUpApproval::request_message`]: rill_core::step_up::StepUpApproval::request_message
+fn open_step_up(
+    context: &mut WalletContext,
+    id: Value,
+    paused: &Value,
+    envelope: Value,
+    run_set: RunSet,
+    api: &str,
+) -> Value {
+    let unavailable = |why: String| {
+        tool_error(
+            id.clone(),
+            "step_up_unavailable",
+            &format!(
+                "This transaction is above the owner's step-up threshold, and the owner's \
+                 approval could not be requested ({why}). Nothing was signed or submitted. Run \
+                 the action again with a new idempotencyKey once the Rill API answers."
+            ),
+        )
+    };
+    let approval: rill_core::step_up::StepUpApproval =
+        match serde_json::from_value(paused["approval"].clone()) {
+            Ok(approval) => approval,
+            Err(e) => return unavailable(format!("the approval did not form: {e}")),
+        };
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let agent_signature =
+        match keystore.sign_personal_message(approval.request_message().as_bytes()) {
+            Ok(signature) => signature.to_base64(),
+            Err(e) => return unavailable(format!("the request could not be signed: {e}")),
+        };
+    let body = json!({
+        "approval": approval,
+        "unsignedPtb": envelope["unsignedPtb"],
+        "agentSignature": agent_signature,
+    });
+    let url = format!("{api}/api/step-up");
+    let opened = match block_on(crate::http::post_json(&url, &body)) {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) | Err(e) => return unavailable(e),
+    };
+    let data = opened.get("data").unwrap_or(&opened);
+    let (Some(approval_id), Some(approval_url)) =
+        (data["id"].as_str(), data["approvalUrl"].as_str())
+    else {
+        return unavailable(format!(
+            "the API answered without an id and a link: {opened}"
+        ));
+    };
+    // The id comes back as an argument on the agent's next call and names a path on the API, so
+    // it is held to the alphabet every caller-chosen id here is.
+    if let Err(why) = crate::workflow::validate_id("approvalId", approval_id) {
+        return unavailable(why);
+    }
+    let approval_origin = match crate::step_up::approval_link_origin(approval_url, approval_id) {
+        Ok(origin) => origin,
+        Err(why) => return unavailable(why),
+    };
+    context.pending_step_up.insert(
+        approval_id.to_owned(),
+        crate::step_up::PendingStepUp {
+            envelope,
+            approval,
+            run_set,
+        },
+    );
+    let mut answer = paused.clone();
+    answer["approvalId"] = json!(approval_id);
+    answer["approvalUrl"] = json!(approval_url);
+    // Named on its own so the owner can see which site they are about to connect a wallet to.
+    answer["approvalOrigin"] = json!(approval_origin);
+    tool_ok(id, answer)
+}
+
+/// `rill_run_action` with an `approvalId`: run the transaction the owner approved, and only it.
+///
+/// Every check is made again here rather than remembered from the paused call: the approval is
+/// still live, the owner has signed it, the grant it names is still the latest usable one, and the
+/// signature is the current owner's over this signer's own text. Then the held envelope runs
+/// through every check `execute` makes, with the approved digest pinned, so different bytes or a
+/// lapsed envelope are refused there.
+fn continue_step_up(
+    context: &mut WalletContext,
+    id: Value,
+    params: &Value,
+    action_id: &str,
+    approval_id: &str,
+    api: &str,
+    owner: Option<&str>,
+) -> Value {
+    let refuse = |context: &mut WalletContext, code: &str, reason: String| {
+        context.last_rejection = Some(reason.clone());
+        tool_error(id.clone(), code, &reason)
+    };
+    let Some(pending) = context.pending_step_up.get(approval_id).cloned() else {
+        return refuse(
+            context,
+            "unknown_approval",
+            format!(
+                "This signer holds no transaction under approvalId {approval_id}: it was never \
+                 opened here, or this signer restarted since. Nothing was submitted. Run the \
+                 action again with a new idempotencyKey; the owner is asked again."
+            ),
+        );
+    };
+    if pending.approval.action_id != action_id {
+        return refuse(
+            context,
+            "unknown_approval",
+            format!(
+                "approvalId {approval_id} is for {}, not {action_id}. Nothing was submitted.",
+                pending.approval.action_id
+            ),
+        );
+    }
+    let arguments = params.get("arguments");
+    if ["params", "revision", "walletId"].iter().any(|key| {
+        arguments
+            .and_then(|a| a.get(*key))
+            .is_some_and(|v| !v.is_null())
+    }) {
+        return refuse(
+            context,
+            "invalid_arguments",
+            "With approvalId, pass only actionId, approvalId and a new idempotencyKey: the owner \
+             approved one exact transaction, and nothing about it can change now."
+                .to_string(),
+        );
+    }
+    if pending.approval.is_expired(now_ms()) {
+        context.pending_step_up.remove(approval_id);
+        return refuse(
+            context,
+            "step_up_expired",
+            "The owner did not approve this transaction within the 5 minutes it was valid for, \
+             so it can no longer be submitted. Nothing was submitted. Run the action again with a \
+             new idempotencyKey to ask the owner again."
+                .to_string(),
+        );
+    }
+
+    let url = format!("{api}/api/step-up/{approval_id}");
+    let shown = match block_on(crate::http::get_json(&url)) {
+        Ok(Ok(shown)) => shown,
+        Ok(Err(e)) | Err(e) => {
+            return refuse(
+                context,
+                "step_up_unavailable",
+                format!(
+                    "Whether the owner approved could not be read ({e}). Nothing was submitted; \
+                     call again with the same approvalId and a new idempotencyKey."
+                ),
+            )
+        }
+    };
+    let shown = shown.get("data").unwrap_or(&shown);
+    let Some(owner_signature) = shown["ownerSignature"].as_str().map(str::to_owned) else {
+        let seconds_left = pending
+            .approval
+            .expires_at_ms
+            .parse::<u64>()
+            .unwrap_or(0)
+            .saturating_sub(now_ms())
+            / 1000;
+        let mut waiting = json!({
+            "code": "step_up_pending",
+            "status": "pending_owner_approval",
+            "submitted": false,
+            "approvalId": approval_id,
+            "secondsLeft": seconds_left,
+            "spendBaseUnits": pending.approval.spend_base_units,
+            "expiresAtMs": pending.approval.expires_at_ms,
+            "note": "The owner has not approved this transaction yet; nothing was signed or \
+                     submitted. Once they approve it in Studio, call again with this approvalId \
+                     and a new idempotencyKey.",
+        });
+        // Held to the same shape as when the request was opened; a link that fails it is dropped.
+        if let Some(url) = shown["approvalUrl"].as_str() {
+            if let Ok(origin) = crate::step_up::approval_link_origin(url, approval_id) {
+                waiting["approvalUrl"] = json!(url);
+                waiting["approvalOrigin"] = json!(origin);
+            }
+        }
+        return tool_ok(id, waiting);
+    };
+
+    // The grant the approval names must still be the one the owner would run now.
+    let Some(signer) = context.keystore.as_ref().map(|k| k.address().to_string()) else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
+    let checked = match checked_grants(context, &signer, api) {
+        Ok(checked) => checked,
+        Err(e) => return tool_error(id, "grants_unavailable", &e),
+    };
+    let wallet = pending
+        .approval
+        .wallet_id
+        .parse::<sui_sdk_types::Address>()
+        .ok();
+    let current = checked
+        .iter()
+        .filter_map(|(_, verdict)| verdict.as_ref().ok())
+        .filter(|verified| {
+            verified.grant.action_id == action_id
+                && verified
+                    .grant
+                    .wallet_id
+                    .parse::<sui_sdk_types::Address>()
+                    .ok()
+                    == wallet
+        })
+        .max_by_key(|verified| verified.grant.revision)
+        .cloned();
+    let current_digest = current.as_ref().map(|verified| verified.grant.digest());
+    let endpoint = endpoint(context);
+    let verdict = block_on(async {
+        let chain = rill_chain::grpc::GrpcSui::new(&endpoint)
+            .map_err(|e| crate::step_up::ApprovalRefusal::Unavailable(e.to_string()))?;
+        crate::step_up::verify_owner_approval(
+            &chain,
+            &pending.approval,
+            &owner_signature,
+            current_digest.as_deref(),
+        )
+        .await
+    });
+    let approved_by = match verdict {
+        Ok(Ok(approved_by)) => approved_by,
+        Ok(Err(refusal)) => return refuse(context, refusal.code(), refusal.to_string()),
+        Err(e) => return refuse(context, "step_up_unavailable", e),
+    };
+    let Some(verified) = current else {
+        return refuse(
+            context,
+            "grant_changed",
+            crate::step_up::ApprovalRefusal::GrantChanged.to_string(),
+        );
+    };
+    let same = |a: &str, b: &str| {
+        a.parse::<sui_sdk_types::Address>().ok() == b.parse::<sui_sdk_types::Address>().ok()
+    };
+    if owner.is_some_and(|owner| !same(owner, &approved_by)) {
+        return tool_error(
+            id,
+            "owner_changed",
+            "The vault owner changed since workflow preflight; no transaction submitted for this step.",
+        );
+    }
+
+    let saved = context.run_set.replace(pending.run_set.clone());
+    let response = execute(
+        context,
+        id,
+        &json!({ "arguments": { "envelope": pending.envelope } }),
+        EnvelopeSource::Grant,
+        StepUp::Approved {
+            pinned_digest: pending.approval.pinned_digest.clone(),
+        },
+    );
+    context.run_set = saved;
+    if response["result"]["structuredContent"]["submitted"] == true {
+        context.pending_step_up.remove(approval_id);
+    }
+    let mut response = with_grant(response, &verified);
+    if let Some(structured) = response
+        .get_mut("result")
+        .and_then(|r| r.get_mut("structuredContent"))
+        .and_then(Value::as_object_mut)
+    {
+        structured.insert("approvalId".into(), json!(approval_id));
     }
     response
 }
@@ -2198,11 +2533,34 @@ enum EnvelopeSource {
     Grant,
 }
 
+/// What an owner's step-up threshold asks of one execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepUp {
+    /// The run set names no threshold.
+    None,
+    /// Above `threshold` base units, pause for the owner instead of signing.
+    Gate {
+        threshold: u64,
+        grant: crate::step_up::StepUpGrant,
+    },
+    /// The owner approved exactly the bytes with this pinned digest, and the signer checked it.
+    Approved { pinned_digest: String },
+}
+
+/// Said beside every step-up pause, so the agent knows what the owner has to do and what it may
+/// not do meanwhile.
+const STEP_UP_NOTE: &str = "Above the owner's step-up threshold: nothing was signed or submitted. \
+    Give the owner approvalUrl; they approve this exact transaction in Rill Studio with their own \
+    wallet, within the 5 minutes the transaction is valid for. Then call rill_run_action again with \
+    the same actionId, this approvalId and a NEW idempotencyKey: this key's outcome is this pause, \
+    and replaying it returns the pause again. Do not rebuild or try another tool meanwhile.";
+
 fn execute(
     context: &mut WalletContext,
     id: Value,
     params: &Value,
     source: EnvelopeSource,
+    step_up: StepUp,
 ) -> Value {
     let Some(run_set) = context.run_set.as_ref() else {
         // Names what is missing and where it goes. "No run-set is loaded" alone tells an agent it
@@ -2228,6 +2586,23 @@ fn execute(
         context.last_rejection = Some(reason.to_string());
         return tool_error(id, "mainnet_not_opted_in", reason);
     }
+    // A threshold belongs to an owner-signed grant, whose run is the only one that can pause for
+    // the owner. Without the gate this path would sign above it, so it refuses before reading
+    // anything: a run set file carries no owner's signature and no route to their approval.
+    let threshold = match run_set.step_up_threshold() {
+        Ok(threshold) => threshold,
+        Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
+    };
+    if threshold.is_some() && step_up == StepUp::None {
+        let reason = "This run set has an owner's step-up threshold, which only an owner-signed \
+                      grant can carry: above it the owner approves each transaction in Studio, \
+                      and a run set file has no route to that approval. Run the granted action \
+                      with rill_run_action instead. Nothing was signed."
+            .to_string();
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, "step_up_requires_grant", &reason);
+    }
+    let coin_type = run_set.capability_manifest.wallet_coin_type.clone();
 
     let Some(envelope_value) = params.get("arguments").and_then(|a| a.get("envelope")) else {
         return tool_error(id, "invalid_arguments", "envelope is required.");
@@ -2308,6 +2683,82 @@ fn execute(
             &reason,
             json!({ "pinnedDigest": digest, "priorDigest": prior.digest }),
         );
+    }
+
+    // The owner's step-up gate. After the bytes are pinned, so the amount compared is the one the
+    // signature would cover, and before the key or a node is touched, so a pause signs nothing.
+    match &step_up {
+        StepUp::None => {}
+        StepUp::Approved { pinned_digest } => {
+            if *pinned_digest != digest {
+                let reason = format!(
+                    "The owner approved the transaction pinned as {pinned_digest}, and these bytes \
+                     pin as {digest}. An approval is for exactly the bytes it names. Nothing was \
+                     signed."
+                );
+                context.last_rejection = Some(reason.clone());
+                return tool_error(id, "step_up_digest_mismatch", &reason);
+            }
+        }
+        StepUp::Gate { threshold, grant } => {
+            // The declared spend is the builder's word about the bytes; the bytes are the bytes.
+            // The larger is compared, so a builder that understates the spend still meets the
+            // gate.
+            let Some(requested) = pinned.decoded().requested_spend_base_units else {
+                let reason = "This transaction's spend amount is not a literal in its bytes, so \
+                              the owner could not be shown what they would approve. Refusing \
+                              rather than asking for an approval nobody can check. Nothing was \
+                              signed."
+                    .to_string();
+                context.last_rejection = Some(reason.clone());
+                return tool_error(id, "step_up_amount_unreadable", &reason);
+            };
+            let spend = pinned.spend_base_units().max(requested);
+            if spend > *threshold {
+                let envelope = pinned.envelope();
+                let (Some(expires_at_ms), Ok(transaction_digest)) = (
+                    rill_policy::parse_rfc3339_ms(&envelope.expires_at),
+                    rill_policy::decode::transaction_digest(&envelope.unsigned_ptb),
+                ) else {
+                    return tool_error(
+                        id,
+                        "policy_rejection",
+                        "The pinned envelope could not be described for the owner's approval.",
+                    );
+                };
+                let approval = rill_core::step_up::StepUpApproval {
+                    network: context.network.clone(),
+                    agent: policy.sender.clone(),
+                    wallet_id: policy.wallet_id.clone(),
+                    wallet_package_id: policy.wallet_package_id.clone(),
+                    action_id: policy.action_id.clone(),
+                    action_name: grant.action_name.clone(),
+                    grant_revision: grant.revision,
+                    grant_digest: grant.digest.clone(),
+                    pinned_digest: digest.clone(),
+                    transaction_digest: transaction_digest.clone(),
+                    spend_base_units: spend.to_string(),
+                    threshold_base_units: threshold.to_string(),
+                    coin_type,
+                    expires_at_ms: expires_at_ms.to_string(),
+                };
+                return tool_ok(
+                    id,
+                    json!({
+                        "code": "step_up_required",
+                        "status": "pending_owner_approval",
+                        "submitted": false,
+                        "pinnedDigest": digest,
+                        "transactionDigest": transaction_digest,
+                        "spendBaseUnits": spend.to_string(),
+                        "thresholdBaseUnits": threshold.to_string(),
+                        "expiresAtMs": expires_at_ms.to_string(),
+                        "approval": approval,
+                        "note": STEP_UP_NOTE,
+                    }),
+                );
+            }
+        }
     }
 
     // The client is built inside the runtime, and everything that uses it stays inside the same
@@ -2957,6 +3408,311 @@ mod execution_tests {
             .as_str()
             .unwrap()
             .contains("skill_other"));
+    }
+
+    // ── the owner's step-up gate ──────────────────────────────────────────────────────────────
+
+    /// Nothing listens here, so a call that reaches the network fails on this machine.
+    const CLOSED: &str = "http://127.0.0.1:1";
+
+    /// A transaction that requests `amount` from the wallet the way every builder does:
+    /// `request_spend(wallet, cap, version, amount, clock)`. The wallet stands in for the other
+    /// objects so the run set's object scope stays the one object it already allows.
+    fn ptb_requesting(amount: u64) -> String {
+        use sui_sdk_types::{Address, Digest, Identifier};
+        use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
+
+        let mut tx = TransactionBuilder::new();
+        tx.set_sender(WALLET.parse::<Address>().unwrap());
+        tx.set_gas_budget(50_000_000);
+        tx.set_gas_price(1_000);
+        tx.add_gas_objects([ObjectInput::owned(
+            "0x000000000000000000000000000000000000000000000000000000000000000a"
+                .parse()
+                .unwrap(),
+            1,
+            Digest::ZERO,
+        )]);
+        let wallet = tx.object(ObjectInput::shared(WALLET.parse().unwrap(), 400_001, true));
+        let amount = tx.pure(&amount);
+        tx.move_call(
+            Function::new(
+                PKG.parse().unwrap(),
+                Identifier::new("agent_wallet").unwrap(),
+                Identifier::new("request_spend").unwrap(),
+            ),
+            vec![wallet, wallet, wallet, amount, wallet],
+        );
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&tx.try_build().unwrap()).unwrap())
+    }
+
+    /// An envelope carrying `ptb` and declaring `declared` as its spend.
+    fn envelope_for(ptb: &str, declared: &str) -> Value {
+        let mut env = envelope(json!({
+            "unsignedPtb": ptb,
+            "actionDigest": rill_core::envelope::digest_unsigned_ptb(ptb),
+        }));
+        env["resolvedParams"]["spendAmountMist"] = json!(declared);
+        env
+    }
+
+    fn stepped_context(threshold: &str) -> WalletContext {
+        let mut value = serde_json::to_value(run_set()).unwrap();
+        value["stepUpAboveBaseUnits"] = json!(threshold);
+        let mut ctx = context_with_run_set()
+            .with_run_set(Some(RunSet::from_value(&value).expect("a stepped run set")));
+        ctx.rpc_url = Some(CLOSED.into());
+        ctx.api_url = Some(CLOSED.into());
+        ctx
+    }
+
+    fn granted() -> crate::step_up::StepUpGrant {
+        crate::step_up::StepUpGrant {
+            action_name: "hero".into(),
+            revision: 4,
+            digest: "aa".repeat(32),
+        }
+    }
+
+    fn run(ctx: &mut WalletContext, envelope: Value, step_up: StepUp) -> Value {
+        execute(
+            ctx,
+            json!(1),
+            &json!({ "arguments": { "envelope": envelope } }),
+            EnvelopeSource::Grant,
+            step_up,
+        )
+    }
+
+    fn gate(threshold: u64) -> StepUp {
+        StepUp::Gate {
+            threshold,
+            grant: granted(),
+        }
+    }
+
+    #[test]
+    fn the_gate_returns_pending_above_threshold_and_never_signs() {
+        let mut ctx = stepped_context("10");
+        let ptb = ptb_requesting(20);
+        let out = run(&mut ctx, envelope_for(&ptb, "20"), gate(10));
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["status"], "pending_owner_approval", "{out}");
+        assert_eq!(structured["submitted"], false);
+        assert_eq!(
+            structured["pinnedDigest"],
+            json!(rill_core::envelope::digest_unsigned_ptb(&ptb))
+        );
+        assert_eq!(structured["spendBaseUnits"], "20");
+        assert_eq!(structured["thresholdBaseUnits"], "10");
+        let approval: rill_core::step_up::StepUpApproval =
+            serde_json::from_value(structured["approval"].clone()).expect("an approval");
+        assert_eq!(approval.grant_revision, 4);
+        assert_eq!(approval.grant_digest, "aa".repeat(32));
+        assert_eq!(
+            approval.transaction_digest,
+            rill_policy::decode::transaction_digest(&ptb).unwrap()
+        );
+        assert!(ctx.submitted.is_empty(), "nothing was signed or submitted");
+
+        // At the threshold the gate stays out of the way: the call goes on to re-simulate, which
+        // fails here only because the node is a closed port.
+        let mut ctx = stepped_context("10");
+        let out = run(&mut ctx, envelope_for(&ptb_requesting(10), "10"), gate(10));
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "chain_unavailable",
+            "{out}"
+        );
+    }
+
+    /// The declared spend is the server's word. The bytes say 20, so 20 is what the owner's
+    /// threshold is compared with, whatever the envelope claims.
+    #[test]
+    fn a_server_that_understates_declared_spend_still_meets_the_gate() {
+        let mut ctx = stepped_context("10");
+        let out = run(&mut ctx, envelope_for(&ptb_requesting(20), "5"), gate(10));
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["spendBaseUnits"], "20", "{out}");
+        assert!(ctx.submitted.is_empty());
+    }
+
+    /// Bytes whose amount cannot be read cannot be shown to the owner, so nobody could approve
+    /// them; that is refused by name rather than sent to a page that would refuse it again.
+    #[test]
+    fn a_spend_the_bytes_do_not_state_is_refused_rather_than_sent_for_approval() {
+        let mut ctx = stepped_context("10");
+        let out = run(&mut ctx, envelope(json!({})), gate(10));
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_amount_unreadable",
+            "{out}"
+        );
+        assert!(ctx.submitted.is_empty());
+    }
+
+    #[test]
+    fn an_approved_digest_cannot_be_used_for_different_bytes() {
+        let mut ctx = stepped_context("10");
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting(20), "20"),
+            StepUp::Approved {
+                pinned_digest: "00".repeat(32),
+            },
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_digest_mismatch",
+            "{out}"
+        );
+        assert!(ctx.submitted.is_empty());
+
+        // The digest the owner approved goes on to simulate and nothing else changes.
+        let ptb = ptb_requesting(20);
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb, "20"),
+            StepUp::Approved {
+                pinned_digest: rill_core::envelope::digest_unsigned_ptb(&ptb),
+            },
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "chain_unavailable",
+            "{out}"
+        );
+    }
+
+    /// A run set with a threshold never signs without its gate, whichever path brought it here.
+    #[test]
+    fn a_threshold_without_its_gate_is_refused() {
+        let mut ctx = stepped_context("10");
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting(1), "1"),
+            StepUp::None,
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_requires_grant",
+            "{out}"
+        );
+    }
+
+    /// The pause is a stopped outcome under its key: replaying that key answers the same pause
+    /// and runs nothing, and continuing after the owner approves is a new call with a new key.
+    #[test]
+    fn a_pending_approval_is_stored_under_its_key_and_replayed_not_rerun() {
+        let dir = std::env::temp_dir().join(format!(
+            "rill-step-up-receipts-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let request = json!({"tool": "rill_run_action", "arguments": {"actionId": "skill_hero"}});
+        let mut ctx = stepped_context("10");
+        let first = crate::workflow::once(&dir, "stepped-1", &request, || {
+            run(&mut ctx, envelope_for(&ptb_requesting(20), "20"), gate(10))["result"].clone()
+        })
+        .unwrap();
+        assert_eq!(first["status"], "stopped", "{first}");
+        assert_eq!(
+            first["result"]["structuredContent"]["code"],
+            "step_up_required"
+        );
+
+        let replay = crate::workflow::once(&dir, "stepped-1", &request, || {
+            panic!("a replayed key must not run again")
+        })
+        .unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            replay["result"]["structuredContent"]["code"],
+            "step_up_required"
+        );
+
+        let follow_up = json!({"tool": "rill_run_action",
+            "arguments": {"actionId": "skill_hero", "approvalId": "abc"}});
+        assert!(matches!(
+            crate::workflow::once(&dir, "stepped-1", &follow_up, || panic!("not run")),
+            Err(crate::workflow::ReceiptError::Conflict { .. })
+        ));
+    }
+
+    fn keyed_call(ctx: &mut WalletContext, arguments: Value) -> Value {
+        let mut arguments = arguments;
+        arguments["idempotencyKey"] = json!(format!("step-up-{}", rand::random::<u64>()));
+        handle(
+            ctx,
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "rill_run_action", "arguments": arguments }
+            }),
+        )
+        .unwrap()["result"]["structuredContent"]
+            .clone()
+    }
+
+    fn pending(expires_at_ms: u64) -> crate::step_up::PendingStepUp {
+        let ptb = ptb_requesting(20);
+        let mut approval: rill_core::step_up::StepUpApproval = serde_json::from_value(
+            run(
+                &mut stepped_context("10"),
+                envelope_for(&ptb, "20"),
+                gate(10),
+            )["result"]["structuredContent"]["approval"]
+                .clone(),
+        )
+        .unwrap();
+        approval.expires_at_ms = expires_at_ms.to_string();
+        crate::step_up::PendingStepUp {
+            envelope: envelope_for(&ptb, "20"),
+            approval,
+            run_set: stepped_context("10").run_set.unwrap(),
+        }
+    }
+
+    /// Every refusal on the continuing call is answered before the network is asked anything.
+    #[test]
+    fn a_continuing_call_names_an_unknown_or_expired_approval() {
+        let mut ctx = stepped_context("10").with_state_dir(Some(
+            std::env::temp_dir().join(format!("rill-step-up-continue-{}", std::process::id())),
+        ));
+        let out = keyed_call(
+            &mut ctx,
+            json!({"actionId": "skill_hero", "approvalId": "nope"}),
+        );
+        assert_eq!(out["code"], "unknown_approval", "{out}");
+
+        ctx.pending_step_up
+            .insert("old".into(), pending(now_ms().saturating_sub(1)));
+        let out = keyed_call(
+            &mut ctx,
+            json!({"actionId": "skill_hero", "approvalId": "old"}),
+        );
+        assert_eq!(out["code"], "step_up_expired", "{out}");
+        assert!(
+            out["message"].as_str().unwrap().contains("5 minutes"),
+            "{out}"
+        );
+        assert!(
+            !ctx.pending_step_up.contains_key("old"),
+            "an expired approval is forgotten"
+        );
+
+        ctx.pending_step_up
+            .insert("live".into(), pending(now_ms() + 60_000));
+        let out = keyed_call(
+            &mut ctx,
+            json!({"actionId": "skill_other", "approvalId": "live"}),
+        );
+        assert_eq!(out["code"], "unknown_approval", "{out}");
+        let out = keyed_call(
+            &mut ctx,
+            json!({"actionId": "skill_hero", "approvalId": "live", "params": {"swap": {"amount_in": "1"}}}),
+        );
+        assert_eq!(out["code"], "invalid_arguments", "{out}");
+        assert!(ctx.submitted.is_empty());
     }
 
     #[test]

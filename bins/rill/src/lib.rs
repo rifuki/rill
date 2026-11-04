@@ -35,6 +35,7 @@ pub mod runset;
 pub mod spend_cmd;
 pub mod stake_cmd;
 pub mod stdio;
+pub mod step_up;
 pub mod swap_cmd;
 pub mod verdict;
 pub mod wallet;

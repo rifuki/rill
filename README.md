@@ -110,6 +110,17 @@ wallet's owner signed it and the wallet still names this agent; a grant altered 
 signing is refused. An owner without a browser grants from the terminal with
 `rill-wallet --as <owner> grant --action <id> --wallet <id> --budget <mist> --per-tx <mist> --submit`.
 
+An owner can also set a step-up threshold on a grant: `--step-up-above <mist>` on that command, or
+"Ask me above" in Studio. Below it a granted action runs without asking anyone. Above it the signer
+pins the transaction, signs nothing, and answers `step_up_required` with a Studio link; the owner
+approves those exact bytes there with their own wallet, within the five minutes the transaction is
+valid for, and the signer submits only after checking that signature against the wallet's current
+owner itself. The pause binds `rill_run_action` and `rill_run_workflow`, and the signer's own builds
+are already refused on a granted wallet. It is a signer check, not a chain rule: whoever can read
+the agent's key can sign without it, bounded only by the wallet's on-chain rules. A chain-enforced
+version is planned and needs a package upgrade; see
+`docs/plans/2026-11-04-owner-step-up-approval.md`.
+
 The wallet's owner creates, limits and funds the agent wallet from their own wallet. The agent's
 machine only ever holds the agent key, and the plugin starts the signer without the owner's two
 steps: `rill_create_wallet` and `rill_attach_rules` exist only under `rill-wallet mcp --owner`, run

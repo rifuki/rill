@@ -692,6 +692,32 @@ fn an_execute_without_a_run_set_is_refused_before_signing_and_names_what_is_miss
     );
 }
 
+/// A step-up threshold is the owner's, signed into a grant. A run set file carries no owner's
+/// signature and no route to their approval, so one that names a threshold is refused before the
+/// envelope is read, and the refusal is offline because it comes before any chain call.
+#[test]
+fn an_execute_with_a_file_run_set_that_requires_step_up_is_refused_before_signing() {
+    let mut run_set = run_set_value();
+    run_set["stepUpAboveBaseUnits"] = json!("10");
+    let run_set = serde_json::from_value(run_set).expect("a run set with a threshold parses");
+    let mut context =
+        WalletContext::new(Some(key(13)), "testnet".into(), false).with_run_set(Some(run_set));
+    context.rpc_url = Some("http://127.0.0.1:1".into());
+
+    let response = call(
+        &mut context,
+        "rill_execute",
+        json!({ "envelope": envelope() }),
+    );
+    let out = structured(&response);
+    assert_eq!(out["code"], json!("step_up_requires_grant"), "{out}");
+    assert!(
+        out["message"].as_str().unwrap().contains("rill_run_action"),
+        "{out}"
+    );
+    assert!(context.submitted.is_empty(), "nothing was handed to a node");
+}
+
 /// Re-issuing an execute call does not start a second operation.
 ///
 /// The signer remembers every envelope it handed to the chain, by the digest pinned from the bytes
@@ -879,7 +905,12 @@ fn the_new_tools_keep_their_chain_client_inside_one_runtime() {
 // ── the envelope fixture ──────────────────────────────────────────────────────────────────────
 
 fn context_with_run_set() -> WalletContext {
-    let run_set = serde_json::from_value(json!({
+    let run_set = serde_json::from_value(run_set_value()).expect("the run-set parses");
+    WalletContext::new(Some(key(13)), "testnet".into(), false).with_run_set(Some(run_set))
+}
+
+fn run_set_value() -> Value {
+    json!({
         "label": "u4-flow",
         "network": "testnet",
         "sender": WALLET,
@@ -898,9 +929,7 @@ fn context_with_run_set() -> WalletContext {
         "declaredSpendBaseUnits": "2000000000",
         "minimumRemainingBaseUnits": "0",
         "gasCeilingBaseUnits": "50000000"
-    }))
-    .expect("the run-set parses");
-    WalletContext::new(Some(key(13)), "testnet".into(), false).with_run_set(Some(run_set))
+    })
 }
 
 /// A real transaction, built the way the server builds one. Three zero bytes would pass every check

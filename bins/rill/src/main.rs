@@ -549,7 +549,8 @@ fn main() {
             ) else {
                 eprintln!(
                     "rill: usage: rill --as <owner> grant --action <id> --wallet <id> --budget <mist> \
-                     --per-tx <mist> [--days <n>] [--api <url>] [--submit]"
+                     --per-tx <mist> [--step-up-above <mist>] [--days <n>] [--api <url>] \
+                     [--submit]"
                 );
                 std::process::exit(1);
             };
@@ -573,6 +574,7 @@ fn main() {
                 budget_mist,
                 per_tx_mist,
                 expires_at_ms,
+                step_up_above_mist: flag("--step-up-above"),
                 submit: argv.iter().any(|a| a == "--submit"),
             };
             let runtime = tokio::runtime::Builder::new_current_thread()
