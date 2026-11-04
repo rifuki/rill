@@ -112,7 +112,8 @@ pub const MAINNET_AGENT_WALLET_V2: &str =
 ///
 /// Filled by the coordinator from the upgrade receipt, never guessed. The release workflow runs
 /// `deployments::tests::mainnet_v3_ids_are_filled`, so a tag cannot ship with the placeholder.
-pub const MAINNET_AGENT_WALLET_V3: &str = UNPUBLISHED;
+pub const MAINNET_AGENT_WALLET_V3: &str =
+    "0x2039c2d59d9967854ebc1ac413ac49af634e9f7956c70f4b30165e5771d17d48";
 
 /// The `agent_wallet` package the signer calls on mainnet.
 ///
@@ -132,7 +133,8 @@ pub const MAINNET_CETUS_ADAPTER_V1: &str =
 /// The `cetus_adapter` `published-at` relinked against agent_wallet v3, filled from its upgrade
 /// receipt. The server reads its adapter from `RILL_CETUS_ADAPTER_PACKAGE_ID`, so that deployment
 /// setting has to move to this id in the same window.
-pub const MAINNET_CETUS_ADAPTER: &str = UNPUBLISHED;
+pub const MAINNET_CETUS_ADAPTER: &str =
+    "0x8a04636a5399ad4416e1254a0f3ac6745327501c1547fcbe1a991b4c48103e3f";
 
 /// The shared `Version` object [`MAINNET_AGENT_WALLET`] gates itself on.
 pub const MAINNET_AGENT_WALLET_VERSION: &str =
