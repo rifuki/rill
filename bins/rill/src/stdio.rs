@@ -1678,6 +1678,55 @@ fn bad_mist(id: Value, fields: &[(&str, &str)]) -> Option<Value> {
     })
 }
 
+/// Every gas reference this signer has consumed: this process's memory plus what earlier
+/// processes recorded under the state directory, so a restart keeps the stale-gas fence.
+fn gas_fence(context: &WalletContext) -> HashMap<sui_sdk_types::Address, u64> {
+    let mut fence = context.consumed_gas.clone();
+    if let (Some(state_dir), Some(keystore)) = (&context.state_dir, &context.keystore) {
+        for (object, version) in
+            crate::gas_fence::load(state_dir, &context.network, &keystore.address())
+        {
+            let held = fence.entry(object).or_insert(version);
+            *held = (*held).max(version);
+        }
+    }
+    fence
+}
+
+/// Remember the gas a landed submission consumed, in memory and on disk. Returns a warning when
+/// the disk copy could not be written; the in-memory fence still holds for this process.
+fn remember_consumed_gas(
+    context: &mut WalletContext,
+    objects: &[sui_sdk_types::ObjectReference],
+) -> Option<String> {
+    let mut failures = Vec::new();
+    for object in objects {
+        let held = context
+            .consumed_gas
+            .entry(*object.object_id())
+            .or_insert(object.version());
+        *held = (*held).max(object.version());
+        if let (Some(state_dir), Some(keystore)) = (&context.state_dir, &context.keystore) {
+            if let Err(e) = crate::gas_fence::record(
+                state_dir,
+                &context.network,
+                &keystore.address(),
+                object.object_id(),
+                object.version(),
+            ) {
+                failures.push(e);
+            }
+        }
+    }
+    (!failures.is_empty()).then(|| {
+        format!(
+            "the consumed gas could not be recorded on disk ({}); a restart before the builder \
+             catches up may build with a stale gas reference, which the chain refuses",
+            failures.join("; ")
+        )
+    })
+}
+
 /// The Rill API `RILL_API_URL` names. Read through [`WalletContext::api_url`], never directly.
 fn api_url_from_env() -> Option<String> {
     std::env::var(crate::config::API_URL_VAR)
@@ -2021,7 +2070,8 @@ fn run_action_for_owner(
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": { "name": "build_action", "arguments": arguments }
     });
-    let consumed_gas = &context.consumed_gas;
+    let consumed_gas = gas_fence(context);
+    let consumed_gas = &consumed_gas;
     let built = match block_on(async {
         for attempt in 0..40 {
             let value = crate::http::post_json(&url, &request).await?;
@@ -2870,10 +2920,9 @@ fn execute(
         return failure_response(context, id, "execution_failed", &failure);
     }
 
-    for object in gas_objects {
-        context
-            .consumed_gas
-            .insert(*object.object_id(), object.version());
+    if let Some(warning) = remember_consumed_gas(context, &gas_objects) {
+        // Stderr, never stdout: stdout is the protocol wire. The submission stands either way.
+        eprintln!("rill: {warning}");
     }
     context.submitted.insert(
         digest.clone(),
@@ -4612,6 +4661,33 @@ mod pre_flight_tests {
         let refused = granted_wallet_gate(&mut context, &json!(1), WALLET, Some(CLOSED))
             .expect("an unreachable API is a refusal");
         assert_eq!(code(&refused["result"]), "grants_unavailable", "{refused}");
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// A signer restarted right after its own submission must still refuse a build that pays
+    /// with the gas reference that submission consumed.
+    #[test]
+    fn a_restarted_signer_still_knows_the_gas_its_last_submission_consumed() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rill-stdio-gas-fence-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let coin: sui_sdk_types::Address = WALLET.parse().unwrap();
+        let mut first = context(recipients_allowlist()).with_state_dir(Some(state_dir.clone()));
+        let spent = sui_sdk_types::ObjectReference::new(coin, 41, sui_sdk_types::Digest::ZERO);
+        let warning = remember_consumed_gas(&mut first, std::slice::from_ref(&spent));
+        assert!(warning.is_none(), "{warning:?}");
+
+        let restarted = context(recipients_allowlist()).with_state_dir(Some(state_dir.clone()));
+        assert!(
+            restarted.consumed_gas.is_empty(),
+            "the restart starts with an empty memory"
+        );
+        let fence = gas_fence(&restarted);
+        assert!(crate::workflow::gas_is_stale(&[spent], &fence), "{fence:?}");
+        let newer = sui_sdk_types::ObjectReference::new(coin, 42, sui_sdk_types::Digest::ZERO);
+        assert!(!crate::workflow::gas_is_stale(&[newer], &fence));
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 }
