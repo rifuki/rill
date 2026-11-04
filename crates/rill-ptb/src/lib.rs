@@ -26,4 +26,5 @@ pub mod registry;
 pub mod rules;
 pub mod shared;
 pub mod spend;
+pub mod sponsor;
 pub mod transfer;

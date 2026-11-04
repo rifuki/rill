@@ -19,6 +19,16 @@
 //! approval: the run pauses above the grant's threshold, the owner signs the approval's own text
 //! from the keystore, and the approved transaction lands once.
 //!
+//! Where the deployment has the on-chain `step_up` rule (agent_wallet v3), the scenario attaches
+//! that rule instead of setting a threshold in the grant. It first shows that a spend above the
+//! threshold with the agent paying its own gas aborts on chain (a simulation, which spends
+//! nothing), then goes through the same pause with the owner signing the transaction itself as its
+//! gas sponsor, and the run lands once with both signatures. The rule is assumed present on mainnet
+//! once `MAINNET_AGENT_WALLET_V3` is filled, and on testnet when a rehearsal names its own package
+//! with `AGENT_WALLET_PACKAGE_ID` and `AGENT_WALLET_VERSION_ID`. `RILL_E2E_ONCHAIN_STEP_UP=1` or `0`
+//! overrides either guess. `scripts/e2e.sh` passes the two ids to the server, and this file passes
+//! them to the signer and to the owner's revoke, so a rehearsal needs no code edit.
+//!
 //! Whatever fails after step 2, the wallet is revoked on the way out, so a failed run leaves no
 //! funds behind. Mainnet costs real SUI (one 0.005 SUI swap plus gas) and needs
 //! `RILL_E2E_ALLOW_MAINNET=1` on top of the signer's own mainnet consent.
@@ -35,12 +45,17 @@ use rill_cli::http;
 use rill_cli::keystore::Keystore;
 use rill_cli::revoke_cmd::{self, RevokeArgs};
 use rill_core::envelope::Network;
+use rill_core::manifest::CapabilityManifest;
 use rill_core::step_up::StepUpApproval;
+use rill_ptb::policy_read::{attached_modules, parse_type_names, policy_rules_transaction};
+use rill_ptb::shared::SharedObjects;
+use rill_ptb::spend::{build_gated_spend_for_modules, WalletBinding};
 use serde_json::{json, Value};
 use sui_sdk_types::{
     Address, Digest, GasPayment, ObjectReference, Transaction, TransactionExpiration,
     TransactionKind,
 };
+use sui_transaction_builder::{ObjectInput, TransactionBuilder};
 
 /// Every scenario funds one run and a remainder too small for a second, so the second run is the
 /// wallet's own refusal rather than a limit the test chose to trip.
@@ -109,6 +124,31 @@ fn setup() -> Setup {
 
 fn step(name: &str) {
     eprintln!("\n== {name}");
+}
+
+/// The wallet package and its `Version` this run builds against: a rehearsal's own pair when the
+/// environment names one, else the network's published pair.
+fn deployment(network: Network) -> Result<(Address, Address), String> {
+    rill_ptb::deployments::wallet_deployment(
+        network,
+        var("AGENT_WALLET_PACKAGE_ID").as_deref(),
+        var("AGENT_WALLET_VERSION_ID").as_deref(),
+    )
+}
+
+/// Whether the deployment carries the on-chain `step_up` rule. See the module note.
+fn on_chain_step_up(network: Network) -> bool {
+    match var("RILL_E2E_ONCHAIN_STEP_UP").as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    match network {
+        Network::Mainnet => {
+            !rill_ptb::deployments::is_unpublished(rill_ptb::deployments::MAINNET_AGENT_WALLET_V3)
+        }
+        Network::Testnet => var("AGENT_WALLET_PACKAGE_ID").is_some(),
+    }
 }
 
 fn data(value: Value) -> Value {
@@ -285,6 +325,13 @@ impl Agent {
                 command.env_remove(key);
             }
         }
+        // A rehearsal's own package is the one deployment fact passed on, so the signer's local
+        // reads and builds target the package the server built the grant against.
+        for key in ["AGENT_WALLET_PACKAGE_ID", "AGENT_WALLET_VERSION_ID"] {
+            if let Some(value) = var(key) {
+                command.env(key, value);
+            }
+        }
         let mut child = command
             .env("RILL_CONFIG", &config)
             .stdin(Stdio::piped())
@@ -431,6 +478,8 @@ struct Plan {
     attach: Value,
     /// The grant's step-up threshold, in mist; a run spending more waits for the owner.
     step_up_above: Option<u64>,
+    /// The threshold is the on-chain `step_up` rule's, attached at setup, rather than the grant's.
+    step_up_on_chain: bool,
 }
 
 /// A BalanceManager this run provisioned, which the owner empties again before the run ends.
@@ -537,7 +586,7 @@ fn swap_runs() -> u64 {
 }
 
 async fn revoke(setup: &Setup, wallet: &str) -> Result<(), String> {
-    let (package, _) = rill_ptb::deployments::wallet_deployment(setup.network, None, None)?;
+    let (package, _) = deployment(setup.network)?;
     let chain = GrpcSui::new(&setup.rpc).map_err(|error| error.to_string())?;
     for attempt in 0..8 {
         if wallet_fields(&chain, wallet)
@@ -819,22 +868,33 @@ async fn plan(
             let min_out = quoted * 9 / 10;
             receipts["quote"] = json!({"usdc": quoted.to_string(), "minOut": min_out.to_string()});
             eprintln!("quoted {quoted} USDC base units, floor {min_out}");
+            let step_up_on_chain = kind == Kind::StepUp && on_chain_step_up(setup.network);
+            let mut manifest = json!({"walletCoinType":"0x2::sui::SUI","rules":[
+                {"kind":"budget","totalMist": (spend * runs + spend / 2).to_string()},
+                {"kind":"per_tx","maxMist": spend.to_string()},
+                {"kind":"slippage_floor","minOutMist": min_out.to_string(),"coinType": usdc},
+                {"kind":"asset_scope","allowedCoinTypes":["0x2::sui::SUI", usdc]}
+            ]});
+            if step_up_on_chain {
+                // Attached with the rest at setup, so the owner signs it with the funding.
+                manifest["rules"]
+                    .as_array_mut()
+                    .expect("rules")
+                    .push(json!({"kind":"step_up","thresholdMist": (spend / 2).to_string()}));
+            }
+            receipts["stepUpOnChain"] = json!(step_up_on_chain);
             Ok(Plan {
                 flow: json!({"nodes":[{"id":"swap","type":"cetus_swap","config":{
                     "amount_in": spend.to_string(), "pool": pool, "inputCoinType": "0x2::sui::SUI",
                     "min_amount_out": min_out.to_string()
                 }}],"edges":[]}),
-                manifest: json!({"walletCoinType":"0x2::sui::SUI","rules":[
-                    {"kind":"budget","totalMist": (spend * runs + spend / 2).to_string()},
-                    {"kind":"per_tx","maxMist": spend.to_string()},
-                    {"kind":"slippage_floor","minOutMist": min_out.to_string(),"coinType": usdc},
-                    {"kind":"asset_scope","allowedCoinTypes":["0x2::sui::SUI", usdc]}
-                ]}),
+                manifest,
                 budget: spend * runs + spend / 2,
                 per_tx: spend,
                 spend,
                 attach: json!({}),
                 step_up_above: (kind == Kind::StepUp).then_some(spend / 2),
+                step_up_on_chain,
             })
         }
         Kind::Stake => {
@@ -855,6 +915,7 @@ async fn plan(
                 spend: min,
                 attach: json!({}),
                 step_up_above: None,
+                step_up_on_chain: false,
             })
         }
         Kind::DeepBook => {
@@ -891,6 +952,7 @@ async fn plan(
                     "depositCapId": manager.deposit_cap, "price": price
                 }),
                 step_up_above: None,
+                step_up_on_chain: false,
             })
         }
     }
@@ -996,7 +1058,11 @@ async fn run(
             budget_mist: plan.budget.to_string(),
             per_tx_mist: plan.per_tx.to_string(),
             expires_at_ms: Some(expires.clone()),
-            step_up_above_mist: plan.step_up_above.map(|mist| mist.to_string()),
+            // Under the on-chain rule the chain's threshold decides, so the grant sets none.
+            step_up_above_mist: plan
+                .step_up_above
+                .filter(|_| !plan.step_up_on_chain)
+                .map(|mist| mist.to_string()),
             submit: true,
         },
     )
@@ -1204,6 +1270,28 @@ async fn step_up_run(
     if entry["usable"] != Value::Bool(true) {
         return Err(format!("the fresh grant is not usable: {entry}"));
     }
+    if entry["stepUpOnChain"] != Value::Bool(plan.step_up_on_chain) {
+        return Err(format!(
+            "rill_actions does not say whether the on-chain rule applies: {entry}"
+        ));
+    }
+
+    if plan.step_up_on_chain {
+        step("stepup: above the threshold, the agent paying its own gas aborts on chain");
+        let cap = receipts["wallet"]["agentCap"]
+            .as_str()
+            .ok_or("the receipts name no agent capability")?
+            .to_owned();
+        let refusal = agent_paid_spend(setup, chain, wallet, &cap, plan.spend).await?;
+        if refusal.module != "step_up" || refusal.code != 1 {
+            return Err(format!(
+                "the agent-paid spend was refused, but not by step_up's E_NEEDS_OWNER: {refusal}"
+            ));
+        }
+        receipts["stepUp"] = json!({ "agentPaidRefusal": refusal.to_string() });
+        eprintln!("refused on chain: {refusal}");
+        expect_wallet_unchanged(chain, wallet, &funded, "the agent-paid simulation").await?;
+    }
 
     step("stepup: a run above the threshold pauses for the owner");
     let paused_arguments =
@@ -1243,10 +1331,19 @@ async fn step_up_run(
             "the approval link is not the approve page on its origin: {paused}"
         ));
     }
+    if plan.step_up_on_chain
+        && (paused["sponsored"] != true || paused["gasOwner"].as_str() != Some(owner.as_str()))
+    {
+        return Err(format!(
+            "the pause under the on-chain rule does not name the owner as gas sponsor: {paused}"
+        ));
+    }
+    let agent_paid_refusal = receipts["stepUp"]["agentPaidRefusal"].clone();
     receipts["stepUp"] = json!({
         "approvalId": approval_id, "pinnedDigest": paused["pinnedDigest"],
         "transactionDigest": paused["transactionDigest"], "spendMist": spend_named.to_string(),
-        "thresholdMist": threshold.to_string(),
+        "thresholdMist": threshold.to_string(), "onChain": plan.step_up_on_chain,
+        "gasOwner": paused["gasOwner"], "agentPaidRefusal": agent_paid_refusal,
     });
     eprintln!("paused for approval {approval_id}");
 
@@ -1303,11 +1400,43 @@ async fn step_up_run(
             "the server's text is not the approval's own: {shown}"
         ));
     }
-    let signature = setup
-        .owner
-        .sign_personal_message(message.as_bytes())
-        .map_err(|e| e.to_string())?
-        .to_base64();
+    let signature = if plan.step_up_on_chain {
+        // As Studio does: the owner signs the transaction itself, as its gas sponsor, after reading
+        // from the bytes that the agent sends it and the owner pays for it.
+        let unsigned = shown["unsignedPtb"]
+            .as_str()
+            .ok_or_else(|| format!("the server shows no transaction: {shown}"))?;
+        let transaction: Transaction = bcs::from_bytes(
+            &STANDARD
+                .decode(unsigned)
+                .map_err(|e| format!("the transaction is not base64: {e}"))?,
+        )
+        .map_err(|e| format!("the bytes are not a transaction: {e}"))?;
+        if transaction.sender != setup.agent
+            || transaction.gas_payment.owner != setup.owner.address()
+        {
+            return Err(format!(
+                "the held transaction is not sent by the agent and paid by the owner: sender {}, gas owner {}",
+                transaction.sender, transaction.gas_payment.owner
+            ));
+        }
+        if approval.gas_owner.as_deref() != Some(owner.as_str()) {
+            return Err(format!(
+                "the approval does not name the owner as gas sponsor: {shown}"
+            ));
+        }
+        setup
+            .owner
+            .sign(&transaction)
+            .map_err(|e| e.to_string())?
+            .to_base64()
+    } else {
+        setup
+            .owner
+            .sign_personal_message(message.as_bytes())
+            .map_err(|e| e.to_string())?
+            .to_base64()
+    };
     let approved = data(
         http::post_json(
             &format!("{api}/api/step-up/{approval_id}/approve"),
@@ -1404,6 +1533,106 @@ async fn step_up_run(
     receipts["passed"] = json!(true);
     eprintln!("\nstepup: all steps passed");
     Ok(())
+}
+
+/// Simulate the spend `rill spend` would build for `amount` from `wallet`, sent and paid for by the
+/// agent, and return the rule that refused it. A simulation needs no key and spends nothing.
+async fn agent_paid_spend(
+    setup: &Setup,
+    chain: &GrpcSui,
+    wallet: &str,
+    cap: &str,
+    amount: u64,
+) -> Result<rill_chain::aborts::RuleRefusal, String> {
+    let (package, version) = deployment(setup.network)?;
+    let wallet_id: Address = wallet.parse().map_err(|_| "the wallet id")?;
+    let mut shared = SharedObjects::new();
+    for id in [wallet_id, version] {
+        let summary = chain
+            .get_object(&id.to_string())
+            .await
+            .map_err(|e| format!("reading {id}: {e}"))?;
+        shared.insert(
+            id,
+            summary
+                .shared_initial_version
+                .ok_or_else(|| format!("{id} is not shared"))?,
+        );
+    }
+    let gas_price = chain
+        .reference_gas_price()
+        .await
+        .map_err(|e| e.to_string())?;
+    let read = policy_rules_transaction(package, wallet_id, "0x2::sui::SUI", &shared, gas_price)
+        .map_err(|e| e.to_string())?;
+    let rules = chain
+        .simulate_read(&STANDARD.encode(bcs::to_bytes(&read).map_err(|e| e.to_string())?))
+        .await
+        .map_err(|e| format!("reading the wallet's rules: {e}"))?;
+    let names = rules
+        .command_returns
+        .iter()
+        .flatten()
+        .next()
+        .ok_or("the rule read returned nothing")
+        .and_then(|bytes| parse_type_names(bytes).map_err(|_| "the rule list did not decode"))?;
+    let modules = attached_modules(&names);
+    if !modules.contains(&"step_up") {
+        return Err(format!(
+            "the wallet does not carry the step_up rule: {names:?}"
+        ));
+    }
+    let cap = chain
+        .get_object(cap)
+        .await
+        .map_err(|e| format!("reading the agent capability: {e}"))?;
+    let coins = sui_gas_coins(chain, &setup.agent.to_string())
+        .await
+        .map_err(|e| format!("reading the agent's gas: {e}"))?;
+    let mut tx = TransactionBuilder::new();
+    tx.set_sender(setup.agent);
+    tx.set_gas_price(gas_price);
+    tx.set_gas_budget(affordable_budget(50_000_000, &coins));
+    tx.add_gas_objects(coins.iter().map(|coin| {
+        ObjectInput::owned(
+            coin.reference.id.parse().expect("an id from the chain"),
+            coin.reference.version,
+            coin.reference
+                .digest
+                .parse()
+                .expect("a digest from the chain"),
+        )
+    }));
+    let binding = WalletBinding {
+        package_id: package,
+        wallet_id,
+        cap: ObjectInput::owned(
+            cap.reference.id.parse().map_err(|_| "the cap id")?,
+            cap.reference.version,
+            cap.reference.digest.parse().map_err(|_| "the cap digest")?,
+        ),
+        version_id: version,
+        coin_type: "0x2::sui::SUI".into(),
+        manifest: CapabilityManifest {
+            wallet_coin_type: "0x2::sui::SUI".into(),
+            rules: Vec::new(),
+        },
+    };
+    let coin = build_gated_spend_for_modules(&mut tx, &binding, amount, &modules, &shared)
+        .map_err(|e| e.to_string())?;
+    let to = tx.pure(&setup.agent);
+    tx.transfer_objects(vec![coin], to);
+    let built = tx.try_build().map_err(|e| e.to_string())?;
+    let outcome = chain
+        .simulate(&STANDARD.encode(bcs::to_bytes(&built).map_err(|e| e.to_string())?))
+        .await
+        .map_err(|e| format!("the node did not simulate the agent-paid spend: {e}"))?;
+    if outcome.ok {
+        return Err("a spend above the threshold with the agent paying its gas would land".into());
+    }
+    let error = outcome.error.unwrap_or_default();
+    rill_chain::aborts::classify_rule_abort(&error)
+        .ok_or_else(|| format!("the agent-paid spend failed, but not on a rule: {error}"))
 }
 
 /// One signer, three separate owner-approved grants, one ordered MCP workflow.

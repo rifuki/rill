@@ -54,7 +54,11 @@ pub fn ensure_narrower(
             .ok_or_else(refusal)?;
         let narrower = match (required, rule) {
             (Budget { total_mist: p }, Budget { total_mist: a })
-            | (PerTx { max_mist: p }, PerTx { max_mist: a }) => amount(a)? <= amount(p)?,
+            | (PerTx { max_mist: p }, PerTx { max_mist: a })
+            // A lower threshold asks the owner to co-sign more transactions, never fewer.
+            | (StepUp { threshold_mist: p }, StepUp { threshold_mist: a }) => {
+                amount(a)? <= amount(p)?
+            }
             (
                 RateLimit {
                     window_ms: pw,
@@ -166,6 +170,12 @@ mod tests {
                 json!({"kind":"recipient_allowlist","addresses":["0x1","0x2"]}),
                 json!({"kind":"recipient_allowlist","addresses":["0x1"]}),
                 json!({"kind":"recipient_allowlist","addresses":["0x3"]}),
+            ),
+            // A lower step-up threshold asks the owner more often, which is the tighter one.
+            (
+                json!({"kind":"step_up","thresholdMist":"10"}),
+                json!({"kind":"step_up","thresholdMist":"9"}),
+                json!({"kind":"step_up","thresholdMist":"11"}),
             ),
             (
                 json!({"kind":"asset_scope","allowedCoinTypes":["0x2::sui::SUI","0x3::coin::USDC"]}),

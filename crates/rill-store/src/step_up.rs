@@ -152,6 +152,7 @@ mod tests {
             threshold_base_units: "10".into(),
             coin_type: "0x2::sui::SUI".into(),
             expires_at_ms: expires_at_ms.to_string(),
+            gas_owner: None,
         }
     }
 

@@ -6,6 +6,48 @@ use rill_core::envelope::{
 };
 use sui_sdk_types::ObjectReference;
 
+/// The wallet's owner, when this spend must be gas-sponsored by them under the on-chain step_up
+/// rule.
+///
+/// Decided only for a manifest that names the rule, so a wallet without it builds exactly as it did
+/// before the rule existed, with no extra read. The threshold compared is the chain's, never the
+/// manifest's copy: the owner can change it on chain at any time, and the chain is what aborts.
+async fn step_up_sponsor(
+    wallet: &AgentWalletInput,
+    root_spend_mist: u64,
+    chain: &impl SuiRead,
+) -> Result<Option<Address>, CompileError> {
+    if !wallet
+        .capability_manifest
+        .rules
+        .iter()
+        .any(|rule| matches!(rule, rill_core::manifest::CapabilityRule::StepUp { .. }))
+    {
+        return Ok(None);
+    }
+    let wallet_id = address(&wallet.wallet_id)?.to_string();
+    let Some(threshold) = rill_ptb::policy_read::read_step_up_threshold(chain, &wallet_id)
+        .await
+        .map_err(error)?
+    else {
+        return Err(error(
+            "the grant names the on-chain step_up rule, and this wallet does not carry it, so its \
+             prove call would abort; the owner attaches the rule or grants the action again",
+        ));
+    };
+    if root_spend_mist <= threshold {
+        return Ok(None);
+    }
+    let summary = chain.get_object(&wallet_id).await.map_err(error)?;
+    let owner = summary
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("owner"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("the wallet names no owner to sponsor the gas"))?;
+    Ok(Some(address(owner)?))
+}
+
 /// Compile the stored graph, resolve real gas, and return an envelope only after strict simulation.
 pub async fn build_action(
     flow: &FlowGraph,
@@ -32,10 +74,15 @@ pub async fn build_action(
     let input_ids = rill_policy::decode::decode(&preview_bytes)
         .map_err(error)?
         .object_inputs;
+    // Above the wallet's on-chain step_up threshold the chain aborts unless the owner sponsors the
+    // gas, so the owner's coins pay and the owner co-signs. At or under it, nothing changes.
+    let sponsor = step_up_sponsor(wallet, compiled.root_spend_mist, chain).await?;
+    let payer = sponsor.unwrap_or(sender);
+    let payer_name = if sponsor.is_some() { "owner" } else { "sender" };
     let expected = coin_type("0x2::coin::Coin<0x2::sui::SUI>")?;
     let mut gas_total = 0u128;
     for candidate in chain
-        .list_owned_objects(&sender.to_string())
+        .list_owned_objects(&payer.to_string())
         .await
         .map_err(error)?
     {
@@ -91,9 +138,13 @@ pub async fn build_action(
     }
     if gas_total < u128::from(transaction.gas_payment.budget) {
         return Err(error(format!(
-            "insufficient sender gas: have {gas_total}, need {}",
+            "insufficient {payer_name} gas: have {gas_total}, need {}",
             transaction.gas_payment.budget
         )));
+    }
+    if let Some(owner) = sponsor {
+        let coins = std::mem::take(&mut transaction.gas_payment.objects);
+        rill_ptb::sponsor::sponsor_gas(&mut transaction, owner, coins).map_err(error)?;
     }
     let unsigned_ptb = STANDARD.encode(bcs::to_bytes(&transaction).map_err(error)?);
     let simulation = chain

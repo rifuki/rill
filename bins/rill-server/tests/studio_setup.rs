@@ -2,7 +2,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rill_chain::{fake::FakeSui, ObjectRef, ObjectSummary};
 use rill_core::envelope::Network;
 use rill_ptb::deployments;
-use rill_server::studio_setup::{attach_plan, prepare_plan, recovery_plan, SetupContext};
+use rill_server::studio_setup::{
+    attach_plan, grant_plan, prepare_plan, recovery_plan, SetupContext,
+};
 use rill_store::PublishedSkill;
 use serde_json::{json, Value};
 use sui_sdk_types::{Address, Command, TransactionKind};
@@ -500,6 +502,90 @@ async fn attach_rejects_rotated_cap_revoked_expired_or_already_configured_wallet
             .unwrap_err();
         assert!(error.contains(reason), "{error}");
     }
+}
+
+/// A funded wallet already carrying rules, as a grant finds it, with the step_up rule's config on
+/// its policy when `threshold` is set.
+fn granted_wallet_chain(threshold: Option<u64>) -> FakeSui {
+    let policy = addr("0xe1");
+    let mut chain = object(
+        chain("5000000000", "0x1", "0x2"),
+        "0x10",
+        &format!(
+            "{}::agent_wallet::AgentWallet<0x2::sui::SUI>",
+            deployments::TESTNET_AGENT_WALLET
+        ),
+        json!({"owner":"0x1","agent":"0x2","cap_id":"0x11","budget":"5000000000","spent":"0",
+            "expires_at_ms":"1000000","revoked":false,
+            "policy":{"id":policy,"rules":{"contents":["budget","per_tx"]}}}),
+        None,
+    );
+    if let Some(threshold) = threshold {
+        chain = chain.with_dynamic_field(
+            &policy,
+            rill_chain::DynamicFieldSummary {
+                field_id: addr("0xf0"),
+                value_type: Some(format!(
+                    "{}::step_up::Config",
+                    deployments::TESTNET_AGENT_WALLET
+                )),
+                fields: Some(json!({"value":{"threshold": threshold.to_string()}})),
+            },
+        );
+    }
+    chain
+}
+
+/// The owner attached the step_up rule on chain after publishing, so the published manifest does
+/// not name it. A grant made now names it, at the chain's threshold, so the build proves it and the
+/// signer pauses where the chain does. Without it every run would abort for a missing receipt.
+#[tokio::test]
+async fn a_grant_names_the_step_up_rule_the_wallet_carries_on_chain() {
+    let grant = grant_plan(
+        &body(),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &granted_wallet_chain(Some(300_000_000)),
+    )
+    .await
+    .unwrap();
+    let rules = grant.run_set["capabilityManifest"]["rules"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        rules.contains(&json!({"kind":"step_up","thresholdMist":"300000000"})),
+        "{rules:?}"
+    );
+    assert!(
+        grant.run_set["allowedTargets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str().unwrap().ends_with("::step_up::prove")),
+        "{}",
+        grant.run_set
+    );
+    assert_eq!(
+        grant.build_arguments["agentWallet"]["capabilityManifest"]["rules"],
+        json!(rules)
+    );
+
+    // A wallet without the rule is granted exactly as before.
+    let plain = grant_plan(
+        &body(),
+        &skill(),
+        &addr("0x1"),
+        &context(),
+        &granted_wallet_chain(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        plain.run_set["capabilityManifest"],
+        skill().flow["capabilityManifest"]
+    );
 }
 
 #[tokio::test]

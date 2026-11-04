@@ -11,9 +11,9 @@
 /// stored, or discarded — the transaction can only succeed by routing it through `confirm_spend`,
 /// which asserts every attached rule's receipt is present.
 ///
-/// Rules are independent modules (`agent_wallet::budget`, `::per_tx`, `::rate_limit`, `::time_window`)
-/// that attach their config as a dynamic field on `SpendPolicy`, keyed by their own witness type —
-/// mirroring `sui::transfer_policy::add_rule`. Because rule configs live in dynamic fields rather than
+/// Rules are independent modules (`agent_wallet::budget`, `::per_tx`, `::rate_limit`, `::time_window`,
+/// `::step_up`) that attach their config as a dynamic field on `SpendPolicy`, keyed by their own
+/// witness type, mirroring `sui::transfer_policy::add_rule`. Because rule configs live in dynamic fields rather than
 /// `AgentWallet`/`SpendPolicy` struct fields, new rule types ship via in-place package upgrade
 /// (guarded by `agent_wallet::version`) without ever touching the wallet's struct layout — no forced
 /// redeploy.

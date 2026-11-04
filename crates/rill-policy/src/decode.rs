@@ -43,6 +43,20 @@ pub struct Decoded {
     /// against this must treat unknown as over it. `Some(0)` is a transaction that requests
     /// nothing.
     pub requested_spend_base_units: Option<u64>,
+    /// The transaction's sender, as the bytes name it.
+    pub sender: String,
+    /// Whoever pays the gas. Not the sender when the transaction is sponsored, which is how an
+    /// owner co-signs a spend above the on-chain `step_up` threshold.
+    pub gas_owner: String,
+    /// The most gas the payer can be charged, in base units of SUI.
+    pub gas_budget: u64,
+}
+
+impl Decoded {
+    /// Whether someone other than the sender pays the gas.
+    pub fn is_sponsored(&self) -> bool {
+        self.gas_owner != self.sender
+    }
 }
 
 /// Where `agent_wallet::request_spend(wallet, cap, version, amount, clock)` takes its amount.
@@ -114,6 +128,9 @@ pub fn decode(unsigned_ptb_base64: &str) -> Result<Decoded, Rejection> {
         commands,
         object_inputs,
         requested_spend_base_units: requested_spend,
+        sender: transaction.sender.to_string(),
+        gas_owner: transaction.gas_payment.owner.to_string(),
+        gas_budget: transaction.gas_payment.budget,
     })
 }
 
@@ -418,6 +435,25 @@ mod tests {
         );
         let decoded = decode(&encode(tx.try_build().unwrap())).unwrap();
         assert_eq!(decoded.requested_spend_base_units, Some(0));
+    }
+
+    /// Whoever pays the gas is read from the bytes, beside the sender: a sponsored transaction is
+    /// one the owner signs as payer, and the signer must know before it asks them.
+    #[test]
+    fn the_sender_gas_owner_and_budget_are_read_from_the_bytes() {
+        let tx = builder();
+        let mut built = tx.try_build().unwrap();
+        let plain = decode(&encode(built.clone())).unwrap();
+        assert_eq!(plain.sender, addr(9).to_string());
+        assert_eq!(plain.gas_owner, addr(9).to_string());
+        assert_eq!(plain.gas_budget, 50_000_000);
+        assert!(!plain.is_sponsored());
+
+        built.gas_payment.owner = addr(0x0a);
+        let sponsored = decode(&encode(built)).unwrap();
+        assert_eq!(sponsored.sender, addr(9).to_string());
+        assert_eq!(sponsored.gas_owner, addr(0x0a).to_string());
+        assert!(sponsored.is_sponsored());
     }
 
     /// Studio recomputes this digest from the same bytes before the owner signs, so both sides

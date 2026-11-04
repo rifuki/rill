@@ -78,6 +78,12 @@ struct State {
     /// The (message, signature, address) triples the fake accepts as valid. Anything else is
     /// invalid, so a test that forgot to stage a signature fails rather than passes.
     valid_signatures: Vec<(Vec<u8>, String, String)>,
+    /// The (transaction, signature, address) triples accepted as transaction signatures. Kept apart
+    /// from personal messages, as the node keeps them, so a signature staged for one kind never
+    /// passes as the other.
+    valid_transaction_signatures: Vec<(String, String, String)>,
+    /// Every signature list an execution was submitted with, in order.
+    execution_signatures: Vec<Vec<String>>,
     /// Whether the node fails when asked to verify a signature, rather than answering.
     signature_check_unavailable: bool,
 }
@@ -102,6 +108,8 @@ impl Default for State {
             // the network's answer, which a caller reads; it is not a price a caller assumed.
             reference_gas_price: Ok(1_000),
             valid_signatures: Vec::new(),
+            valid_transaction_signatures: Vec::new(),
+            execution_signatures: Vec::new(),
             signature_check_unavailable: false,
         }
     }
@@ -222,6 +230,26 @@ impl FakeSui {
         self
     }
 
+    /// Accept `signature` as `address`'s signature over the transaction `unsigned_tx_b64`.
+    pub fn with_valid_transaction_signature(
+        self,
+        unsigned_tx_b64: &str,
+        signature: &str,
+        address: &str,
+    ) -> Self {
+        self.state.borrow_mut().valid_transaction_signatures.push((
+            unsigned_tx_b64.to_owned(),
+            signature.to_owned(),
+            address.to_owned(),
+        ));
+        self
+    }
+
+    /// The signature lists executions were submitted with, in order.
+    pub fn execution_signatures(&self) -> Vec<Vec<String>> {
+        self.state.borrow().execution_signatures.clone()
+    }
+
     /// Make signature verification fail as a node that cannot be asked does, so a caller can be
     /// shown to tell "not signed" apart from "could not be checked".
     pub fn with_signature_check_unavailable(self) -> Self {
@@ -267,6 +295,28 @@ impl FakeSui {
 }
 
 impl SuiRead for FakeSui {
+    async fn verify_transaction_signature(
+        &self,
+        unsigned_tx_b64: &str,
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck> {
+        if self.state.borrow().signature_check_unavailable {
+            return Err(ChainError::Transport("fake node is unreachable".into()));
+        }
+        let accepted = self
+            .state
+            .borrow()
+            .valid_transaction_signatures
+            .iter()
+            .any(|(t, s, a)| t == unsigned_tx_b64 && s == signature && a == address);
+        Ok(if accepted {
+            SignatureCheck::Valid
+        } else {
+            SignatureCheck::Invalid("not a transaction signature this fake was given".into())
+        })
+    }
+
     async fn verify_personal_message(
         &self,
         message: &[u8],
@@ -444,6 +494,7 @@ impl SuiWrite for FakeSui {
         }
         let mut s = self.state.borrow_mut();
         s.executions.push(tx_b64.to_owned());
+        s.execution_signatures.push(signatures.to_vec());
         s.next_digest += 1;
         let digest = format!("FakeDigest{}", s.next_digest);
         Ok(ExecutionOutcome {

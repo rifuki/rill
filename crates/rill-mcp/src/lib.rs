@@ -612,7 +612,11 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  the action again. The signer submits only after it verifies the current owner's \
                  signature over that exact transaction. This pause binds this tool and \
                  rill_run_workflow; whoever can read the agent's key is bound only by the \
-                 wallet's on-chain rules."),
+                 wallet's on-chain rules. When the grant names the on-chain step_up rule \
+                 (stepUpOnChain in rill_actions), the wallet's threshold pauses too, at whichever \
+                 of the two is lower; above the wallet's, the owner pays the gas and approves by \
+                 signing the transaction as its sponsor, and the chain itself refuses that spend \
+                 without them."),
                 json!({
                     "type": "object",
                     "properties": {

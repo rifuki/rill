@@ -728,3 +728,184 @@ async fn published_actions_skip_gas_coins_deleted_since_the_owner_listing() {
         "0xc4".parse::<Address>().unwrap().to_string()
     );
 }
+
+// ── The on-chain step_up rule: above its threshold the owner pays the gas ──────────────────────
+
+const STEP_UP_OWNER: &str = "0xd1";
+
+fn object(id: &str, kind: &str, fields: serde_json::Value, shared: Option<u64>) -> ObjectSummary {
+    ObjectSummary {
+        reference: ObjectRef {
+            id: id.parse::<Address>().unwrap().to_string(),
+            version: 18,
+            digest: sui_sdk_types::Digest::ZERO.to_string(),
+        },
+        object_type: Some(kind.into()),
+        fields: Some(fields),
+        shared_initial_version: shared,
+    }
+}
+
+/// The funded chain, with the wallet's fields naming its owner and policy, the step_up config on
+/// that policy when `threshold` is set, and a SUI coin the owner holds.
+fn step_up_chain(threshold: Option<u64>) -> FakeSui {
+    let owner = STEP_UP_OWNER.parse::<Address>().unwrap().to_string();
+    let policy = "0xe1".parse::<Address>().unwrap().to_string();
+    let mut chain = funded_chain()
+        .with_object(
+            None,
+            object(
+                "0xa1",
+                "0xa0::agent_wallet::AgentWallet<0x2::sui::SUI>",
+                json!({"owner": owner, "agent": "0xc1", "policy": {"id": policy}}),
+                Some(7),
+            ),
+        )
+        .with_object(
+            Some(&owner),
+            object(
+                "0xf2",
+                "0x2::coin::Coin<0x2::sui::SUI>",
+                json!({"balance":"1000000000"}),
+                None,
+            ),
+        );
+    if let Some(threshold) = threshold {
+        chain = chain.with_dynamic_field(
+            &policy,
+            rill_chain::DynamicFieldSummary {
+                field_id: "0xf00".into(),
+                value_type: Some("0xa0::step_up::Config".into()),
+                fields: Some(json!({
+                    "name": {"dummy_field": false},
+                    "value": {"threshold": threshold.to_string(), "spent_in_tx": "0"},
+                })),
+            },
+        );
+    }
+    chain
+}
+
+fn stake_flow() -> FlowGraph {
+    flow(
+        json!({"nodes":[{"id":"stake","type":"haedal_stake","config":{"amount":"1000000000"}}],"edges":[]}),
+    )
+}
+
+fn step_up_options() -> CompileOptions {
+    wallet_options(Some(json!({"kind":"step_up","thresholdMist":"500000000"})))
+}
+
+fn built_transaction(
+    envelope: &rill_core::envelope::ExecutionEnvelope,
+) -> sui_sdk_types::Transaction {
+    bcs::from_bytes(&STANDARD.decode(&envelope.unsigned_ptb).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn above_the_on_chain_step_up_threshold_the_owner_pays_the_gas() {
+    let envelope = rill_server::studio_compile::build_action(
+        &stake_flow(),
+        &step_up_options(),
+        "skill_stake",
+        &step_up_chain(Some(500_000_000)),
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap();
+    let tx = built_transaction(&envelope);
+    let agent: Address = "0xc1".parse().unwrap();
+    let owner: Address = STEP_UP_OWNER.parse().unwrap();
+    assert_eq!(tx.sender, agent, "the agent still sends");
+    assert_eq!(tx.gas_payment.owner, owner, "the owner sponsors");
+    assert_eq!(
+        tx.gas_payment
+            .objects
+            .iter()
+            .map(|o| o.object_id().to_string())
+            .collect::<Vec<_>>(),
+        vec!["0xf2".parse::<Address>().unwrap().to_string()],
+        "only the owner's coins pay"
+    );
+    assert!(
+        envelope
+            .allowed_targets
+            .iter()
+            .any(|t| t.ends_with("::step_up::prove")),
+        "{:?}",
+        envelope.allowed_targets
+    );
+    assert_eq!(envelope.sender, agent.to_string());
+}
+
+#[tokio::test]
+async fn at_or_under_the_on_chain_threshold_the_agent_pays_as_before() {
+    let envelope = rill_server::studio_compile::build_action(
+        &stake_flow(),
+        &step_up_options(),
+        "skill_stake",
+        &step_up_chain(Some(1_000_000_000)),
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap();
+    let tx = built_transaction(&envelope);
+    assert_eq!(tx.gas_payment.owner, tx.sender);
+    assert_eq!(
+        tx.gas_payment.objects[0].object_id().to_string(),
+        "0xf1".parse::<Address>().unwrap().to_string()
+    );
+}
+
+/// The grant names the rule and the wallet does not carry it, so the prove call would abort. The
+/// build says which rule is missing instead of handing back a transaction that cannot land.
+#[tokio::test]
+async fn a_grant_naming_step_up_on_a_wallet_without_it_is_refused() {
+    let refused = rill_server::studio_compile::build_action(
+        &stake_flow(),
+        &step_up_options(),
+        "skill_stake",
+        &step_up_chain(None),
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("step_up"), "{refused}");
+}
+
+/// The owner pays, so the owner's coins are the ones that must cover the budget.
+#[tokio::test]
+async fn a_sponsored_build_without_owner_gas_is_refused() {
+    let owner = STEP_UP_OWNER.parse::<Address>().unwrap().to_string();
+    let policy = "0xe1".parse::<Address>().unwrap().to_string();
+    let chain = funded_chain()
+        .with_object(
+            None,
+            object(
+                "0xa1",
+                "0xa0::agent_wallet::AgentWallet<0x2::sui::SUI>",
+                json!({"owner": owner, "agent": "0xc1", "policy": {"id": policy}}),
+                Some(7),
+            ),
+        )
+        .with_dynamic_field(
+            &policy,
+            rill_chain::DynamicFieldSummary {
+                field_id: "0xf00".into(),
+                value_type: Some("0xa0::step_up::Config".into()),
+                fields: Some(json!({"value": {"threshold": "1"}})),
+            },
+        );
+    let refused = rill_server::studio_compile::build_action(
+        &stake_flow(),
+        &step_up_options(),
+        "skill_stake",
+        &chain,
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("owner"), "{refused}");
+}

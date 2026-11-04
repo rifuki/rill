@@ -86,6 +86,7 @@ fn approval(bytes: &str) -> StepUpApproval {
         threshold_base_units: "10".into(),
         coin_type: "0x2::sui::SUI".into(),
         expires_at_ms: (NOW + 120_000).to_string(),
+        gas_owner: None,
     }
 }
 
@@ -336,4 +337,186 @@ async fn the_routes_answer_an_unknown_request_without_reading_the_chain() {
     assert_eq!(shown["status"], "pending");
     assert!(shown.get("ownerSignature").is_none_or(Value::is_null));
     assert_eq!(state.config.studio_origin(), "https://studio.test");
+}
+
+// ── The on-chain rule: the owner approves as the transaction's gas sponsor ─────────────────────
+
+const POLICY: &str = "0x00000000000000000000000000000000000000000000000000000000000000e1";
+const STRANGER: &str = "0x00000000000000000000000000000000000000000000000000000000000000e9";
+
+/// A spend of `amount` sent by the agent, its gas paid by `gas_owner` within `budget`.
+fn sponsored_ptb(amount: u64, gas_owner: &str, budget: u64) -> String {
+    let mut tx = TransactionBuilder::new();
+    tx.set_sender(AGENT.parse::<Address>().unwrap());
+    tx.set_gas_budget(budget);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(
+        "0x0b".parse::<Address>().unwrap(),
+        1,
+        Digest::ZERO,
+    )]);
+    let wallet = tx.object(ObjectInput::shared(WALLET.parse().unwrap(), 4, true));
+    let amount = tx.pure(&amount);
+    tx.move_call(
+        Function::new(
+            PACKAGE.parse().unwrap(),
+            Identifier::new("agent_wallet").unwrap(),
+            Identifier::new("request_spend").unwrap(),
+        ),
+        vec![wallet, wallet, wallet, amount, wallet],
+    );
+    let mut built = tx.try_build().unwrap();
+    built.gas_payment.owner = gas_owner.parse().unwrap();
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bcs::to_bytes(&built).unwrap())
+}
+
+fn sponsored(bytes: &str) -> StepUpApproval {
+    StepUpApproval {
+        gas_owner: Some(OWNER.into()),
+        ..approval(bytes)
+    }
+}
+
+/// A wallet naming AGENT and OWNER, carrying the step_up rule at `threshold` when it is set.
+fn rule_chain(threshold: Option<u64>) -> FakeSui {
+    let mut wallet = wallet(AGENT);
+    wallet.fields = Some(json!({
+        "owner": OWNER, "agent": AGENT, "revoked": false, "policy": { "id": POLICY },
+    }));
+    let mut chain = FakeSui::new().with_object(None, wallet);
+    if let Some(threshold) = threshold {
+        chain = chain.with_dynamic_field(
+            POLICY,
+            rill_chain::DynamicFieldSummary {
+                field_id: "0xf00".into(),
+                value_type: Some(format!("{PACKAGE}::step_up::Config")),
+                fields: Some(json!({ "value": { "threshold": threshold.to_string() } })),
+            },
+        );
+    }
+    chain
+}
+
+fn agent_signed(chain: FakeSui, approval: &StepUpApproval) -> FakeSui {
+    chain.with_valid_signature(
+        approval.request_message().as_bytes(),
+        AGENT_SIGNATURE,
+        AGENT,
+    )
+}
+
+#[tokio::test]
+async fn a_sponsored_request_names_the_wallets_owner_as_the_bytes_gas_owner() {
+    let bytes = sponsored_ptb(20, OWNER, 50_000_000);
+    let ours = sponsored(&bytes);
+    let (accepted, _) = open(
+        &body(&ours, &bytes),
+        &agent_signed(rule_chain(Some(10)), &ours),
+    )
+    .await
+    .unwrap();
+    assert_eq!(accepted.gas_owner.as_deref(), Some(OWNER));
+
+    // The bytes pay the agent's own gas while the request says the owner sponsors them.
+    let unsponsored = ptb(20);
+    let claimed = sponsored(&unsponsored);
+    let error = open(
+        &body(&claimed, &unsponsored),
+        &agent_signed(rule_chain(Some(10)), &claimed),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("gas"), "{error}");
+
+    // A sponsor who is not the wallet's owner.
+    let bytes_by_stranger = sponsored_ptb(20, STRANGER, 50_000_000);
+    let mut stranger = sponsored(&bytes_by_stranger);
+    stranger.gas_owner = Some(STRANGER.into());
+    let error = open(
+        &body(&stranger, &bytes_by_stranger),
+        &agent_signed(rule_chain(Some(10)), &stranger),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("owner"), "{error}");
+
+    // More gas than an owner is ever asked to sponsor.
+    let costly = sponsored_ptb(
+        20,
+        OWNER,
+        rill_ptb::sponsor::MAX_SPONSORED_GAS_BUDGET_MIST + 1,
+    );
+    let expensive = sponsored(&costly);
+    let error = open(
+        &body(&expensive, &costly),
+        &agent_signed(rule_chain(Some(10)), &expensive),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("budget"), "{error}");
+
+    // No rule on chain, or a spend the rule does not need the owner for.
+    for threshold in [None, Some(20)] {
+        let error = open(
+            &body(&ours, &bytes),
+            &agent_signed(rule_chain(threshold), &ours),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("step_up"), "{threshold:?}: {error}");
+    }
+
+    // Bytes the owner would sponsor, under a request that never says so.
+    let mut unnamed = ours.clone();
+    unnamed.gas_owner = None;
+    let error = open(
+        &body(&unnamed, &bytes),
+        &agent_signed(rule_chain(Some(10)), &unnamed),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("sponsor"), "{error}");
+}
+
+#[tokio::test]
+async fn a_sponsored_approval_is_the_owners_signature_over_the_held_transaction() {
+    let bytes = sponsored_ptb(20, OWNER, 50_000_000);
+    let ours = sponsored(&bytes);
+    let store = StepUpStore::new();
+    store
+        .prepare("r2".into(), ours.clone(), bytes.clone(), NOW)
+        .unwrap();
+
+    // The owner signed the approval's text: that is the signer-only kind, not a sponsor's signature.
+    let text = rule_chain(Some(10)).with_valid_signature(
+        ours.message().as_bytes(),
+        OWNER_SIGNATURE,
+        OWNER,
+    );
+    let (status, _) = approve(&store, "r2", OWNER_SIGNATURE, &text, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The agent's signature over the transaction is the sender's, never the sponsor's.
+    let by_agent =
+        rule_chain(Some(10)).with_valid_transaction_signature(&bytes, OWNER_SIGNATURE, AGENT);
+    let (status, _) = approve(&store, "r2", OWNER_SIGNATURE, &by_agent, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(store
+        .get("r2", NOW)
+        .unwrap()
+        .unwrap()
+        .owner_signature
+        .is_none());
+
+    let by_owner =
+        rule_chain(Some(10)).with_valid_transaction_signature(&bytes, OWNER_SIGNATURE, OWNER);
+    let entry = approve(&store, "r2", OWNER_SIGNATURE, &by_owner, NOW)
+        .await
+        .unwrap();
+    assert_eq!(entry.owner_signature.as_deref(), Some(OWNER_SIGNATURE));
 }

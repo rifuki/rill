@@ -245,6 +245,19 @@ pub trait SuiRead {
         signature: &str,
         address: &str,
     ) -> ChainResult<SignatureCheck>;
+
+    /// Whether `signature` (base64, Sui's serialized form) signs the transaction `unsigned_tx_b64`
+    /// (base64 BCS `TransactionData`) as `address`.
+    ///
+    /// The check a gas sponsor's signature gets before it is submitted beside the sender's. Asked
+    /// of the node for the reason [`Self::verify_personal_message`] is: the sponsor may be a
+    /// zkLogin wallet, which only the chain's current JWKs can verify.
+    async fn verify_transaction_signature(
+        &self,
+        unsigned_tx_b64: &str,
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck>;
 }
 
 /// Writes. Separated from [`SuiRead`] so that a component which only needs to read cannot be
@@ -389,6 +402,14 @@ pub mod aborts {
                      and neither will retrying with the same amount. Spend less, or have the \
                      wallet's owner attach different rules."
                 }
+                // Not a cap: above the owner's threshold the owner pays the gas, which only the
+                // owner's own signature can do. The agent cannot produce that, so retrying alone,
+                // with any amount above the threshold, fails the same way.
+                ("step_up", _) => {
+                    "Above the wallet's step-up threshold the owner must approve this transaction \
+                     in Studio; do not retry. Run it through rill_run_action, which pauses and \
+                     hands the owner an approval link, or ask the owner to approve the spend."
+                }
                 ("time_window", _) => {
                     "This is a time bound, not an amount. Retrying now will fail the same way; \
                      either wait for the window, or have the owner change it."
@@ -485,6 +506,7 @@ pub mod aborts {
             "per_tx",
             "rate_limit",
             "time_window",
+            "step_up",
             "agent_wallet",
         ]
         .into_iter()
@@ -505,6 +527,10 @@ pub mod aborts {
                 "this spend would exceed what may be spent in the current rolling window"
             }
             ("time_window", 1) => "the wallet is outside the window it is permitted to spend in",
+            ("step_up", 1) => {
+                "this transaction is above the owner's step-up threshold, so the wallet's owner \
+                 must be its gas sponsor, and it is not"
+            }
             ("time_window", 2) => {
                 "the time window itself is invalid: not_before is not before \
                                    not_after"
@@ -697,6 +723,30 @@ pub mod aborts {
                     "code {code} must not invite a retry: {advice}"
                 );
             }
+        }
+
+        #[test]
+        fn the_step_up_abort_code_matches_the_move_contract() {
+            let source = include_str!("../../../move/agent_wallet/sources/rules/step_up.move");
+            assert!(source.contains("const E_NEEDS_OWNER: u64 = 1;"));
+        }
+
+        /// Above the owner's on-chain threshold nothing the agent does alone can land the spend:
+        /// the owner has to pay its gas. A smaller amount is a different spend, not a retry, so the
+        /// advice sends the agent to the owner's approval and says not to retry.
+        #[test]
+        fn a_step_up_refusal_sends_the_agent_to_the_owners_approval() {
+            let error = PER_TX.replace("per_tx", "step_up");
+            let refusal = classify_rule_abort(&error).expect("a step_up refusal");
+            assert_eq!(refusal.module, "step_up");
+            assert_eq!(refusal.code, 1);
+            assert!(refusal.meaning.contains("gas sponsor"), "{refusal}");
+            let advice = refusal.advice();
+            assert!(
+                advice.contains("the owner must approve this transaction in Studio"),
+                "{advice}"
+            );
+            assert!(advice.contains("do not retry"), "{advice}");
         }
 
         /// Reporting an unrelated failure as a policy decision would be worse than saying nothing:

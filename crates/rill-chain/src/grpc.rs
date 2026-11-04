@@ -70,6 +70,44 @@ impl GrpcSui {
         }
     }
 
+    /// One `VerifySignature` call, for whichever message kind `message` names.
+    async fn verify_signature(
+        &self,
+        message: sui_rpc::proto::sui::rpc::v2::Bcs,
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck> {
+        use sui_rpc::proto::sui::rpc::v2::VerifySignatureRequest;
+
+        let Ok(signature) = sui_sdk_types::UserSignature::from_base64(signature) else {
+            return Ok(SignatureCheck::Invalid(
+                "the signature is not a Sui signature in base64".into(),
+            ));
+        };
+        let mut request = VerifySignatureRequest::default();
+        request.message = Some(message);
+        request.signature = Some(signature.into());
+        request.address = Some(address.to_owned());
+
+        let response = self
+            .client
+            .clone()
+            .signature_verification_client()
+            .verify_signature(request)
+            .await
+            .map_err(refusal_or_transport)?
+            .into_inner();
+        Ok(if response.is_valid == Some(true) {
+            SignatureCheck::Valid
+        } else {
+            SignatureCheck::Invalid(
+                response
+                    .reason
+                    .unwrap_or_else(|| "the node did not accept the signature".into()),
+            )
+        })
+    }
+
     /// Every object `owner` holds, walked `page_size` at a time.
     ///
     /// Public so a test can force a small page and prove the token path against a real node,
@@ -496,19 +534,35 @@ impl SuiRead for GrpcSui {
         })
     }
 
+    async fn verify_transaction_signature(
+        &self,
+        unsigned_tx_b64: &str,
+        signature: &str,
+        address: &str,
+    ) -> ChainResult<SignatureCheck> {
+        use base64::Engine as _;
+        use sui_rpc::proto::sui::rpc::v2::Bcs;
+
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(unsigned_tx_b64.trim())
+        else {
+            return Ok(SignatureCheck::Invalid(
+                "the transaction is not base64".into(),
+            ));
+        };
+        let mut message = Bcs::default();
+        message.name = Some("TransactionData".into());
+        message.value = Some(bytes.into());
+        self.verify_signature(message, signature, address).await
+    }
+
     async fn verify_personal_message(
         &self,
         message: &[u8],
         signature: &str,
         address: &str,
     ) -> ChainResult<SignatureCheck> {
-        use sui_rpc::proto::sui::rpc::v2::{Bcs, VerifySignatureRequest};
+        use sui_rpc::proto::sui::rpc::v2::Bcs;
 
-        let Ok(signature) = sui_sdk_types::UserSignature::from_base64(signature) else {
-            return Ok(SignatureCheck::Invalid(
-                "the signature is not a Sui signature in base64".into(),
-            ));
-        };
         // A personal message is signed as its BCS form: a ULEB128 length, then the bytes.
         let mut bytes = Vec::with_capacity(message.len() + 5);
         let mut len = message.len();
@@ -525,28 +579,7 @@ impl SuiRead for GrpcSui {
         let mut bcs_message = Bcs::default();
         bcs_message.name = Some("PersonalMessage".into());
         bcs_message.value = Some(bytes.into());
-        let mut request = VerifySignatureRequest::default();
-        request.message = Some(bcs_message);
-        request.signature = Some(signature.into());
-        request.address = Some(address.to_owned());
-
-        let response = self
-            .client
-            .clone()
-            .signature_verification_client()
-            .verify_signature(request)
-            .await
-            .map_err(refusal_or_transport)?
-            .into_inner();
-        Ok(if response.is_valid == Some(true) {
-            SignatureCheck::Valid
-        } else {
-            SignatureCheck::Invalid(
-                response
-                    .reason
-                    .unwrap_or_else(|| "the node did not accept the signature".into()),
-            )
-        })
+        self.verify_signature(bcs_message, signature, address).await
     }
 
     async fn reference_gas_price(&self) -> ChainResult<u64> {

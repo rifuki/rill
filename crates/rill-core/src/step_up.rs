@@ -53,6 +53,14 @@ pub struct StepUpApproval {
     pub coin_type: String,
     /// The envelope's own expiry, in milliseconds since the epoch, as decimal text.
     pub expires_at_ms: String,
+    /// The wallet's owner as the transaction's gas sponsor, when the wallet carries the on-chain
+    /// `step_up` rule and the spend is above its threshold. The owner then approves by signing the
+    /// transaction itself as sponsor, which the chain checks, instead of [`Self::message`].
+    ///
+    /// Left out of the JSON when absent, so an approval of the signer-only kind keeps the exact
+    /// canonical form, digest and text it had before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_owner: Option<String>,
 }
 
 impl StepUpApproval {
@@ -108,6 +116,11 @@ impl StepUpApproval {
         )
     }
 
+    /// Whether the owner approves this one as the transaction's gas sponsor.
+    pub fn is_sponsored(&self) -> bool {
+        self.gas_owner.is_some()
+    }
+
     /// Whether the approval has expired at `now_ms`. Unparseable is expired, as for a grant.
     pub fn is_expired(&self, now_ms: u64) -> bool {
         self.expires_at_ms
@@ -136,6 +149,7 @@ mod tests {
             threshold_base_units: "10000000".into(),
             coin_type: "0x2::sui::SUI".into(),
             expires_at_ms: "1791143096704".into(),
+            gas_owner: None,
         }
     }
 
@@ -211,6 +225,35 @@ mod tests {
         let mut garbled = approval();
         garbled.expires_at_ms = "soon".into();
         assert!(garbled.is_expired(0));
+    }
+
+    /// A request for a wallet that carries the on-chain rule names the owner as gas sponsor. The key
+    /// is absent otherwise, so every approval of the signer-only kind keeps its exact JSON, digest
+    /// and text, and Studio's pinned digest above still holds.
+    #[test]
+    fn a_sponsored_approval_names_its_gas_owner_and_an_unsponsored_one_is_unchanged() {
+        let plain = approval();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("gasOwner").is_none(), "{json}");
+        assert!(!plain.is_sponsored());
+        let read: StepUpApproval = serde_json::from_value(json).unwrap();
+        assert_eq!(read, plain);
+
+        let mut sponsored = approval();
+        sponsored.gas_owner = Some("0xa1".into());
+        assert!(sponsored.is_sponsored());
+        assert_eq!(
+            serde_json::to_value(&sponsored).unwrap()["gasOwner"],
+            serde_json::json!("0xa1")
+        );
+        // Pinned for Studio as well (rill-frontend src/lib/step-up.test.ts), which rebuilds the
+        // text of a sponsored approval to check the server's copy.
+        assert_eq!(
+            sponsored.digest(),
+            "d55def4b86c1561cd0ee82e184596e10327d485ea3060b74c90d28a46cfc9b3f"
+        );
+        assert_ne!(sponsored.digest(), plain.digest());
+        assert_ne!(sponsored.request_message(), plain.request_message());
     }
 
     /// Strict like a grant: a field this signer does not know is a different approval format, and

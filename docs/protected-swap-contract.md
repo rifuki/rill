@@ -62,6 +62,8 @@ Owner calls: `allow_recipient(wallet, version, recipient, ctx)` creates the list
 
 A wallet with a list can no longer run anything that needs a released coin (a generic Cetus swap, a Haedal stake, a DeepBook deposit): any coin handed to the PTB could be sent anywhere. It becomes payout-only, plus protected swaps if the owner also configures protected mode.
 
+The same upgrade adds the `step_up` rule module, also additive: `add(wallet, version, threshold, ctx)` and `remove(wallet, version, ctx)` go through the owner-only `add_rule`/`remove_rule`, and `prove(req, wallet, version, ctx)` keeps a running total per transaction digest, as `per_tx` does, and aborts `E_NEEDS_OWNER` (`step_up` code 1) once that total is above the threshold and `ctx.sponsor()` is not the wallet's owner. Its `Rule` takes the v3 package as defining id. A client that does not know the rule leaves its prove out, so `confirm_spend` aborts `E_RULE_NOT_SATISFIED` (10): it fails closed. Before mainnet, the testnet rehearsal must show `ctx.sponsor()` returning the gas owner in both simulation and execution (`scripts/e2e.sh testnet stepup` with `AGENT_WALLET_PACKAGE_ID` and `AGENT_WALLET_VERSION_ID` set to the rehearsal's package covers both: an agent-paid simulation must abort with code 1, and the owner-sponsored run must land).
+
 Upgrade order, one maintenance window:
 
 1. `sui client upgrade --dry-run` for agent_wallet with UpgradeCap `0x7b7c04fb…8eef`; confirm the policy is still compatible.
@@ -70,7 +72,7 @@ Upgrade order, one maintenance window:
 4. Release the signer, server and plugin pin. The release workflow refuses to build while either id is still the placeholder.
 5. Publisher-gated `version::migrate` on `0x86430a81…ba94`.
 6. Every Studio grant saved before this window has to be granted again; list them from the server's grant store (`GRANTS_STORE_PATH`, else `grants.json` beside the skills store) and tell each owner before step 5, then each owner re-grants in Studio once the server runs on the v3 ids.
-7. Smoke on mainnet: allow, `confirm_spend_to` a listed address, an unlisted one refused (21), `confirm_spend` refused (20), clear, and one re-granted protected Cetus swap run through `rill_run_action`.
+7. Smoke on mainnet: allow, `confirm_spend_to` a listed address, an unlisted one refused (21), `confirm_spend` refused (20), clear, and one re-granted protected Cetus swap run through `rill_run_action`. Then `scripts/e2e.sh mainnet stepup`, which attaches `step_up`, sees an agent-paid spend refused with code 1, and lands one owner-sponsored run.
 
 Agent spending through new code is unavailable between steps 2 and 5, and through any client still on the old ids after step 5. Owner exits on old ids keep working because they are not version-gated.
 

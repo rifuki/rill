@@ -112,6 +112,7 @@ fn each_rules_prove_takes_the_clock_exactly_when_the_manifest_says_it_does() {
         (RuleKind::PerTx, "per_tx"),
         (RuleKind::RateLimit, "rate_limit"),
         (RuleKind::TimeWindow, "time_window"),
+        (RuleKind::StepUp, "step_up"),
     ] {
         let source = move_source(&format!("rules/{module}.move"));
         let params = parameters_of(&source, "prove");

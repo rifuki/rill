@@ -233,9 +233,69 @@ fn read_uleb128(bytes: &[u8], cursor: &mut usize) -> Result<u64, BookError> {
 /// `prove` call to a function that does not exist.
 pub fn rule_module(type_name: &str) -> Option<&str> {
     let module = type_name.split("::").nth(1)?;
-    ["budget", "per_tx", "rate_limit", "time_window"]
+    ["budget", "per_tx", "rate_limit", "time_window", "step_up"]
         .into_iter()
         .find(|known| *known == module)
+}
+
+/// The `step_up` rule's threshold, from the dynamic field that holds its `Config`.
+///
+/// `value_type` names the field's type, which ends in the rule module's `Config`; the numbers are
+/// under `value` because the node wraps them in the dynamic-field envelope. `None` for any other
+/// rule, and for a threshold that is not a whole number, which a caller must not read as "no rule".
+pub fn step_up_threshold(value_type: &str, field: &serde_json::Value) -> Option<u64> {
+    let module = value_type.strip_suffix("::Config")?.rsplit("::").next()?;
+    if module != "step_up" {
+        return None;
+    }
+    match field.get("value")?.get("threshold")? {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
+    }
+}
+
+/// The wallet's on-chain step-up threshold, or `None` when the rule is not attached.
+///
+/// Read from the chain each time, because the rule decides which transaction the owner must
+/// sponsor and the owner can change it at any moment. Every failure is an error rather than `None`:
+/// a wallet whose rules could not be read may carry the rule, and a build that assumed it did not
+/// would hand the agent a transaction the chain aborts, or the owner a request they never needed.
+pub async fn read_step_up_threshold(
+    chain: &impl rill_chain::SuiRead,
+    wallet_id: &str,
+) -> Result<Option<u64>, String> {
+    let wallet = chain
+        .get_object(wallet_id)
+        .await
+        .map_err(|e| format!("reading the wallet: {e}"))?;
+    let policy = wallet
+        .fields
+        .as_ref()
+        .and_then(|f| f.get("policy"))
+        .and_then(|p| p.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("the wallet's rule policy could not be read")?;
+    let fields = chain
+        .list_dynamic_fields(policy)
+        .await
+        .map_err(|e| format!("reading the wallet's rule configs: {e}"))?;
+    for field in fields {
+        let Some(value_type) = field.value_type.as_deref() else {
+            continue;
+        };
+        if !value_type.ends_with("::step_up::Config") {
+            continue;
+        }
+        let value = field
+            .fields
+            .as_ref()
+            .ok_or("the step_up config came back empty")?;
+        return step_up_threshold(value_type, value)
+            .map(Some)
+            .ok_or_else(|| "the step_up threshold is not a whole number".into());
+    }
+    Ok(None)
 }
 
 /// Every recognised rule module attached to a wallet, in the order the chain reports them.
@@ -308,6 +368,106 @@ mod tests {
             attached_modules(&decoded),
             vec!["budget"],
             "an unrecognised rule is dropped from the emit list, not guessed at"
+        );
+    }
+
+    /// The rule shipped in the v3 upgrade, so its type name carries the upgraded package's id. The
+    /// module is what is matched, never the address.
+    #[test]
+    fn the_step_up_rule_is_recognised_and_its_threshold_read() {
+        assert_eq!(rule_module("1bad7dbb::step_up::Rule"), Some("step_up"));
+        let field = serde_json::json!({
+            "name": { "dummy_field": false },
+            "value": { "threshold": "100000000", "tx_digest": [], "spent_in_tx": "0" },
+        });
+        assert_eq!(
+            step_up_threshold("0x1bad::step_up::Config", &field),
+            Some(100_000_000)
+        );
+        assert_eq!(step_up_threshold("0x1bad::per_tx::Config", &field), None);
+        assert_eq!(
+            step_up_threshold(
+                "0x1bad::step_up::Config",
+                &serde_json::json!({ "value": { "threshold": "a lot" } })
+            ),
+            None
+        );
+    }
+
+    fn wallet(policy: Option<&str>) -> rill_chain::ObjectSummary {
+        rill_chain::ObjectSummary {
+            reference: rill_chain::ObjectRef {
+                id: "0x20".into(),
+                version: 7,
+                digest: String::new(),
+            },
+            object_type: Some("0xca::agent_wallet::AgentWallet<0x2::sui::SUI>".into()),
+            fields: Some(match policy {
+                Some(policy) => serde_json::json!({ "owner": "0xa", "policy": { "id": policy } }),
+                None => serde_json::json!({ "owner": "0xa" }),
+            }),
+            shared_initial_version: Some(3),
+        }
+    }
+
+    fn config(module: &str, value: serde_json::Value) -> rill_chain::DynamicFieldSummary {
+        rill_chain::DynamicFieldSummary {
+            field_id: format!("0xf1{module}"),
+            value_type: Some(format!("0xca::{module}::Config")),
+            fields: Some(serde_json::json!({ "name": { "dummy_field": false }, "value": value })),
+        }
+    }
+
+    fn read(chain: &rill_chain::fake::FakeSui) -> Result<Option<u64>, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(read_step_up_threshold(chain, "0x20"))
+    }
+
+    /// Absent and unread are different answers: a wallet whose rules could not be read may carry
+    /// the rule, and building as if it did not would send a transaction the chain aborts.
+    #[test]
+    fn the_threshold_is_read_from_the_wallets_policy_and_an_unreadable_one_is_an_error() {
+        use rill_chain::fake::FakeSui;
+
+        let with = FakeSui::new()
+            .with_object(None, wallet(Some("0x99")))
+            .with_dynamic_field(
+                "0x99",
+                config("budget", serde_json::json!({ "total_mist": "5" })),
+            )
+            .with_dynamic_field(
+                "0x99",
+                config(
+                    "step_up",
+                    serde_json::json!({ "threshold": "300", "spent_in_tx": "0" }),
+                ),
+            );
+        assert_eq!(read(&with), Ok(Some(300)));
+
+        let without = FakeSui::new()
+            .with_object(None, wallet(Some("0x99")))
+            .with_dynamic_field(
+                "0x99",
+                config("budget", serde_json::json!({ "total_mist": "5" })),
+            );
+        assert_eq!(read(&without), Ok(None));
+
+        let garbled = FakeSui::new()
+            .with_object(None, wallet(Some("0x99")))
+            .with_dynamic_field(
+                "0x99",
+                config("step_up", serde_json::json!({ "threshold": "x" })),
+            );
+        assert!(read(&garbled).is_err());
+
+        let no_policy = FakeSui::new().with_object(None, wallet(None));
+        assert!(read(&no_policy).is_err());
+
+        assert!(
+            read(&FakeSui::new()).is_err(),
+            "a wallet that cannot be read"
         );
     }
 

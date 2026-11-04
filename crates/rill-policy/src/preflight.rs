@@ -75,7 +75,8 @@ pub fn check(
             CapabilityRule::Budget { .. }
             | CapabilityRule::PerTx { .. }
             | CapabilityRule::RateLimit { .. }
-            | CapabilityRule::TimeWindow { .. } => {}
+            | CapabilityRule::TimeWindow { .. }
+            | CapabilityRule::StepUp { .. } => {}
             CapabilityRule::ProtocolScope { allowed_packages } => {
                 let Some(packages) = &proposal.packages else {
                     return refuse(UNREADABLE.into());

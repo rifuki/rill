@@ -19,6 +19,12 @@
 # the owner cancels it and withdraws its 1.1 SUI. The stepup scenario swaps 0.005 SUI once, after
 # the owner approves it from the keystore. Every wallet's remainder comes back on revoke.
 # Receipts land in the run directory printed at the end, one e2e-<scenario>-receipts.json each.
+#
+# A rehearsal against a package published for it sets AGENT_WALLET_PACKAGE_ID and
+# AGENT_WALLET_VERSION_ID (its published-at and its shared Version object). Both are passed to the
+# server, and the test passes them to the signer and the owner's revoke; on testnet they also tell
+# the stepup scenario that the on-chain step_up rule exists (RILL_E2E_ONCHAIN_STEP_UP=1 or 0 says so
+# explicitly instead).
 set -euo pipefail
 
 network="${1:-testnet}"
@@ -62,7 +68,16 @@ port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p
 api="http://127.0.0.1:$port"
 secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 
-env -i PATH="$PATH" HOME="$HOME" \
+# The server starts from an empty environment, so a rehearsal's package pair is the one thing
+# handed to it on purpose. Both or neither: the server refuses half a pair.
+deployment=()
+if [ -n "${AGENT_WALLET_PACKAGE_ID:-}" ] || [ -n "${AGENT_WALLET_VERSION_ID:-}" ]; then
+  : "${AGENT_WALLET_PACKAGE_ID:?set AGENT_WALLET_PACKAGE_ID together with AGENT_WALLET_VERSION_ID}"
+  : "${AGENT_WALLET_VERSION_ID:?set AGENT_WALLET_VERSION_ID together with AGENT_WALLET_PACKAGE_ID}"
+  deployment=(AGENT_WALLET_PACKAGE_ID="$AGENT_WALLET_PACKAGE_ID" AGENT_WALLET_VERSION_ID="$AGENT_WALLET_VERSION_ID")
+fi
+
+env -i PATH="$PATH" HOME="$HOME" ${deployment[@]+"${deployment[@]}"} \
   SUI_NETWORK="$network" PORT="$port" BIND_ADDRESS=127.0.0.1 \
   PUBLIC_BASE_URL="$api" RILL_CONSENT_URL="$api/authorize" \
   RILL_OAUTH_SECRET="$secret" \

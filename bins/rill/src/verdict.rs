@@ -206,6 +206,23 @@ mod tests {
         );
     }
 
+    /// `rill spend`, `rill swap` and the rest pay their own gas, so above the wallet's on-chain
+    /// step-up threshold the chain refuses them. The message says the owner has to approve it and
+    /// that retrying will not help, rather than quoting the abort.
+    #[test]
+    fn a_command_above_the_step_up_threshold_says_the_owner_must_approve_it() {
+        let failure = would_fail(Some(PER_TX.replace("per_tx", "step_up")));
+        let Failure::Refused(refusal) = &failure else {
+            panic!("a step_up abort must be a refusal: {failure}");
+        };
+        assert_eq!(refusal.module, "step_up");
+        let text = failure.to_string();
+        assert!(
+            text.contains("the owner must approve this transaction in Studio; do not retry"),
+            "{text}"
+        );
+    }
+
     /// Dressing an unrelated failure up as a policy decision tells someone their limits are
     /// working when something else is broken.
     #[test]

@@ -24,10 +24,12 @@ use sui::event;
 /// `version` field up to match; callers holding a stale `Version` reference get rejected by
 /// `check_is_valid` until they migrate.
 ///
-/// 3 adds the owner's recipient allowlist. Old package versions stay callable on Sui, and v2's
-/// `confirm_spend` knows nothing of the allowlist, so the list only binds once `migrate` has moved
-/// the live object past 2 and every v2 agent path aborts here. `allow_recipient` is gated for the
-/// same reason: a list must not be settable while bytecode that ignores it is still authoritative.
+/// 3 adds the owner's recipient allowlist and the `step_up` rule. Old package versions stay callable
+/// on Sui, and v2's `confirm_spend` knows nothing of the allowlist, so the list only binds once
+/// `migrate` has moved the live object past 2 and every v2 agent path aborts here. `allow_recipient`
+/// is gated for the same reason: a list must not be settable while bytecode that ignores it is still
+/// authoritative. `step_up` needs no such gate on `add`: v2 cannot prove a rule it does not know, so
+/// attaching it early only pauses the agent until `migrate`.
 const VERSION: u64 = 3;
 
 /// `check_is_valid` was called against a `Version` object whose `version` no longer matches this

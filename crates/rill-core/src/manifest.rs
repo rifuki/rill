@@ -9,8 +9,8 @@
 //!
 //! ## Not every rule is enforced on-chain, and the declaration says which
 //!
-//! `budget`, `per_tx`, `rate_limit` and `time_window` are proved against the real transaction by
-//! Move and cannot be bypassed. The other four are pre-flight, because an on-chain rule can only
+//! `budget`, `per_tx`, `rate_limit`, `time_window` and `step_up` are proved against the real
+//! transaction by Move and cannot be bypassed. The other four are pre-flight, because an on-chain rule can only
 //! compare against metadata the transaction asserts about itself, which is decoration, not a
 //! guarantee. `slippage_floor` has a second reason: at rule-prove time the swap's output does not
 //! exist yet, since it is the value being computed.
@@ -71,6 +71,11 @@ pub enum CapabilityRule {
         not_before_ms: String,
         not_after_ms: String,
     },
+    /// Above this amount per transaction, the wallet's owner must pay the transaction's gas, which
+    /// only the owner's own signature can do. It does not cap the spend: it makes the owner a party
+    /// to the large ones, so the agent key alone cannot release them.
+    #[serde(rename_all = "camelCase")]
+    StepUp { threshold_mist: String },
 }
 
 impl CapabilityRule {
@@ -85,6 +90,7 @@ impl CapabilityRule {
             Self::AssetScope { .. } => RuleKind::AssetScope,
             Self::RecipientAllowlist { .. } => RuleKind::RecipientAllowlist,
             Self::TimeWindow { .. } => RuleKind::TimeWindow,
+            Self::StepUp { .. } => RuleKind::StepUp,
         }
     }
 }
@@ -99,6 +105,7 @@ pub enum RuleKind {
     AssetScope,
     RecipientAllowlist,
     TimeWindow,
+    StepUp,
 }
 
 impl RuleKind {
@@ -117,6 +124,7 @@ impl RuleKind {
             Self::AssetScope => "asset_scope",
             Self::RecipientAllowlist => "recipient_allowlist",
             Self::TimeWindow => "time_window",
+            Self::StepUp => "step_up",
         }
     }
 
@@ -133,7 +141,9 @@ impl RuleKind {
     pub fn prove_takes_clock(self) -> bool {
         match self {
             Self::RateLimit | Self::TimeWindow => true,
-            Self::Budget | Self::PerTx => false,
+            // `step_up` decides against the transaction's digest and sponsor, which Move reads from
+            // the transaction context rather than from an argument.
+            Self::Budget | Self::PerTx | Self::StepUp => false,
             // Pre-flight rules have no `prove` at all; the question does not arise, and `false` is
             // the answer that emits nothing extra if one ever reaches this path.
             Self::ProtocolScope
@@ -150,7 +160,9 @@ impl RuleKind {
     /// enforcement the chain does not perform; defaulting to pre-flight would hide one it does.
     pub fn enforcement(self) -> Enforcement {
         match self {
-            Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow => Enforcement::OnChain,
+            Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow | Self::StepUp => {
+                Enforcement::OnChain
+            }
             Self::ProtocolScope
             | Self::SlippageFloor
             | Self::AssetScope
@@ -193,8 +205,9 @@ impl RuleKind {
             Self::SlippageFloor => Some(Self::AssetScope),
             Self::AssetScope => Some(Self::RecipientAllowlist),
             Self::RecipientAllowlist => Some(Self::TimeWindow),
+            Self::TimeWindow => Some(Self::StepUp),
             // The last kind. Nothing follows it.
-            Self::TimeWindow => None,
+            Self::StepUp => None,
         }
     }
 
@@ -233,7 +246,7 @@ impl RuleKind {
     /// No wildcard arm, for the reason [`Self::enforcement`] has none.
     pub fn signer_tools(self) -> &'static [SignerTool] {
         match self {
-            Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow => &[],
+            Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow | Self::StepUp => &[],
             Self::ProtocolScope => &[SignerTool::Execute],
             Self::SlippageFloor => &[SignerTool::Swap],
             Self::AssetScope => &[SignerTool::Spend, SignerTool::Swap, SignerTool::Stake],
@@ -423,6 +436,9 @@ impl CapabilityManifest {
                 CapabilityRule::PerTx { max_mist } => {
                     u64_field(max_mist, "rules[per_tx].maxMist")?;
                 }
+                CapabilityRule::StepUp { threshold_mist } => {
+                    u64_field(threshold_mist, "rules[step_up].thresholdMist")?;
+                }
                 CapabilityRule::RateLimit {
                     window_ms,
                     max_mist,
@@ -477,7 +493,7 @@ impl CapabilityManifest {
 
 // ── Projection 1: on-chain rule parameters ────────────────────────────────────────────────────
 
-/// One rule's `add_rule` arguments. Only the four on-chain kinds appear; the pre-flight kinds are
+/// One rule's `add_rule` arguments. Only the on-chain kinds appear; the pre-flight kinds are
 /// deliberately absent rather than projected as no-ops, so a caller cannot mistake a decorative
 /// on-chain rule for an enforced one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,6 +546,11 @@ pub fn to_on_chain_rule_params(
                     ("notBeforeMs", u64_field(not_before_ms, "notBeforeMs")?),
                     ("notAfterMs", u64_field(not_after_ms, "notAfterMs")?),
                 ],
+            }),
+            CapabilityRule::StepUp { threshold_mist } => out.push(OnChainRuleParams {
+                module,
+                prove_takes_clock,
+                config: vec![("thresholdMist", u64_field(threshold_mist, "thresholdMist")?)],
             }),
             // Pre-flight kinds project nothing. See the module note.
             CapabilityRule::ProtocolScope { .. }
@@ -617,6 +638,9 @@ pub fn to_signer_policy(manifest: &CapabilityManifest) -> Result<SignerPolicy, M
                     not_after_ms: not_after_ms.clone(),
                 })
             }
+            // Held by the chain, and the signer reads the live threshold from there rather than
+            // from a copy that could be out of date by the time it signs.
+            CapabilityRule::StepUp { .. } => {}
         }
     }
     Ok(policy)
@@ -813,6 +837,17 @@ fn describe(rule: &CapabilityRule, coin_type: &str) -> (String, DeclarationCap) 
                 format!("Only coins: {value}"),
                 DeclarationCap {
                     label: "Allowed coins".into(),
+                    value,
+                    enforcement,
+                },
+            )
+        }
+        CapabilityRule::StepUp { threshold_mist } => {
+            let value = format_amount(threshold_mist, coin_type);
+            (
+                format!("Above {value} per transaction, the owner co-signs as gas sponsor"),
+                DeclarationCap {
+                    label: "Owner approval above".into(),
                     value,
                     enforcement,
                 },

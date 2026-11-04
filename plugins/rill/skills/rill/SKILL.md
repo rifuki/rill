@@ -87,6 +87,17 @@ signer that pauses, though, not the chain: anyone who can read the agent's keyst
 agent with a shell or the `rill-wallet` CLI, can sign without the pause, and is then
 bound only by the wallet's on-chain rules.
 
+An owner can instead attach the on-chain `step_up` rule to the wallet. `rill_actions` then shows
+`stepUpOnChain` as true, and `rill_wallet` shows the threshold under `stepUp`. A grant's own
+`stepUpAboveBaseUnits` still applies beside it, and the run pauses above whichever is lower. The
+steps above are the same, except that above the wallet's threshold the owner approves by signing
+the transaction itself as its gas sponsor: the owner pays that transaction's gas. Above the threshold
+the chain refuses any spend the owner did not sponsor, so this pause binds every key and every
+tool. `rill_spend`, `rill_swap` and `rill_stake` pay their own gas and are refused by the chain
+above it with `step_up` named as the rule: the owner must approve the transaction in Studio,
+so do not retry with them. `step_up_needs_owner_gas` means the builder did not make the owner the
+gas sponsor; nothing was signed, so report it.
+
 ## Pair the signer
 
 When Studio gives the user a pairing request, call `rill_pair { requestId }`. It signs a

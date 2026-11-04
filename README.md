@@ -117,9 +117,19 @@ approves those exact bytes there with their own wallet, within the five minutes 
 valid for, and the signer submits only after checking that signature against the wallet's current
 owner itself. The pause binds `rill_run_action` and `rill_run_workflow`, and the signer's own builds
 are already refused on a granted wallet. It is a signer check, not a chain rule: whoever can read
-the agent's key can sign without it, bounded only by the wallet's on-chain rules. A chain-enforced
-version is planned and needs a package upgrade; see
-`docs/plans/2026-11-04-owner-step-up-approval.md`.
+the agent's key can sign without it, bounded only by the wallet's on-chain rules.
+
+The chain-enforced version ships with agent_wallet v3 as the `step_up` rule, which the owner
+attaches like any other rule (a `step_up` entry with `thresholdMist` in the manifest, `rill wallet
+rules`, or "Owner approval on chain" in Studio). Above its threshold in one transaction the chain
+aborts the spend (`step_up` code 1) unless the wallet's owner is the transaction's gas sponsor, so
+the agent's key alone cannot land it on any path. The builder makes the owner the sponsor above the
+threshold, the signer pauses exactly as above, and the owner approves by signing the transaction
+itself as sponsor in Studio; the signer checks that signature over the exact bytes and submits it
+beside the agent's. Grants made after the rule is attached or removed include it; earlier ones are
+refused until the owner grants again. A testnet rehearsal of the upgrade points the server, the
+signer and `scripts/e2e.sh` at its own package with `AGENT_WALLET_PACKAGE_ID` and
+`AGENT_WALLET_VERSION_ID`.
 
 The wallet's owner creates, limits and funds the agent wallet from their own wallet. The agent's
 machine only ever holds the agent key, and the plugin starts the signer without the owner's two

@@ -8,8 +8,13 @@
 //! owner's signature is the approval.
 //!
 //! What it binds: the MCP path and a compromised builder. Whoever can read the agent's key can
-//! sign without asking the signer, bounded only by the wallet's on-chain rules. A chain-level
-//! variant, with the owner as co-signer, needs a package upgrade and is not built.
+//! sign without asking the signer, bounded only by the wallet's on-chain rules.
+//!
+//! Except on a wallet that carries the on-chain `step_up` rule. There, above the rule's threshold,
+//! the transaction is built with the owner as its gas sponsor and the request names them as
+//! `gasOwner`. The owner's approval is then their signature over the transaction itself, as
+//! sponsor, which the chain requires: the agent key alone cannot land it, through this server or
+//! around it. The relay checks that signature here the way it checks the text-signed kind.
 
 use axum::{
     body::Bytes,
@@ -94,6 +99,9 @@ pub async fn check_request(
     {
         return Err("the transaction digest does not match the transaction's bytes".into());
     }
+    if !same_address(&decoded.sender, &approval.agent) {
+        return Err("the transaction is not sent by the agent the request names".into());
+    }
     if decoded.requested_spend_base_units.map(|n| n.to_string())
         != Some(approval.spend_base_units.clone())
     {
@@ -118,6 +126,7 @@ pub async fn check_request(
     if !same_address(&wallet_agent, &approval.agent) {
         return Err("the wallet does not name this agent".into());
     }
+    check_sponsorship(&approval, &decoded, chain).await?;
     let granted = stored.iter().any(|signed| {
         let grant = &signed.grant;
         grant.action_id == approval.action_id
@@ -145,8 +154,64 @@ pub async fn check_request(
     }
 }
 
+/// The gas payer the request names against the one the bytes carry and the chain requires.
+///
+/// A sponsored request is one the owner signs as gas sponsor, so its bytes must name the wallet's
+/// current owner as gas owner, use no gas coin anywhere, stay inside the budget an owner is asked
+/// to pay, and be above the wallet's on-chain step_up threshold, which is the only reason to ask.
+/// A request that names no sponsor must not carry sponsored bytes: its approval would be a text
+/// signature that no node accepts in the sponsor's place.
+async fn check_sponsorship(
+    approval: &StepUpApproval,
+    decoded: &rill_policy::decode::Decoded,
+    chain: &impl SuiRead,
+) -> Result<(), String> {
+    let Some(gas_owner) = approval.gas_owner.as_deref() else {
+        if decoded.is_sponsored() {
+            return Err(
+                "the transaction's gas is paid by someone other than the agent, and the request \
+                 does not name a sponsor"
+                    .into(),
+            );
+        }
+        return Ok(());
+    };
+    if !same_address(&decoded.gas_owner, gas_owner) {
+        return Err(format!(
+            "the transaction's gas is paid by {}, not by the sponsor {gas_owner} the request names",
+            decoded.gas_owner
+        ));
+    }
+    let owner = wallet_field(chain, &approval.wallet_id, "owner").await?;
+    if !same_address(&owner, gas_owner) {
+        return Err("the sponsor the request names is not the wallet's owner".into());
+    }
+    if decoded.gas_budget > rill_ptb::sponsor::MAX_SPONSORED_GAS_BUDGET_MIST {
+        return Err(format!(
+            "a gas budget of {} is above the {} an owner is asked to sponsor",
+            decoded.gas_budget,
+            rill_ptb::sponsor::MAX_SPONSORED_GAS_BUDGET_MIST
+        ));
+    }
+    rill_policy::decode::check_command_kinds(decoded).map_err(|e| e.to_string())?;
+    let threshold = rill_ptb::policy_read::read_step_up_threshold(chain, &approval.wallet_id)
+        .await?
+        .ok_or(
+            "the wallet does not carry the on-chain step_up rule, so the owner need not sponsor",
+        )?;
+    let spend = decoded.requested_spend_base_units.unwrap_or(u64::MAX);
+    if spend <= threshold {
+        return Err(format!(
+            "a spend of {spend} is within the wallet's step_up threshold of {threshold}, so the \
+             owner need not sponsor it"
+        ));
+    }
+    Ok(())
+}
+
 /// Store the owner's signature on request `id`, only when it is the wallet owner's over this
-/// approval's text. A refusal leaves the request as it was, so the owner sees the reason while
+/// approval: over its text for the signer-only kind, over the transaction itself as gas sponsor
+/// for a sponsored one. A refusal leaves the request as it was, so the owner sees the reason while
 /// still on the page that can try again.
 pub async fn approve(
     store: &StepUpStore,
@@ -171,15 +236,30 @@ pub async fn approve(
     let owner = wallet_field(chain, &entry.approval.wallet_id, "owner")
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    match chain
-        .verify_personal_message(entry.approval.message().as_bytes(), signature, &owner)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("the node could not verify the signature: {e}"),
-            )
-        })? {
+    let check = match entry.approval.gas_owner.as_deref() {
+        Some(gas_owner) => {
+            if !same_address(gas_owner, &owner) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "the wallet's owner changed since this request named its sponsor".into(),
+                ));
+            }
+            chain
+                .verify_transaction_signature(&entry.unsigned_ptb, signature, &owner)
+                .await
+        }
+        None => {
+            chain
+                .verify_personal_message(entry.approval.message().as_bytes(), signature, &owner)
+                .await
+        }
+    };
+    match check.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("the node could not verify the signature: {e}"),
+        )
+    })? {
         SignatureCheck::Valid => {}
         SignatureCheck::Invalid(why) => {
             return Err((

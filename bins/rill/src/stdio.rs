@@ -1816,6 +1816,13 @@ fn action_entry((signed, verdict): &CheckedGrant) -> Value {
         "maxPerTransactionBaseUnits": grant.run_set.get("maxAmountBaseUnits"),
         // So an agent knows ahead of a run which ones will pause for the owner.
         "stepUpAboveBaseUnits": grant.run_set.get(rill_core::grant::STEP_UP_KEY),
+        // When true the wallet's on-chain step_up threshold also pauses a run, at whichever of the
+        // two is lower, and above the chain's the owner signs the transaction as its gas sponsor.
+        // Read from the grant's manifest rather than the chain, so listing actions costs no extra
+        // read; rill_wallet reads the threshold itself.
+        "stepUpOnChain": grant.run_set["capabilityManifest"]["rules"]
+            .as_array()
+            .is_some_and(|rules| rules.iter().any(|rule| rule["kind"] == "step_up")),
         "usable": verdict.is_ok(),
     });
     match verdict {
@@ -2134,17 +2141,43 @@ fn run_action_for_owner(
         }
     };
 
-    let step_up = match verified.run_set.step_up_threshold() {
-        Ok(Some(threshold)) => StepUp::Gate {
-            threshold,
-            grant: crate::step_up::StepUpGrant {
-                action_name: verified.grant.action_name.clone(),
-                revision: verified.grant.revision,
-                digest: verified.grant.digest(),
-            },
-        },
-        Ok(None) => StepUp::None,
-        Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
+    let step_up_grant = crate::step_up::StepUpGrant {
+        action_name: verified.grant.action_name.clone(),
+        revision: verified.grant.revision,
+        digest: verified.grant.digest(),
+    };
+    // A grant that names the on-chain rule also pauses at the chain's threshold, with the owner as
+    // the sponsor above it. One that does not keeps the signer-only threshold, and nothing more is
+    // read for it.
+    let on_chain = if crate::step_up::names_on_chain_rule(&verified.run_set.capability_manifest) {
+        let endpoint = endpoint(context);
+        block_on(async {
+            let chain = rill_chain::grpc::GrpcSui::new(&endpoint).map_err(|e| e.to_string())?;
+            crate::step_up::on_chain_threshold(
+                &chain,
+                &verified.run_set.capability_manifest,
+                &verified.grant.wallet_id,
+            )
+            .await
+        })
+    } else {
+        Ok(Ok(None))
+    };
+    let step_up = match on_chain {
+        Ok(Ok(on_chain)) => {
+            match step_up_gate(&verified.run_set, on_chain, &verified.owner, step_up_grant) {
+                Ok(step_up) => step_up,
+                Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
+            }
+        }
+        Ok(Err(why)) | Err(why) => {
+            let reason = format!(
+                "The owner's grant names the on-chain step-up rule, and the wallet's threshold \
+                 could not be read ({why}). Nothing was signed or submitted."
+            );
+            context.last_rejection = Some(reason.clone());
+            return tool_error(id, "step_up_unavailable", &reason);
+        }
     };
 
     // The owner-signed run set stands in for a file for this one call, then the signer's own
@@ -2170,6 +2203,34 @@ fn run_action_for_owner(
         );
     }
     with_grant(response, &verified)
+}
+
+/// The step-up gate one granted run goes through, from the run set's threshold and the wallet's
+/// on-chain one when the grant names the rule.
+///
+/// Both bind, and neither replaces the other. The run set's threshold is the owner's own word, in
+/// the grant they signed, about where they want to be asked; the chain's is where the chain aborts
+/// without them. So the run pauses at the lower of the two, and the owner pays the gas only above
+/// the chain's, the one place the chain requires it. Between them the pause is the signer-only
+/// kind, as it is on a wallet without the rule.
+fn step_up_gate(
+    run_set: &RunSet,
+    on_chain: Option<u64>,
+    owner: &str,
+    grant: crate::step_up::StepUpGrant,
+) -> Result<StepUp, crate::runset::RunSetError> {
+    let own = run_set.step_up_threshold()?;
+    let Some(threshold) = own.into_iter().chain(on_chain).min() else {
+        return Ok(StepUp::None);
+    };
+    Ok(StepUp::Gate {
+        threshold,
+        grant,
+        on_chain: on_chain.map(|threshold| OnChainStepUp {
+            owner: owner.to_owned(),
+            threshold,
+        }),
+    })
 }
 
 /// The grant a run used, added to its answer so the agent can report which approval it ran under.
@@ -2422,6 +2483,7 @@ fn continue_step_up(
         crate::step_up::verify_owner_approval(
             &chain,
             &pending.approval,
+            pending.envelope["unsignedPtb"].as_str().unwrap_or_default(),
             &owner_signature,
             current_digest.as_deref(),
         )
@@ -2458,6 +2520,10 @@ fn continue_step_up(
         EnvelopeSource::Grant,
         StepUp::Approved {
             pinned_digest: pending.approval.pinned_digest.clone(),
+            sponsor_signature: pending
+                .approval
+                .is_sponsored()
+                .then(|| owner_signature.clone()),
         },
     );
     context.run_set = saved;
@@ -2590,11 +2656,29 @@ enum StepUp {
     None,
     /// Above `threshold` base units, pause for the owner instead of signing.
     Gate {
+        /// The lower of the run set's threshold and the on-chain one, where the pause starts.
         threshold: u64,
         grant: crate::step_up::StepUpGrant,
+        /// The wallet's on-chain `step_up` rule, when the grant names it.
+        on_chain: Option<OnChainStepUp>,
     },
     /// The owner approved exactly the bytes with this pinned digest, and the signer checked it.
-    Approved { pinned_digest: String },
+    Approved {
+        pinned_digest: String,
+        /// The owner's signature as gas sponsor, submitted beside the agent's, for a sponsored
+        /// approval. `None` for the signer-only kind, which the agent's signature alone submits.
+        sponsor_signature: Option<String>,
+    },
+}
+
+/// The wallet's on-chain `step_up` rule as one run meets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OnChainStepUp {
+    /// The wallet's owner. Above `threshold` the bytes must name them as gas sponsor, because the
+    /// chain aborts anything else, and the owner approves by signing the transaction as sponsor.
+    owner: String,
+    /// The rule's threshold as the chain holds it now.
+    threshold: u64,
 }
 
 /// Said beside every step-up pause, so the agent knows what the owner has to do and what it may
@@ -2737,9 +2821,23 @@ fn execute(
 
     // The owner's step-up gate. After the bytes are pinned, so the amount compared is the one the
     // signature would cover, and before the key or a node is touched, so a pause signs nothing.
+    let same_address = |a: &str, b: &str| {
+        a.parse::<sui_sdk_types::Address>().ok() == b.parse::<sui_sdk_types::Address>().ok()
+    };
     match &step_up {
         StepUp::None => {}
-        StepUp::Approved { pinned_digest } => {
+        StepUp::Approved {
+            pinned_digest,
+            sponsor_signature,
+        } => {
+            if sponsor_signature.is_some() != pinned.decoded().is_sponsored() {
+                let reason = "The owner's approval and these bytes disagree about who pays the \
+                              gas: a sponsor's signature goes only with bytes the sponsor pays \
+                              for. The node would reject the pair, so nothing was signed."
+                    .to_string();
+                context.last_rejection = Some(reason.clone());
+                return tool_error(id, "step_up_sponsor_mismatch", &reason);
+            }
             if *pinned_digest != digest {
                 let reason = format!(
                     "The owner approved the transaction pinned as {pinned_digest}, and these bytes \
@@ -2750,7 +2848,11 @@ fn execute(
                 return tool_error(id, "step_up_digest_mismatch", &reason);
             }
         }
-        StepUp::Gate { threshold, grant } => {
+        StepUp::Gate {
+            threshold,
+            grant,
+            on_chain,
+        } => {
             // The declared spend is the builder's word about the bytes; the bytes are the bytes.
             // The larger is compared, so a builder that understates the spend still meets the
             // gate.
@@ -2764,7 +2866,43 @@ fn execute(
                 return tool_error(id, "step_up_amount_unreadable", &reason);
             };
             let spend = pinned.spend_base_units().max(requested);
+            let decoded = pinned.decoded();
+            // The owner signs as sponsor only above the chain's threshold. Under it an owner who
+            // approves signs the text, and sponsored bytes would wait for a signature never asked
+            // for.
+            let sponsor = on_chain
+                .as_ref()
+                .filter(|rule| spend > rule.threshold)
+                .map(|rule| rule.owner.clone());
+            if let Some(rule) = on_chain.as_ref().filter(|_| sponsor.is_none()) {
+                if decoded.is_sponsored() {
+                    let reason = format!(
+                        "This transaction spends {spend}, within the wallet's on-chain step-up \
+                         threshold of {}, and its gas is paid by {}: the owner has nothing to sign \
+                         as sponsor, so no sponsor's signature will come and the node would reject \
+                         it. Nothing was signed. Build the action again.",
+                        rule.threshold, decoded.gas_owner
+                    );
+                    context.last_rejection = Some(reason.clone());
+                    return tool_error(id, "step_up_unexpected_sponsor", &reason);
+                }
+            }
             if spend > *threshold {
+                if let (Some(owner), Some(rule)) = (&sponsor, on_chain) {
+                    if !same_address(&decoded.gas_owner, owner) {
+                        let reason = format!(
+                            "This transaction spends {spend}, above the wallet's on-chain step-up \
+                             threshold of {}, so the chain aborts it unless the wallet's owner \
+                             {owner} pays its gas, and its gas is paid by {}. Nothing was signed, \
+                             and the owner was not asked. The builder must make the owner the gas \
+                             sponsor; build the action again.",
+                            rule.threshold, decoded.gas_owner
+                        );
+                        context.last_rejection = Some(reason.clone());
+                        return tool_error(id, "step_up_needs_owner_gas", &reason);
+                    }
+                }
+                let gas_budget = decoded.gas_budget;
                 let envelope = pinned.envelope();
                 let (Some(expires_at_ms), Ok(transaction_digest)) = (
                     rill_policy::parse_rfc3339_ms(&envelope.expires_at),
@@ -2791,22 +2929,27 @@ fn execute(
                     threshold_base_units: threshold.to_string(),
                     coin_type,
                     expires_at_ms: expires_at_ms.to_string(),
+                    gas_owner: sponsor.clone(),
                 };
-                return tool_ok(
-                    id,
-                    json!({
-                        "code": "step_up_required",
-                        "status": "pending_owner_approval",
-                        "submitted": false,
-                        "pinnedDigest": digest,
-                        "transactionDigest": transaction_digest,
-                        "spendBaseUnits": spend.to_string(),
-                        "thresholdBaseUnits": threshold.to_string(),
-                        "expiresAtMs": expires_at_ms.to_string(),
-                        "approval": approval,
-                        "note": STEP_UP_NOTE,
-                    }),
-                );
+                let mut paused = json!({
+                    "code": "step_up_required",
+                    "status": "pending_owner_approval",
+                    "submitted": false,
+                    "pinnedDigest": digest,
+                    "transactionDigest": transaction_digest,
+                    "spendBaseUnits": spend.to_string(),
+                    "thresholdBaseUnits": threshold.to_string(),
+                    "expiresAtMs": expires_at_ms.to_string(),
+                    "approval": approval,
+                    "sponsored": sponsor.is_some(),
+                    "note": STEP_UP_NOTE,
+                });
+                if let Some(owner) = sponsor {
+                    // What the owner pays at most, said before they are asked to.
+                    paused["gasOwner"] = json!(owner);
+                    paused["gasBudgetBaseUnits"] = json!(gas_budget.to_string());
+                }
+                return tool_ok(id, paused);
             }
         }
     }
@@ -2852,13 +2995,20 @@ fn execute(
             .sign(&transaction)
             .map_err(|e| Failed::Signing(e.to_string()))?;
 
-        let outcome = rill_chain::SuiWrite::execute(
-            &chain,
-            simulated.signable_bytes(),
-            &[signature.to_base64()],
-        )
-        .await
-        .map_err(|e| Failed::Submit(e.to_string()))?;
+        // The sender's signature, then the owner's as gas sponsor when the owner approved this
+        // transaction under the on-chain rule. The node checks each against its own role.
+        let mut signatures = vec![signature.to_base64()];
+        if let StepUp::Approved {
+            sponsor_signature: Some(sponsor),
+            ..
+        } = &step_up
+        {
+            signatures.push(sponsor.clone());
+        }
+        let outcome =
+            rill_chain::SuiWrite::execute(&chain, simulated.signable_bytes(), &signatures)
+                .await
+                .map_err(|e| Failed::Submit(e.to_string()))?;
 
         Ok::<_, Failed>((
             outcome,
@@ -3468,6 +3618,12 @@ mod execution_tests {
     /// `request_spend(wallet, cap, version, amount, clock)`. The wallet stands in for the other
     /// objects so the run set's object scope stays the one object it already allows.
     fn ptb_requesting(amount: u64) -> String {
+        ptb_requesting_paid_by(amount, WALLET)
+    }
+
+    /// The same transaction, its gas paid by `gas_owner`: the owner, when the on-chain rule needs
+    /// them as sponsor.
+    fn ptb_requesting_paid_by(amount: u64, gas_owner: &str) -> String {
         use sui_sdk_types::{Address, Digest, Identifier};
         use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 
@@ -3492,9 +3648,10 @@ mod execution_tests {
             ),
             vec![wallet, wallet, wallet, amount, wallet],
         );
+        let mut built = tx.try_build().unwrap();
+        built.gas_payment.owner = gas_owner.parse().unwrap();
         use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD
-            .encode(bcs::to_bytes(&tx.try_build().unwrap()).unwrap())
+        base64::engine::general_purpose::STANDARD.encode(bcs::to_bytes(&built).unwrap())
     }
 
     /// An envelope carrying `ptb` and declaring `declared` as its spend.
@@ -3539,7 +3696,232 @@ mod execution_tests {
         StepUp::Gate {
             threshold,
             grant: granted(),
+            on_chain: None,
         }
+    }
+
+    /// The wallet's owner in these tests, who sponsors above the on-chain threshold.
+    const OWNER: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+
+    /// The gate a wallet carrying the on-chain rule gets when the grant has no threshold of its
+    /// own: the chain's threshold, and its owner as the sponsor above it.
+    fn on_chain_gate(threshold: u64) -> StepUp {
+        StepUp::Gate {
+            threshold,
+            grant: granted(),
+            on_chain: Some(OnChainStepUp {
+                owner: OWNER.into(),
+                threshold,
+            }),
+        }
+    }
+
+    /// The run set of a grant made for a wallet with the on-chain rule, and no signer-only
+    /// threshold of its own.
+    fn on_chain_context() -> WalletContext {
+        let mut ctx = context_with_run_set();
+        ctx.rpc_url = Some(CLOSED.into());
+        ctx.api_url = Some(CLOSED.into());
+        ctx
+    }
+
+    #[test]
+    fn the_on_chain_gate_pauses_above_its_threshold_for_the_owner_as_sponsor() {
+        let mut ctx = on_chain_context();
+        let ptb = ptb_requesting_paid_by(20, OWNER);
+        let out = run(&mut ctx, envelope_for(&ptb, "20"), on_chain_gate(10));
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["sponsored"], true, "{out}");
+        assert_eq!(structured["gasOwner"], OWNER, "{out}");
+        assert_eq!(structured["gasBudgetBaseUnits"], "50000000", "{out}");
+        let approval: rill_core::step_up::StepUpApproval =
+            serde_json::from_value(structured["approval"].clone()).unwrap();
+        assert_eq!(approval.gas_owner.as_deref(), Some(OWNER));
+        assert_eq!(approval.threshold_base_units, "10");
+        assert!(ctx.submitted.is_empty());
+
+        // Above the threshold with the agent paying: the chain would abort it, so nothing is
+        // signed and the owner is not asked to approve bytes they could not sponsor.
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting(20), "20"),
+            on_chain_gate(10),
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_needs_owner_gas",
+            "{out}"
+        );
+
+        // A sponsor other than the owner is no sponsor at all for the rule.
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting_paid_by(20, PKG), "20"),
+            on_chain_gate(10),
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_needs_owner_gas",
+            "{out}"
+        );
+
+        // Within the threshold the owner has nothing to sign, so sponsored bytes cannot land.
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting_paid_by(5, OWNER), "5"),
+            on_chain_gate(10),
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_unexpected_sponsor",
+            "{out}"
+        );
+
+        // Within it and paid by the agent, the run goes on as before.
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting(5), "5"),
+            on_chain_gate(10),
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "chain_unavailable",
+            "{out}"
+        );
+        assert!(ctx.submitted.is_empty());
+    }
+
+    /// A grant can carry both thresholds: the owner's own `stepUpAboveBaseUnits` and the on-chain
+    /// rule's. Neither replaces the other. The run pauses at the lower one, so the owner is asked
+    /// wherever they said to be asked; only above the chain's threshold must the owner pay the gas,
+    /// because only there does the chain abort without them.
+    #[test]
+    fn a_grant_with_both_thresholds_pauses_at_the_lower_and_sponsors_only_above_the_chains() {
+        let both = |ctx: &WalletContext| {
+            step_up_gate(ctx.run_set.as_ref().unwrap(), Some(30), OWNER, granted()).unwrap()
+        };
+
+        // Between the two: the owner's own threshold pauses it, as the signer-only kind, with the
+        // agent paying the gas the chain still accepts from it.
+        let mut ctx = stepped_context("10");
+        let step_up = both(&ctx);
+        let out = run(&mut ctx, envelope_for(&ptb_requesting(20), "20"), step_up);
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["sponsored"], false, "{out}");
+        assert_eq!(structured["thresholdBaseUnits"], "10", "{out}");
+        assert!(structured.get("gasOwner").is_none(), "{out}");
+        let approval: rill_core::step_up::StepUpApproval =
+            serde_json::from_value(structured["approval"].clone()).unwrap();
+        assert_eq!(approval.gas_owner, None);
+        assert!(ctx.submitted.is_empty(), "nothing was signed or submitted");
+
+        // Owner-sponsored bytes between the two have no sponsor's signature coming.
+        let mut ctx = stepped_context("10");
+        let step_up = both(&ctx);
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting_paid_by(20, OWNER), "20"),
+            step_up,
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_unexpected_sponsor",
+            "{out}"
+        );
+
+        // Above both: the owner approves as gas sponsor, and bytes the agent pays for are refused.
+        let mut ctx = stepped_context("10");
+        let step_up = both(&ctx);
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting_paid_by(40, OWNER), "40"),
+            step_up,
+        );
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["sponsored"], true, "{out}");
+        assert_eq!(structured["gasOwner"], OWNER, "{out}");
+        let mut ctx = stepped_context("10");
+        let step_up = both(&ctx);
+        let out = run(&mut ctx, envelope_for(&ptb_requesting(40), "40"), step_up);
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_needs_owner_gas",
+            "{out}"
+        );
+
+        // At or under both, the gate stays out of the way and the run goes on to simulate.
+        let mut ctx = stepped_context("10");
+        let step_up = both(&ctx);
+        let out = run(&mut ctx, envelope_for(&ptb_requesting(10), "10"), step_up);
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "chain_unavailable",
+            "{out}"
+        );
+
+        // An on-chain threshold below the owner's own is the lower one, and it pauses as sponsor.
+        let mut ctx = stepped_context("50");
+        let step_up = both(&ctx);
+        let out = run(
+            &mut ctx,
+            envelope_for(&ptb_requesting_paid_by(40, OWNER), "40"),
+            step_up,
+        );
+        let structured = &out["result"]["structuredContent"];
+        assert_eq!(structured["code"], "step_up_required", "{out}");
+        assert_eq!(structured["sponsored"], true, "{out}");
+        assert_eq!(structured["thresholdBaseUnits"], "30", "{out}");
+
+        // Without an on-chain threshold the run set's alone decides, exactly as before the rule.
+        let ctx = stepped_context("10");
+        assert_eq!(
+            step_up_gate(ctx.run_set.as_ref().unwrap(), None, OWNER, granted()).unwrap(),
+            gate(10)
+        );
+    }
+
+    /// The owner's sponsor signature goes with sponsored bytes only. Submitting one without the
+    /// other is a transaction the node rejects, so it is refused before anything is signed.
+    #[test]
+    fn an_approved_run_carries_the_sponsor_signature_only_for_sponsored_bytes() {
+        let mut ctx = on_chain_context();
+        let plain = ptb_requesting(20);
+        let out = run(
+            &mut ctx,
+            envelope_for(&plain, "20"),
+            StepUp::Approved {
+                pinned_digest: rill_core::envelope::digest_unsigned_ptb(&plain),
+                sponsor_signature: Some("owner-signature".into()),
+            },
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_sponsor_mismatch",
+            "{out}"
+        );
+
+        let paid = ptb_requesting_paid_by(20, OWNER);
+        let out = run(
+            &mut ctx,
+            envelope_for(&paid, "20"),
+            StepUp::Approved {
+                pinned_digest: rill_core::envelope::digest_unsigned_ptb(&paid),
+                sponsor_signature: None,
+            },
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "step_up_sponsor_mismatch",
+            "{out}"
+        );
+
+        let out = run(
+            &mut ctx,
+            envelope_for(&paid, "20"),
+            StepUp::Approved {
+                pinned_digest: rill_core::envelope::digest_unsigned_ptb(&paid),
+                sponsor_signature: Some("owner-signature".into()),
+            },
+        );
+        assert_eq!(
+            out["result"]["structuredContent"]["code"], "chain_unavailable",
+            "{out}"
+        );
+        assert!(ctx.submitted.is_empty());
     }
 
     #[test]
@@ -3611,6 +3993,7 @@ mod execution_tests {
             envelope_for(&ptb_requesting(20), "20"),
             StepUp::Approved {
                 pinned_digest: "00".repeat(32),
+                sponsor_signature: None,
             },
         );
         assert_eq!(
@@ -3626,6 +4009,7 @@ mod execution_tests {
             envelope_for(&ptb, "20"),
             StepUp::Approved {
                 pinned_digest: rill_core::envelope::digest_unsigned_ptb(&ptb),
+                sponsor_signature: None,
             },
         );
         assert_eq!(
@@ -4026,6 +4410,20 @@ mod grant_floor_tests {
         let ok = action_entry(&usable(4));
         assert_eq!(ok["usable"], true);
         assert!(ok.get("refusalCode").is_none());
+    }
+
+    /// An agent learns before a run that above the chain's threshold the owner co-signs, so a
+    /// pause there is expected rather than a failure to work around.
+    #[test]
+    fn rill_actions_says_when_the_grant_names_the_on_chain_step_up_rule() {
+        assert_eq!(action_entry(&usable(4))["stepUpOnChain"], false);
+        let (mut signed, _) = usable(5);
+        signed.grant.run_set["capabilityManifest"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind": "step_up", "thresholdMist": "30"}));
+        let entry = action_entry(&(signed, Err(Refusal::Expired)));
+        assert_eq!(entry["stepUpOnChain"], true, "{entry}");
     }
 
     #[test]

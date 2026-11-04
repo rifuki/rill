@@ -185,6 +185,23 @@ pub async fn read_limits_from(
         report.extend(labels);
     }
     report.insert("recipientAllowlist".into(), recipient_allowlist);
+    // Said on its own as well as under the rule, because it changes what an agent should expect
+    // from a run rather than what a run may spend: above it the owner co-signs.
+    let step_up = configs.iter().find_map(|(_, config)| match config {
+        RuleConfig::StepUp { threshold } => Some(*threshold),
+        _ => None,
+    });
+    report.insert(
+        "stepUp".into(),
+        match step_up {
+            Some(threshold) => json!({
+                "enforcement": Enforcement::OnChain.as_str(),
+                "thresholdBaseUnits": threshold.to_string(),
+                "note": STEP_UP_NOTE,
+            }),
+            None => Value::Null,
+        },
+    );
 
     match facts {
         Ok(facts) => {
@@ -372,8 +389,18 @@ fn limits_of(config: &RuleConfig) -> Value {
             "notBeforeMs": not_before_ms.to_string(),
             "notAfterMs": not_after_ms.to_string(),
         }),
+        RuleConfig::StepUp { threshold } => json!({
+            "ownerApprovalAboveBaseUnits": threshold.to_string(),
+        }),
     }
 }
+
+/// What the on-chain step-up threshold means for an agent, said where the threshold is reported.
+const STEP_UP_NOTE: &str = "Above this amount in one transaction, the chain aborts the spend \
+    unless the wallet's owner pays its gas, which only the owner can sign for. rill_run_action \
+    pauses there and hands the owner an approval link; rill_spend, rill_swap and rill_stake have \
+    no such pause and are refused by the chain above it. It is not a ceiling: with the owner's \
+    approval the spend goes through, up to largestSpendNow.";
 
 /// Which layer holds what, stated once, in the read every agent makes before it spends.
 const NOTE: &str = "Start with `largestSpendNow`: it is the biggest single spend this wallet \
@@ -545,6 +572,48 @@ mod assembly_tests {
         assert_eq!(out["largestSpendNow"]["baseUnits"], "50000000");
         assert_eq!(out["largestSpendNow"]["boundBy"], "per_tx");
         assert_eq!(out["largestSpendNow"]["certain"], true);
+    }
+
+    /// The owner's on-chain step-up threshold is reported beside the rules, held on chain. It is
+    /// not a ceiling: above it the owner co-signs, so the largest spend the agent can make alone
+    /// stays the tightest real limit, and the threshold says where the owner comes in.
+    #[test]
+    fn the_on_chain_step_up_threshold_is_reported() {
+        let chain = node(Some(3), &["budget", "step_up"])
+            .with_dynamic_field(
+                POLICY,
+                config_field(
+                    "budget",
+                    json!({ "total_mist": "200000000", "spent": "51000000" }),
+                ),
+            )
+            .with_dynamic_field(
+                POLICY,
+                config_field(
+                    "step_up",
+                    json!({ "threshold": "30000000", "tx_digest": [], "spent_in_tx": "0" }),
+                ),
+            );
+        let out = run(&chain, None).expect("the read assembles");
+        let rule = out["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["module"] == "step_up")
+            .unwrap_or_else(|| panic!("the step_up rule is labelled, not unrecognised: {out}"));
+        assert_eq!(rule["enforcement"], "on-chain");
+        assert_eq!(rule["limits"]["ownerApprovalAboveBaseUnits"], "30000000");
+        assert_eq!(out["stepUp"]["thresholdBaseUnits"], "30000000", "{out}");
+        assert_eq!(out["stepUp"]["enforcement"], "on-chain");
+        assert_eq!(out["unrecognisedRules"], json!([]));
+        assert_eq!(out["largestSpendNow"]["baseUnits"], "149000000");
+        assert_eq!(out["largestSpendNow"]["certain"], true);
+
+        let plain = node(Some(3), &["budget"]).with_dynamic_field(
+            POLICY,
+            config_field("budget", json!({ "total_mist": "200000000", "spent": "0" })),
+        );
+        assert_eq!(run(&plain, None).unwrap()["stepUp"], Value::Null);
     }
 
     /// A read the node answered without fields says the limits are unavailable rather than omitting

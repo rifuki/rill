@@ -201,7 +201,7 @@ fn an_amount_that_is_not_a_u64_string_is_refused() {
 /// Every kind, written out. The producer keeps no list of its own on purpose; this one exists so
 /// that a kind added to the enum is a kind these tests exercise, and the lookup under test refuses
 /// to compile until it has an arm for it anyway.
-const EVERY_KIND: [RuleKind; 8] = [
+const EVERY_KIND: [RuleKind; 9] = [
     RuleKind::Budget,
     RuleKind::PerTx,
     RuleKind::RateLimit,
@@ -210,6 +210,7 @@ const EVERY_KIND: [RuleKind; 8] = [
     RuleKind::AssetScope,
     RuleKind::RecipientAllowlist,
     RuleKind::TimeWindow,
+    RuleKind::StepUp,
 ];
 
 #[test]
@@ -249,7 +250,7 @@ fn a_module_name_no_kind_claims_maps_to_no_kind_rather_than_a_guess() {
 /// wallet read uses in place of the constant it used to emit.
 #[test]
 fn a_module_name_read_off_chain_labels_as_the_layer_the_producer_computes() {
-    for module in ["budget", "per_tx", "rate_limit", "time_window"] {
+    for module in ["budget", "per_tx", "rate_limit", "time_window", "step_up"] {
         assert_eq!(
             RuleKind::from_module(module).unwrap().enforcement(),
             Enforcement::OnChain,
@@ -352,4 +353,51 @@ fn an_unknown_coin_type_is_reported_honestly() {
     };
     let d = to_declaration(&manifest).unwrap();
     assert_eq!(d.caps[0].value, "12345 base units of 0xabc::mystery::COIN");
+}
+
+/// The step-up rule is held by Move, takes no clock, and projects its threshold as `step_up::add`
+/// takes it, so a setup or `rill wallet rules` attaches it like every other on-chain rule.
+#[test]
+fn a_step_up_rule_is_on_chain_and_projects_its_threshold() {
+    let manifest: CapabilityManifest = serde_json::from_value(serde_json::json!({
+        "walletCoinType": "0x2::sui::SUI",
+        "rules": [
+            { "kind": "budget", "totalMist": "1000000000" },
+            { "kind": "step_up", "thresholdMist": "100000000" },
+        ],
+    }))
+    .unwrap();
+    let kind = RuleKind::StepUp;
+    assert_eq!(kind.module(), "step_up");
+    assert_eq!(kind.enforcement(), Enforcement::OnChain);
+    assert!(!kind.prove_takes_clock());
+    assert!(kind.signer_tools().is_empty());
+    assert_eq!(RuleKind::from_module("step_up"), Some(kind));
+
+    let params = to_on_chain_rule_params(&manifest).unwrap();
+    assert_eq!(params[1].module, "step_up");
+    assert_eq!(params[1].config, vec![("thresholdMist", 100_000_000)]);
+
+    let declaration = to_declaration(&manifest).unwrap();
+    assert_eq!(
+        declaration.summary_lines[1],
+        "Above 0.1 SUI per transaction, the owner co-signs as gas sponsor"
+    );
+    assert_eq!(declaration.caps[1].enforcement, Enforcement::OnChain);
+    assert_eq!(declaration.caps[1].value, "0.1 SUI");
+
+    // Held on chain, so the flat pre-check has nothing to carry for it.
+    assert_eq!(
+        serde_json::to_value(to_signer_policy(&manifest).unwrap()).unwrap(),
+        serde_json::json!({ "maxAmountMist": "1000000000" })
+    );
+
+    let mut bad = manifest.clone();
+    bad.rules[1] = CapabilityRule::StepUp {
+        threshold_mist: "0.5".into(),
+    };
+    assert!(matches!(
+        bad.validate(),
+        Err(ManifestError::BadAmount { .. })
+    ));
 }

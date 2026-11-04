@@ -482,6 +482,47 @@ struct Binding {
     protection: Option<ProtectedSwapInput>,
 }
 
+/// Make a grant's manifest name the on-chain step_up rule exactly as the wallet carries it now.
+///
+/// The owner can attach or change the rule on an existing wallet without publishing again, and
+/// the published manifest does not know. A grant that left it out would build without its prove
+/// call, and every run would abort for the missing receipt; one that named an old threshold would
+/// tell the agent the wrong place to expect a pause. So the chain's answer replaces the manifest's,
+/// and a manifest naming a rule the wallet does not carry is refused, since its prove would abort.
+async fn reconcile_step_up(
+    manifest: &mut CapabilityManifest,
+    chain: &impl SuiRead,
+    wallet_id: Address,
+) -> Result<(), String> {
+    let named = manifest
+        .rules
+        .iter()
+        .any(|rule| matches!(rule, CapabilityRule::StepUp { .. }));
+    match rill_ptb::policy_read::read_step_up_threshold(chain, &wallet_id.to_string()).await {
+        Ok(Some(threshold)) => {
+            manifest
+                .rules
+                .retain(|rule| !matches!(rule, CapabilityRule::StepUp { .. }));
+            manifest.rules.push(CapabilityRule::StepUp {
+                threshold_mist: threshold.to_string(),
+            });
+            Ok(())
+        }
+        Ok(None) if named => Err(
+            "the published action names the on-chain step_up rule, and this wallet does not carry \
+             it; attach it to the wallet before granting"
+                .into(),
+        ),
+        Ok(None) => Ok(()),
+        Err(why) if named => Err(format!(
+            "the wallet's step_up rule could not be read, so the grant would not match it: {why}"
+        )),
+        // A grant that does not name the rule goes on as it did before the rule existed. If the
+        // wallet does carry it, its runs abort on chain for the missing receipt, which is closed.
+        Err(_) => Ok(()),
+    }
+}
+
 /// `fresh` is onboarding: the wallet must still be empty with no rules, because the next step funds
 /// it. Otherwise the wallet must already carry rules, because a grant runs inside them.
 async fn bind(
@@ -560,6 +601,8 @@ async fn bind(
         return Err(
             "wallet has no rules attached yet; finish onboarding before granting an action".into(),
         );
+    } else {
+        reconcile_step_up(&mut grant.manifest, chain, wallet_id).await?;
     }
     let cap = check_owned_cap(
         chain,

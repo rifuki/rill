@@ -211,6 +211,27 @@ fn the_skill_explains_the_step_up_pause_and_its_reach() {
     }
 }
 
+/// On a wallet carrying the on-chain step_up rule, the owner approves as gas sponsor and the chain
+/// refuses the spend without them. The agent must hear that the same pause applies, that its own
+/// tools are refused above the threshold, and that retrying with them will not help.
+#[test]
+fn the_skill_explains_the_on_chain_step_up_rule() {
+    let step_up = section("### Owner step-up approval");
+    for needed in [
+        "`stepUpOnChain`",
+        "gas sponsor",
+        "`step_up_needs_owner_gas`",
+        "`stepUp`",
+        "the chain refuses",
+        "do not retry",
+    ] {
+        assert!(
+            step_up.contains(needed),
+            "the step-up section must say {needed:?}"
+        );
+    }
+}
+
 /// An owner's on-chain recipient list changes what the agent may do with `rill_spend` and closes
 /// every tool that needs a released coin. The skill has to say both, and that only the owner can
 /// change the list, or an agent refused once tries the next address.

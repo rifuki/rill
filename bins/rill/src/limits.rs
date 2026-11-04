@@ -53,6 +53,10 @@ pub enum RuleConfig {
         not_before_ms: u64,
         not_after_ms: u64,
     },
+    /// Above this per transaction the owner must sponsor the gas. Not a ceiling on the spend.
+    StepUp {
+        threshold: u64,
+    },
 }
 
 impl RuleConfig {
@@ -62,6 +66,7 @@ impl RuleConfig {
             Self::PerTx { .. } => "per_tx",
             Self::RateLimit { .. } => "rate_limit",
             Self::TimeWindow { .. } => "time_window",
+            Self::StepUp { .. } => "step_up",
         }
     }
 }
@@ -147,6 +152,9 @@ pub fn largest_spend_now(
                 };
                 narrow(available, "rate_limit", &mut best, &mut bound_by);
             }
+            // Not a limit on what the wallet allows: above the threshold the owner co-signs and the
+            // spend passes. The read reports the threshold beside this number instead.
+            RuleConfig::StepUp { .. } => {}
             RuleConfig::TimeWindow {
                 not_before_ms,
                 not_after_ms,
@@ -230,6 +238,9 @@ pub fn rule_config(value_type: &str, field: &Value) -> Option<RuleConfig> {
         "time_window" => RuleConfig::TimeWindow {
             not_before_ms: at("not_before_ms")?,
             not_after_ms: at("not_after_ms")?,
+        },
+        "step_up" => RuleConfig::StepUp {
+            threshold: at("threshold")?,
         },
         _ => return None,
     })
