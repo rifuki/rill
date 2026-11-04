@@ -404,10 +404,10 @@ One tool per question, and reads never share a tool with writes:
              { "module": "per_tx", "enforcement": "on-chain",
                "enforcedBy": "the Move contract, which aborts the transaction" } ],
   "preFlightRules": [ { "module": "recipient_allowlist", "enforcement": "pre-flight",
-                        "enforcedBy": "the signer, before it signs" } ],
+                        "enforcedBy": "the Rill builder, when it compiles an action; …" } ],
   "note": "Two layers hold this wallet's limits, and each rule above says which. … Nothing on
-           chain checks a destination, a protocol, an asset, or a recipient: those limits are
-           pre-flight, enforced by this signer refusing to sign …" }
+           chain checks a protocol, an asset, a recipient or a slippage floor: those rules are
+           pre-flight …" }
 
 // rill_spend  0.005 SUI
 { "submitted": true, "digest": "DpTPdMKbDSndfAqekmX8EUFyDdYePAk338Y9fqgmWhmW",
@@ -427,10 +427,13 @@ cannot widen it, the agent that asked cannot widen it, and the refusal arrives f
 
 **Which layer holds each limit.** That is true of four kinds of rule, and the read says which. The
 budget, the per-transaction cap, the rate limit and the time window are held by the Move contract
-and proved on chain against the real transaction. Nothing on chain checks a destination, a
-protocol, an asset, or a recipient: protocol scope, asset scope and recipient allowlist are
-pre-flight, enforced by this signer refusing to sign, and they exist only where a run-set gives it
-something to refuse against. The slippage floor is enforced by the chain: `rill_swap` emits
+and proved on chain against the real transaction. Nothing on chain checks a protocol, an asset, a
+recipient or a manifest's slippage floor: those four rules are pre-flight. The Rill builder checks
+them when it compiles an action. The signer does not compare them with what it signs: on
+`rill_execute`, `rill_run_action` and `rill_run_workflow` it refuses any Move call or object the run
+set does not pin, which holds a protocol scope only as far as those targets were compiled under it,
+and `rill_spend`, `rill_swap` and `rill_stake` are bounded by the on-chain rules alone. A swap's own
+`minOut` is enforced by the chain: `rill_swap` emits
 `rill_guard::guard::assert_min_value` on the coin the swap bought, before that coin goes anywhere, so
 a fill below `minOut` aborts the whole transaction and the wallet keeps its SUI. The signer's pinned
 sequence carries that call too, so an envelope that dropped it does not match.

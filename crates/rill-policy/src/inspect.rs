@@ -1,8 +1,8 @@
 //! Structural inspection of the transaction itself — the checks Move cannot make.
 //!
-//! Move sees a `Coin<T>` leave the wallet and nothing about where it goes next. `allowed_packages`
-//! is recorded on-chain and never asserted in `confirm_spend`, and it cannot be: by the time the
-//! rule runs, the commands that spend the coin have not executed. That gap is the entire reason a
+//! Move sees a `Coin<T>` leave the wallet and nothing about where it goes next. No on-chain rule
+//! exists for a protocol scope (the manifest projects none), and none could hold one: by the time
+//! a rule runs, the commands that spend the coin have not executed. That gap is the entire reason a
 //! local signer exists, and this module is that gap's answer.
 //!
 //! The comparison is against an exact **sequence**, not a set. A transaction that calls every

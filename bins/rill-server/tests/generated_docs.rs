@@ -395,20 +395,24 @@ fn a_generated_document_never_puts_a_scoping_rule_on_chain() {
     }
 }
 
-/// The slippage floor is the one limit two layers refuse, and saying only one of them is wrong in
-/// both directions: a reader who thinks only the chain holds it will ship an envelope the signer
-/// rejects, and a reader who thinks only the signer holds it will believe a mismatched floor
-/// reaches the chain unchecked.
+/// The slippage floor is held at more than one point, and saying only one of them is wrong in both
+/// directions. It used to say the signer refuses an envelope whose guard call does not match the
+/// floor, and nothing in the signer read the floor value, so the sentence must name the points that
+/// do refuse and must not claim that one.
 #[test]
-fn the_slippage_floor_is_stated_as_enforced_twice() {
+fn the_slippage_floor_names_every_point_that_refuses_it() {
     let doc = document(BASES[0]);
     let sentence = doc
         .lines()
         .find(|line| line.contains("slippage floor is pre-flight"))
         .unwrap_or_else(|| panic!("the slippage floor's layer is not stated:\n{doc}"));
     assert!(
-        sentence.contains("refuses to sign") && sentence.contains("aborts"),
-        "both refusals must be named: {sentence}"
+        sentence.contains("refuses to compile") && sentence.contains("aborts"),
+        "the builder's refusal and the chain's abort must both be named: {sentence}"
+    );
+    assert!(
+        !doc.contains("whose guard call does not match the floor"),
+        "the signer does not read an envelope's guard floor, so it must not be said to:\n{doc}"
     );
 }
 

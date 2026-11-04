@@ -427,15 +427,17 @@ fn layers_step() -> Step {
          that exceeds one is aborted."
             .into(),
         String::new(),
-        "Nothing on the chain checks a destination, a protocol, an asset, or a recipient. Those \
-         limits are pre-flight, and the refusal is the signer's: it reads them from the run-set it \
-         loaded and will not sign a transaction that breaks one. That is a real refusal and a \
-         different one, and it is worth knowing which you are relying on."
+        "Nothing on the chain checks a protocol, an asset, or a recipient. Those limits are \
+         pre-flight: the Rill builder refuses to compile an action that breaks one, and the signer \
+         does not compare them with what it signs. On rill_execute, rill_run_action and \
+         rill_run_workflow the signer refuses any Move call or object the run set does not pin, \
+         which holds a protocol scope only as far as those pinned targets were compiled under it. \
+         rill_spend, rill_swap and rill_stake are bounded by the on-chain rules alone."
             .into(),
         String::new(),
-        "The slippage floor is pre-flight too, and enforced twice: the signer refuses to sign an \
-         envelope whose guard call does not match the floor it was given, and the chain aborts the \
-         transaction if the floor is breached once it runs."
+        "The slippage floor is pre-flight too: the Rill builder refuses to compile a swap whose \
+         guard floor is below it, the signer does not read the floor value, and the chain aborts \
+         the transaction when a fill lands below the guard's floor once it runs."
             .into(),
     ]);
 
@@ -457,8 +459,8 @@ fn grant_step(manifest: Option<&CapabilityManifest>) -> Option<Step> {
                     .into(),
                 String::new(),
                 "Ask the owner to attach a capability manifest (a budget, a per-transaction cap, a \
-                 rate limit, a time window, and the pre-flight scopes the signer refuses against) \
-                 before running this unattended."
+                 rate limit, a time window, and the pre-flight scopes the builder and the signer \
+                 check) before running this unattended."
                     .into(),
             ],
         });

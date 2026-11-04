@@ -24,8 +24,10 @@
 //! those here would be defence in depth at best, and this crate stays small enough to audit by
 //! keeping to what is genuinely irreplaceable:
 //!
-//! - **which protocol a released coin flows into** — Move cannot see past the command that
-//!   released it, and `allowed_packages` is recorded on-chain but never asserted
+//! - **which protocol a released coin flows into**: Move cannot see past the command that
+//!   released it, and no on-chain rule exists for a protocol scope (the manifest projects none).
+//!   What this crate holds is the exact call sequence and object set the run set pins; it does
+//!   not compare those with the manifest's `allowedPackages`
 //! - **whether an off-chain simulation actually succeeded and was conclusive**
 //! - **byte-level pinning** of the transaction between approval and signature
 //!

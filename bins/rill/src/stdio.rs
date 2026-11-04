@@ -2494,7 +2494,10 @@ mod wallet_read_tests {
         );
         assert_eq!(pre_flight[0]["module"], "recipient_allowlist");
         assert_eq!(pre_flight[0]["enforcement"], "pre-flight");
-        assert_eq!(pre_flight[0]["enforcedBy"], "the signer, before it signs");
+        assert_eq!(
+            pre_flight[0]["enforcedBy"],
+            rill_core::manifest::Enforcement::PreFlight.enforced_by()
+        );
         assert!(
             !out["rules"]
                 .as_array()

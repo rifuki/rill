@@ -8,9 +8,9 @@
 //! # Not every limit is on chain, and this read says which
 //!
 //! The chain holds four kinds of rule and proves them against the real transaction. The other
-//! four exist only pre-flight: protocol scope, asset scope and recipient allowlist are enforced by
-//! this signer refusing to sign. A swap's slippage floor belongs to neither group: `rill_swap`
-//! emits it as a Move call on the coin the swap bought, so the chain aborts on a bad fill.
+//! four (protocol scope, slippage floor, asset scope, recipient allowlist) exist only pre-flight,
+//! and pre-flight is not one guarantee: the Rill builder checks them when it compiles an action,
+//! and this signer checks only what it can read on the tool in hand. The note below says which.
 //!
 //! # The numbers, not only the names
 //!
@@ -326,13 +326,16 @@ const NOTE: &str = "Start with `largestSpendNow`: it is the biggest single spend
     proved on chain against the real transaction, nothing in this process and nothing passed to it \
     can widen them, and a spend that exceeds one is aborted by the chain. Their configured values \
     are under each rule's `limits`, in base units, read from the chain rather than from anything \
-    this process was told. Nothing on chain checks a destination, a protocol, an asset, or a \
-    recipient: those limits are pre-flight, enforced by this signer refusing to sign, and they are \
-    listed under `preFlightRules` from the loaded run-set (null means no run-set is loaded, not \
-    that there are none). A swap's slippage floor is a third thing again: `rill_swap` takes minOut \
-    and emits an on-chain assertion on the coin it bought, so a fill below the floor aborts the \
-    whole transaction. Read again after any change: every number here is a live read, not a cached \
-    copy.";
+    this process was told. Nothing on chain checks a protocol, an asset, a recipient or a slippage \
+    floor: those rules are pre-flight and are listed under `preFlightRules` from the loaded run-set \
+    (null means no run-set is loaded, not that there are none). The Rill builder checks them when \
+    it compiles an action. This signer does not compare them with what it signs: on rill_execute, \
+    rill_run_action and rill_run_workflow it refuses any Move call or object the run set does not \
+    pin, which holds a protocol scope only as far as those pinned targets were compiled under it, \
+    and rill_spend, rill_swap and rill_stake are bounded only by the rules under `rules`. \
+    `rill_swap` takes its own minOut and emits an on-chain assertion on the coin it bought, so a \
+    fill below that minOut aborts the whole transaction. Read again after any change: every number \
+    here is a live read, not a cached copy.";
 
 #[cfg(test)]
 mod assembly_tests {
@@ -734,7 +737,7 @@ mod tests {
         );
         for rule in pre_flight {
             assert_eq!(rule["enforcement"], "pre-flight");
-            assert_eq!(rule["enforcedBy"], "the signer, before it signs");
+            assert_eq!(rule["enforcedBy"], Enforcement::PreFlight.enforced_by());
         }
     }
 

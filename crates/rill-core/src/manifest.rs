@@ -10,10 +10,15 @@
 //! ## Not every rule is enforced on-chain, and the declaration says which
 //!
 //! `budget`, `per_tx`, `rate_limit` and `time_window` are proved against the real transaction by
-//! Move and cannot be bypassed. The other four are enforced pre-flight, by the compiler and the
-//! signer, because an on-chain rule can only compare against metadata the transaction asserts
-//! about itself — which is decoration, not a guarantee. `slippage_floor` has a second reason: at
-//! rule-prove time the swap's output does not exist yet, since it is the value being computed.
+//! Move and cannot be bypassed. The other four are pre-flight, because an on-chain rule can only
+//! compare against metadata the transaction asserts about itself, which is decoration, not a
+//! guarantee. `slippage_floor` has a second reason: at rule-prove time the swap's output does not
+//! exist yet, since it is the value being computed.
+//!
+//! Pre-flight is not one guarantee. The Rill builder checks all four when it compiles an action;
+//! the signer checks only the ones it can read on the tool in hand. What it reads is stated per
+//! tool rather than once for the whole layer, because "the signer refuses" said once was read as
+//! true of every tool and was true of none of the local builds.
 //!
 //! That distinction is carried on every cap rather than smoothed over, because an owner deciding
 //! how much to grant should know which limits the chain holds and which the software does.
@@ -233,7 +238,11 @@ impl Enforcement {
     pub fn enforced_by(self) -> &'static str {
         match self {
             Self::OnChain => "the Move contract, which aborts the transaction",
-            Self::PreFlight => "the signer, before it signs",
+            Self::PreFlight => {
+                "the Rill builder, when it compiles an action; this signer only through the call \
+                 targets and objects a run set pins, on rill_execute, rill_run_action and \
+                 rill_run_workflow"
+            }
         }
     }
 }

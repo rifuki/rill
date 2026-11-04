@@ -234,13 +234,16 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  per-transaction cap, rate limit and time window are on-chain rules: read live \
                  from the Move contract that proves them, so this is the answer rather than a \
                  local copy, and nothing in this process can widen them. Protocol scope, asset \
-                 scope and recipient allowlist are pre-flight rules: this signer enforces them by \
-                 refusing to sign, and they are listed from the loaded run-set, if one is loaded. \
-                 Nothing on the chain checks a destination, a protocol, an asset or a recipient. \
-                 A swap's slippage floor is neither: rill_swap emits it as a Move call on the coin \
-                 the swap bought, so the chain aborts on a bad fill. Read largestSpendNow first: it \
-                 is the biggest single spend this wallet allows right now and names the limit \
-                 holding it, so a spend that would be refused need not be attempted.",
+                 scope, recipient allowlist and slippage floor are pre-flight rules, listed from \
+                 the loaded run-set if one is loaded: the Rill builder checks them when it compiles \
+                 an action, and this signer does not compare them with what it signs; on \
+                 rill_execute, rill_run_action and rill_run_workflow it refuses only calls and \
+                 objects the run set does not pin. Nothing on the chain checks a protocol, an asset, \
+                 a recipient or a manifest's slippage floor. rill_swap's own minOut is a Move call \
+                 on the coin the swap bought, so the chain aborts a fill below it. Read \
+                 largestSpendNow first: it is the biggest single spend this wallet allows right \
+                 now and names the limit holding it, so a spend that would be refused need not be \
+                 attempted.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
