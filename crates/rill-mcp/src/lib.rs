@@ -92,6 +92,73 @@ fn destructive(
     )
 }
 
+/// The tools that build their transaction afresh on every call, and so take an `idempotencyKey`.
+///
+/// A retry of one of these is a second transaction: new gas, new object versions, new bytes, so
+/// nothing on chain tells it from a second intent. Only the caller knows which it meant, and the
+/// key is how it says so. `rill_execute` re-signs the exact bytes it is given, which the chain
+/// refuses to land twice, `rill_attach_rules` reconciles against the live rules, and
+/// `rill_run_workflow` has its own `runId`, so those three take none.
+pub const KEYED_TOOLS: &[&str] = &[
+    "rill_create_wallet",
+    "rill_spend",
+    "rill_swap",
+    "rill_stake",
+    "rill_unstake",
+    "rill_run_action",
+];
+
+/// What every keyed tool's description says about retrying, so the rule reads the same on each.
+macro_rules! keyed_retry {
+    () => {
+        "A retry with the same idempotencyKey returns the first outcome, including after a \
+         restart, and never submits again. An outcome reported as interrupted means check the \
+         chain before using a new key."
+    };
+}
+
+/// The schema property every keyed tool requires.
+fn idempotency_key_property() -> Value {
+    json!({
+        "type": "string",
+        "pattern": "^[A-Za-z0-9_-]{1,96}$",
+        "description": "Required. One value per intended transaction, chosen before the first call. Send the same value on every retry of that transaction: a repeat returns the first outcome and never submits again. A new value is a new transaction."
+    })
+}
+
+/// A tool that submits a transaction it builds itself, guarded by a caller-chosen key.
+///
+/// The schema gains an `idempotencyKey`, required unless the tool has a dry run, keeping any
+/// wording the tool already declares for it.
+fn destructive_keyed(name: &'static str, description: &'static str, mut schema: Value) -> Tool {
+    if let Some(properties) = schema["properties"].as_object_mut() {
+        properties
+            .entry("idempotencyKey")
+            .or_insert_with(idempotency_key_property);
+    }
+    // A tool with a dry run cannot list the key as required: a dry run submits nothing and takes
+    // none, and a schema-validating client would refuse it before the signer saw it. The signer
+    // refuses a submitting call without the key with missing_idempotency_key instead.
+    let has_dry_run = schema["properties"].get("dryRun").is_some();
+    if let Some(required) = schema["required"].as_array_mut().filter(|_| !has_dry_run) {
+        required.push(json!("idempotencyKey"));
+    }
+    Tool::new(
+        Cow::Borrowed(name),
+        Cow::Borrowed(description),
+        object_schema(schema),
+    )
+    .annotate(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            // The same arguments, idempotencyKey included, return the first outcome and never
+            // submit again.
+            .idempotent(true)
+            .open_world(true),
+    )
+}
+
 /// Every tool a surface exposes.
 /// The protocol revisions this implementation speaks, newest first.
 ///
@@ -297,9 +364,9 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
             ),
             // The two owner-side steps, which used to be commands a person typed. Offered only on
             // `Surface::Owner`: see its doc for why an agent's surface leaves them out.
-            destructive(
+            destructive_keyed(
                 "rill_create_wallet",
-                "Mint an agent wallet and the AgentCap that drives it, funded from the key this \
+                concat!("Mint an agent wallet and the AgentCap that drives it, funded from the key this \
                  signer holds. The key here becomes the wallet's owner and the cap goes to the \
                  agent address you name, which is what makes the two identities different keys. \
                  THIS SUBMITS TWO REAL TRANSACTIONS and cannot be undone: one mints and funds the \
@@ -308,9 +375,8 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  landed and the wallet is bounded. If the second fails the answer is an error \
                  named created_but_unbounded, carrying the wallet id: the wallet then exists with \
                  no limit, so do not hand the cap to anything and call rill_attach_rules with that \
-                 id. Do not retry a success: a second call mints a second wallet and funds it \
-                 again.",
-                object_schema(json!({
+                 id. ", keyed_retry!()),
+                json!({
                     "type": "object",
                     "properties": {
                         "agent": {
@@ -336,7 +402,7 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     },
                     "required": ["agent", "amount", "budget", "perTx"],
                     "additionalProperties": false
-                })),
+                }),
             ),
             destructive(
                 "rill_attach_rules",
@@ -371,9 +437,9 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     "additionalProperties": false
                 })),
             ),
-            destructive(
+            destructive_keyed(
                 "rill_spend",
-                "Release funds from an agent wallet and send them, gated by the rules the wallet \
+                concat!("Release funds from an agent wallet and send them, gated by the rules the wallet \
                  carries on chain. THIS SUBMITS A REAL TRANSACTION and cannot be undone. If the \
                  amount exceeds a rule, the contract refuses it and nothing moves — that is the \
                  wallet working, not an error to retry. On a wallet this signer holds a usable owner grant for, it refuses with \
@@ -381,9 +447,8 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  because the API or the node did not answer; nothing moved, so report it. \
                  pre_flight_refused names a rule from the run set this signer holds for the \
                  wallet; report it rather than retrying. Do not retry a refusal \
-                 with the same or a larger amount, and do not retry a success at all: a second \
-                 call sends a second payment.",
-                object_schema(json!({
+                 with the same or a larger amount. ", keyed_retry!()),
+                json!({
                     "type": "object",
                     "properties": {
                         "wallet": { "type": "string", "description": "The AgentWallet object id." },
@@ -399,11 +464,11 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     },
                     "required": ["wallet", "cap", "amount"],
                     "additionalProperties": false
-                })),
+                }),
             ),
-            destructive(
+            destructive_keyed(
                 "rill_swap",
-                "Release funds from an agent wallet and swap them on Cetus, in one transaction, \
+                concat!("Release funds from an agent wallet and swap them on Cetus, in one transaction, \
                  gated by the rules the wallet carries on chain. THIS SUBMITS A REAL TRANSACTION \
                  and cannot be undone. The SUI that enters the swap is released by the contract \
                  against its own rules, so a swap larger than a rule allows is refused by the chain \
@@ -418,9 +483,8 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  use_granted_action: run the granted action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
                  because the API or the node did not answer; nothing moved, so report it. \
                  pre_flight_refused names a rule from the run set this signer holds for the \
-                 wallet; report it rather than retrying. Do not retry a success: a second \
-                 call swaps again.",
-                object_schema(json!({
+                 wallet; report it rather than retrying. ", keyed_retry!()),
+                json!({
                     "type": "object",
                     "properties": {
                         "wallet": { "type": "string", "description": "The AgentWallet object id." },
@@ -452,11 +516,11 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     },
                     "required": ["wallet", "cap", "amount", "pool", "coinTypeA", "coinTypeB", "a2b", "minOut"],
                     "additionalProperties": false
-                })),
+                }),
             ),
-            destructive(
+            destructive_keyed(
                 "rill_stake",
-                "Release SUI from an agent wallet and liquid-stake it with Haedal, in one \
+                concat!("Release SUI from an agent wallet and liquid-stake it with Haedal, in one \
                  transaction, gated by the rules the wallet carries on chain. THIS SUBMITS A REAL \
                  TRANSACTION and cannot be undone. The SUI is released by the contract against its \
                  own rules, so a stake larger than a rule allows is refused by the chain and nothing \
@@ -468,9 +532,8 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  use_granted_action: run the granted action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
                  because the API or the node did not answer; nothing moved, so report it. \
                  pre_flight_refused names a rule from the run set this signer holds for the \
-                 wallet; report it rather than retrying. Do not retry a success: a second call \
-                 stakes again.",
-                object_schema(json!({
+                 wallet; report it rather than retrying. ", keyed_retry!()),
+                json!({
                     "type": "object",
                     "properties": {
                         "wallet": { "type": "string", "description": "The AgentWallet object id." },
@@ -486,22 +549,23 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     },
                     "required": ["wallet", "cap", "amount"],
                     "additionalProperties": false
-                })),
+                }),
             ),
             read_only(
                 "rill_portfolio",
                 "Read directly owned token balances and objects for an address, defaulting to this signer. Exact base units; excludes shared vault funds and external lending positions. No transaction or signature.",
                 object_schema(json!({"type":"object","properties":{"owner":{"type":"string"}},"additionalProperties":false})),
             ),
-            destructive(
+            destructive_keyed(
                 "rill_unstake",
-                "Immediately redeem this signer's own Haedal haSUI for SUI. THIS SUBMITS A REAL TRANSACTION and cannot be undone. Requires a positive minOut in decimal SUI and enforces it on chain. The protocol charges its live instant-redemption fee and may lack liquidity. Delayed unstaking creates a ticket and needs a later epoch claim; this tool does not do that. Simulates before signing; do not retry an unknown submission outcome. Receiver defaults to signer. Mainnet only.",
-                object_schema(json!({"type":"object","properties":{
+                concat!("Immediately redeem this signer's own Haedal haSUI for SUI. THIS SUBMITS A REAL TRANSACTION and cannot be undone. Requires a positive minOut in decimal SUI and enforces it on chain. The protocol charges its live instant-redemption fee and may lack liquidity. Delayed unstaking creates a ticket and needs a later epoch claim; this tool does not do that. Simulates before signing. Receiver defaults to signer. Mainnet only. ", keyed_retry!()),
+                json!({"type":"object","properties":{
                     "amount":{"type":"string","description":"Positive decimal haSUI amount."},
                     "minOut":{"type":"string","description":"Positive minimum decimal SUI after protocol fee."},
                     "receiver":{"type":"string","description":"Public Sui address receiving redeemed SUI; defaults to signer."},
-                    "dryRun":{"type":"boolean","description":"Simulate without submitting; defaults false."}
-                },"required":["amount","minOut"],"additionalProperties":false})),
+                    "dryRun":{"type":"boolean","description":"Simulate without submitting; defaults false."},
+                    "idempotencyKey":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,96}$","description":"Required to submit. One value per intended redemption, chosen before the first call. Send the same value on every retry of that redemption: a repeat returns the first outcome and never submits again. A new value is a new transaction. A dry run (dryRun true) submits nothing, so it ignores the key."}
+                },"required":["amount","minOut"],"additionalProperties":false}),
             ),
             destructive(
                 "rill_execute",
@@ -532,14 +596,15 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  reason. Call this first to learn an actionId for rill_run_action. Reads only.",
                 no_arguments(),
             ),
-            destructive(
+            destructive_keyed(
                 "rill_run_action",
-                "Run one action the wallet's owner granted this agent: the Rill builder prepares the \
+                concat!("Run one action the wallet's owner granted this agent: the Rill builder prepares the \
                  transaction, and this signer checks it against the owner-signed run set, \
                  re-simulates it, signs and submits. THIS SUBMITS A REAL TRANSACTION and cannot be \
                  undone. A refusal naming a rule or the grant is the wallet working; report it \
-                 rather than retrying. Do not call it again after a success: that is a second run.",
-                object_schema(json!({
+                 rather than retrying. Every call builds a fresh transaction, so only the key \
+                 tells a retry from a second run. ", keyed_retry!()),
+                json!({
                     "type": "object",
                     "properties": {
                         "actionId": { "type": "string", "description": "The actionId from rill_actions." },
@@ -549,7 +614,7 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                     },
                     "required": ["actionId"],
                     "additionalProperties": false
-                })),
+                }),
             ),
             destructive(
                 "rill_run_workflow",
@@ -743,6 +808,68 @@ mod tests {
             assert!(
                 !actions.contains(&signing.to_string()),
                 "{signing} needs a key and the builder has none"
+            );
+        }
+    }
+
+    /// The tools that build afresh on every call cannot tell a retry from a second intent, so each
+    /// one takes a caller-chosen key. The three that need none keep saying they are not idempotent.
+    #[test]
+    fn every_rebuilding_submitter_requires_an_idempotency_key() {
+        let tools: Vec<Tool> = tools(Surface::Owner);
+        let find = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is not offered"))
+        };
+        for name in KEYED_TOOLS {
+            let tool = find(name);
+            let schema = &tool.input_schema;
+            let required = schema["required"]
+                .as_array()
+                .is_some_and(|r| r.contains(&json!("idempotencyKey")));
+            if schema["properties"].get("dryRun").is_some() {
+                // A dry run submits nothing and needs no key, so the schema cannot demand one on
+                // every call; the signer refuses a submitting call without it instead.
+                assert!(!required, "{name} must not demand a key for a dry run");
+                assert!(
+                    schema["properties"]["idempotencyKey"]["description"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("Required to submit")),
+                    "{name} must say the key is required to submit"
+                );
+            } else {
+                assert!(required, "{name} must require idempotencyKey");
+            }
+            assert_eq!(
+                schema["properties"]["idempotencyKey"]["pattern"],
+                json!("^[A-Za-z0-9_-]{1,96}$"),
+                "{name}"
+            );
+            assert_eq!(
+                tool.annotations.as_ref().unwrap().idempotent_hint,
+                Some(true),
+                "{name}"
+            );
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("same idempotencyKey"),
+                "{name} must say how to retry: {description}"
+            );
+        }
+        for name in ["rill_execute", "rill_attach_rules", "rill_run_workflow"] {
+            let tool = find(name);
+            assert_eq!(
+                tool.annotations.as_ref().unwrap().idempotent_hint,
+                Some(false),
+                "{name}"
+            );
+            assert!(
+                tool.input_schema["properties"]
+                    .get("idempotencyKey")
+                    .is_none(),
+                "{name} takes no idempotencyKey"
             );
         }
     }

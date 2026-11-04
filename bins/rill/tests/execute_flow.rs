@@ -624,7 +624,10 @@ fn creating_a_wallet_with_no_key_says_whose_key_is_missing() {
     let response = call(
         &mut context,
         "rill_create_wallet",
-        json!({ "agent": WALLET, "amount": "0.05", "budget": BUDGET_MIST, "perTx": PER_TX_MIST }),
+        json!({
+            "agent": WALLET, "amount": "0.05", "budget": BUDGET_MIST, "perTx": PER_TX_MIST,
+            "idempotencyKey": "create-without-a-key"
+        }),
     );
     let out = structured(&response);
     assert_eq!(out["code"], json!("no_key"));
@@ -1018,7 +1021,14 @@ fn live_context(address: &str) -> WalletContext {
         address,
         "the keystore handed back a different key than the one asked for"
     );
-    WalletContext::new(Some(keystore), "testnet".into(), false)
+    // Keyed tools claim their key on disk first; the live runs keep theirs in a scratch directory.
+    let state_dir = std::env::temp_dir().join(format!("rill-execute-live-{}", std::process::id()));
+    WalletContext::new(Some(keystore), "testnet".into(), false).with_state_dir(Some(state_dir))
+}
+
+/// A fresh idempotencyKey per intended submission: each call below is a new transaction.
+fn live_key(step: &str) -> String {
+    format!("execute-flow-{step}-{}", rand::random::<u64>())
 }
 
 /// A spend over the wallet's per-transaction cap, refused by the chain and named, over the
@@ -1030,7 +1040,10 @@ fn an_over_cap_spend_over_the_transport_is_refused_naming_per_tx() {
     let response = call(
         &mut context,
         "rill_spend",
-        json!({ "wallet": LIVE_WALLET, "cap": LIVE_CAP, "amount": "0.06" }),
+        json!({
+            "wallet": LIVE_WALLET, "cap": LIVE_CAP, "amount": "0.06",
+            "idempotencyKey": live_key("over-cap")
+        }),
     );
     eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
 
@@ -1087,7 +1100,8 @@ fn the_whole_flow_runs_over_the_mcp_transport_against_testnet() {
         "rill_create_wallet",
         json!({
             "agent": LIVE_AGENT, "amount": "0.02",
-            "budget": "20000000", "perTx": "10000000"
+            "budget": "20000000", "perTx": "10000000",
+            "idempotencyKey": live_key("create")
         }),
     );
     println!("{}", serde_json::to_string_pretty(&created).unwrap());
@@ -1118,7 +1132,10 @@ fn the_whole_flow_runs_over_the_mcp_transport_against_testnet() {
     let spent = call(
         &mut agent,
         "rill_spend",
-        json!({ "wallet": wallet_id, "cap": cap_id, "amount": "0.005" }),
+        json!({
+            "wallet": wallet_id, "cap": cap_id, "amount": "0.005",
+            "idempotencyKey": live_key("spend")
+        }),
     );
     println!("{}", serde_json::to_string_pretty(&spent).unwrap());
     assert_eq!(spent["result"]["isError"], json!(false), "{spent}");
@@ -1131,7 +1148,10 @@ fn the_whole_flow_runs_over_the_mcp_transport_against_testnet() {
     let refused = call(
         &mut agent,
         "rill_spend",
-        json!({ "wallet": wallet_id, "cap": cap_id, "amount": "0.015" }),
+        json!({
+            "wallet": wallet_id, "cap": cap_id, "amount": "0.015",
+            "idempotencyKey": live_key("over-cap-spend")
+        }),
     );
     println!("{}", serde_json::to_string_pretty(&refused).unwrap());
     let refused = structured(&refused).clone();

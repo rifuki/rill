@@ -56,6 +56,11 @@ pub struct WalletContext {
     /// scope and is stated in the refusal: a freshly started signer does not know, and a replay
     /// would then fail on chain anyway, as an unexplained stale-object error rather than a named
     /// refusal.
+    ///
+    /// Durable deduplication lives in the receipt store instead (`workflow::once`, keyed by the
+    /// caller's idempotencyKey), because the tools that rebuild on every call produce new bytes on
+    /// a retry and would never match here. This map only names a same-process duplicate envelope
+    /// for `rill_execute`.
     pub submitted: HashMap<String, Submission>,
     /// Whether the owner's two steps are offered: `rill mcp --owner`. Off for an agent's launch,
     /// which is what a plugin starts, so an agent is never handed a tool that would make it the
@@ -309,24 +314,184 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
             return tool_error(id, "not_configured", &reason);
         }
     }
+    if rill_mcp::KEYED_TOOLS.contains(&name) {
+        return keyed(context, id, name, &params);
+    }
+    dispatch(context, id, name, &params)
+}
+
+/// The tool itself, once every gate in [`call`] has passed.
+fn dispatch(context: &mut WalletContext, id: Value, name: &str, params: &Value) -> Value {
     match name {
         "rill_status" => status(context, id),
-        "rill_pair" => pair_signer(context, id, &params),
-        "rill_wallet" => wallet(context, id, &params),
-        "rill_quote" => quote(context, id, &params),
-        "rill_create_wallet" => create_wallet(context, id, &params),
-        "rill_attach_rules" => attach_rules(context, id, &params),
-        "rill_spend" => spend(context, id, &params),
-        "rill_swap" => swap(context, id, &params),
-        "rill_stake" => stake(context, id, &params),
-        "rill_portfolio" => portfolio(context, id, &params),
-        "rill_unstake" => unstake(context, id, &params),
-        "rill_execute" => execute(context, id, &params, EnvelopeSource::HandSupplied),
+        "rill_pair" => pair_signer(context, id, params),
+        "rill_wallet" => wallet(context, id, params),
+        "rill_quote" => quote(context, id, params),
+        "rill_create_wallet" => create_wallet(context, id, params),
+        "rill_attach_rules" => attach_rules(context, id, params),
+        "rill_spend" => spend(context, id, params),
+        "rill_swap" => swap(context, id, params),
+        "rill_stake" => stake(context, id, params),
+        "rill_portfolio" => portfolio(context, id, params),
+        "rill_unstake" => unstake(context, id, params),
+        "rill_execute" => execute(context, id, params, EnvelopeSource::HandSupplied),
         "rill_actions" => actions(context, id),
-        "rill_run_action" => run_action(context, id, &params),
-        "rill_run_workflow" => run_workflow(context, id, &params),
+        "rill_run_action" => run_action(context, id, params),
+        "rill_run_workflow" => run_workflow(context, id, params),
         other => rpc_error(id, -32602, &format!("Unknown tool: {other}")),
     }
+}
+
+/// What a keyed tool's outcome adds to its note.
+const KEYED_NOTE: &str = "Under this idempotencyKey a repeat returns this outcome and submits \
+    nothing; calling again means calling with a new key.";
+
+/// A tool that builds afresh on every call, run at most once per caller-chosen key.
+///
+/// Every check here comes before any network read, and a call that cannot be claimed on disk is
+/// refused rather than run unkeyed: a key the signer did not record protects nothing. The key is
+/// stripped before the tool sees it, so no handler has to know it exists.
+fn keyed(context: &mut WalletContext, id: Value, name: &str, params: &Value) -> Value {
+    let arguments = params.get("arguments");
+    let mut stripped = params.clone();
+    if let Some(arguments) = stripped.get_mut("arguments").and_then(Value::as_object_mut) {
+        arguments.remove("idempotencyKey");
+    }
+    // A dry run submits nothing, so there is nothing to deduplicate and no key to demand.
+    if name == "rill_unstake" && arguments.and_then(|a| a.get("dryRun")) == Some(&Value::Bool(true))
+    {
+        return dispatch(context, id, name, &stripped);
+    }
+    let Some(key) = arguments
+        .and_then(|a| a.get("idempotencyKey"))
+        .and_then(Value::as_str)
+    else {
+        return tool_error(
+            id,
+            "missing_idempotency_key",
+            "idempotencyKey is required: choose one per intended transaction and send the same \
+             value on every retry of it. Nothing was submitted.",
+        );
+    };
+    if let Err(why) = crate::workflow::validate_id("idempotencyKey", key) {
+        return tool_error(
+            id,
+            "invalid_arguments",
+            &format!("{why}. Nothing was submitted."),
+        );
+    }
+    // The signer's address names the receipt directory, so two keys loaded on one machine never
+    // share a key space. With no key nothing can be signed, so there is nothing to claim and the
+    // tool's own `no_key` refusal, which says whose key is missing, answers unrecorded.
+    let Some(signer) = context.keystore.as_ref().map(|k| k.address().to_string()) else {
+        return dispatch(context, id, name, &stripped);
+    };
+    let Some(state_dir) = context.state_dir.clone() else {
+        return tool_error(
+            id,
+            "not_configured",
+            "This signer has no state directory (neither RILL_CONFIG nor HOME is set), so it \
+             cannot record an idempotencyKey and refuses to submit without one. Set HOME or \
+             RILL_CONFIG in the launch environment and restart the client. Nothing was submitted.",
+        );
+    };
+    let directory = state_dir
+        .join("requests")
+        .join(&context.network)
+        .join(&signer);
+    let request = json!({
+        "tool": name,
+        "arguments": stripped.get("arguments").cloned().unwrap_or(Value::Null),
+    });
+    // A repeat is answered here, before any tool's own checks, `mainnet_not_opted_in` among them.
+    // That is safe because a replay submits nothing: it hands back what the first call already
+    // did, and the first call ran every check.
+    let outcome = crate::workflow::once(&directory, key, &request, || {
+        dispatch(context, id.clone(), name, &stripped)["result"].clone()
+    });
+    let receipt = match outcome {
+        Ok(receipt) => receipt,
+        Err(crate::workflow::ReceiptError::InvalidKey(why)) => {
+            return tool_error(id, "invalid_arguments", &why)
+        }
+        Err(crate::workflow::ReceiptError::Conflict { stored }) => {
+            return tool_error_with(
+                id,
+                "idempotency_key_conflict",
+                "This idempotencyKey already belongs to a different call; no transaction \
+                 submitted. Use a new key only for a new transaction the user authorized.",
+                json!({ "idempotencyKey": key, "storedRequest": stored }),
+            );
+        }
+        Err(crate::workflow::ReceiptError::Unreadable(why)) => {
+            return tool_error_with(
+                id,
+                "receipt_unreadable",
+                &format!(
+                    "The receipt for this idempotencyKey exists and cannot be read ({why}), so \
+                     whether its call ran is unknown. Nothing was submitted now. Inspect the \
+                     chain for a transaction from this signer before choosing a new key."
+                ),
+                json!({ "idempotencyKey": key, "network": context.network, "signer": signer }),
+            );
+        }
+        Err(crate::workflow::ReceiptError::Storage(why)) => {
+            return tool_error_with(
+                id,
+                "receipt_unavailable",
+                &format!(
+                    "This call could not be recorded under its idempotencyKey ({why}), so it was \
+                     not attempted. Nothing was submitted."
+                ),
+                json!({ "idempotencyKey": key }),
+            );
+        }
+    };
+    let replayed = receipt["replayed"].clone();
+    if receipt["status"] == "interrupted" {
+        let note = receipt["note"]
+            .as_str()
+            .unwrap_or(crate::workflow::INTERRUPTED_NOTE);
+        return tool_error_with(
+            id,
+            "request_interrupted",
+            note,
+            json!({
+                "idempotencyKey": key,
+                "request": receipt["request"],
+                "network": context.network,
+                "signer": signer,
+                "claimedAtMs": receipt["claimedAtMs"],
+                "replayed": true,
+            }),
+        );
+    }
+    let mut result = receipt["result"].clone();
+    if let Some(structured) = result
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    {
+        // The command notes these tools share with the CLI say "calling again sends a second
+        // payment", which is true of a new key and not of this one. Said here, once, for every
+        // keyed note that does not already name the key.
+        if let Some(note) = structured.get_mut("note") {
+            if let Some(text) = note.as_str().filter(|t| !t.contains("idempotencyKey")) {
+                *note = json!(format!("{text} {KEYED_NOTE}"));
+            }
+        }
+        structured.insert("idempotencyKey".into(), json!(key));
+        structured.insert("replayed".into(), replayed);
+        if let Some(warning) = receipt.get("receiptWarning") {
+            structured.insert("receiptWarning".into(), warning.clone());
+        }
+    }
+    // A success's text is its structured content printed, as `tool_ok` writes it, so it is printed
+    // again to carry the fields added above. A refusal's text is its message and stays as it is.
+    if result["isError"] == json!(false) {
+        let text = serde_json::to_string_pretty(&result["structuredContent"]).unwrap_or_default();
+        result["content"] = json!([{ "type": "text", "text": text }]);
+    }
+    rpc_result(id, result)
 }
 
 fn pair_signer(context: &WalletContext, id: Value, params: &Value) -> Value {
@@ -2011,11 +2176,18 @@ pub(crate) fn places_order(targets: &[String]) -> bool {
 }
 
 /// No retry rule here: the envelope cache lives in one process and granted actions are rebuilt on
-/// every call, so a promise that a second call is refused would not hold across them.
+/// every call, so a promise that a second call is refused would not hold across them. A granted
+/// order gets [`GRANTED_RETRY_NOTE`] appended instead, which names the key that does hold.
 const ORDER_PLACED_NOTE: &str = "Order placed on DeepBook and confirmed. This digest proves the \
     placement, not a fill: the order may rest unfilled, fill in part or fill in full. This signer \
     has no tool that reads order status or cancels an order; cancelling and withdrawing are the \
     owner's, in Studio.";
+
+/// How a granted run is retried. `rill_run_action` builds a new transaction on every call, so the
+/// envelope guard in [`execute`] never matches a retry of it; the caller's key, or a workflow's
+/// runId, is what turns a retry into a replay.
+const GRANTED_RETRY_NOTE: &str = "A retry with the same idempotencyKey (or, inside a workflow, \
+    the same runId) returns this outcome and never submits again; a new key is a new transaction.";
 
 /// Where an envelope came from, which decides whether a grant has to be its route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2272,13 +2444,19 @@ fn execute(
             "spendBaseUnits": spend_base_units,
             // What the code does, said in the answer. This used to read "calling again with the
             // same envelope submits a second transaction", which described a footgun instead of
-            // removing it; the second call is now refused and answered with this digest.
-            "note": if order {
-                ORDER_PLACED_NOTE
-            } else {
-                "Submitted and confirmed. This cannot be undone. Calling again with this same \
-                 envelope is refused and answered with this digest, so a retry cannot become a \
-                 second transaction; build a new action if another spend is intended."
+            // removing it; the second call is now refused and answered with this digest. A granted
+            // run never sees that refusal, since each call is a new build, so it names its key.
+            "note": match (order, source) {
+                (true, EnvelopeSource::HandSupplied) => ORDER_PLACED_NOTE.to_string(),
+                (true, EnvelopeSource::Grant) => format!("{ORDER_PLACED_NOTE} {GRANTED_RETRY_NOTE}"),
+                (false, EnvelopeSource::Grant) => format!(
+                    "Submitted and confirmed. This cannot be undone. {GRANTED_RETRY_NOTE}"
+                ),
+                (false, EnvelopeSource::HandSupplied) => "Submitted and confirmed. This cannot be \
+                    undone. Calling again with this same envelope is refused and answered with \
+                    this digest, so a retry cannot become a second transaction; build a new action \
+                    if another spend is intended."
+                    .to_string(),
             }
         }),
     )
@@ -3149,8 +3327,14 @@ mod pre_flight_tests {
     }
 
     fn context(rule: CapabilityRule) -> WalletContext {
+        // Keyed tools claim their key on disk before anything else, so they need somewhere to.
+        // One fixed directory rather than one per process: every run reuses the same tree, so
+        // test runs leave a few small receipts behind instead of a new directory each time. Each
+        // call takes a fresh key, so runs sharing it never replay each other's outcome.
+        let state_dir = std::env::temp_dir().join("rill-pre-flight-tests");
         let mut context = WalletContext::new(Some(key()), "testnet".into(), false)
-            .with_run_set(Some(run_set(rule, &[request_spend()])));
+            .with_run_set(Some(run_set(rule, &[request_spend()])))
+            .with_state_dir(Some(state_dir));
         context.rpc_url = Some(CLOSED.into());
         context
     }
@@ -3159,7 +3343,11 @@ mod pre_flight_tests {
         format!("{PKG}::agent_wallet::request_spend")
     }
 
-    fn call(context: &mut WalletContext, tool: &str, arguments: Value) -> Value {
+    fn call(context: &mut WalletContext, tool: &str, mut arguments: Value) -> Value {
+        // A fresh key per call: each of these is a first attempt, never a retry.
+        if rill_mcp::KEYED_TOOLS.contains(&tool) {
+            arguments["idempotencyKey"] = json!(format!("pre-flight-{}", rand::random::<u64>()));
+        }
         let message = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": tool, "arguments": arguments }

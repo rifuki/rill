@@ -329,6 +329,12 @@ impl Drop for Agent {
     }
 }
 
+/// A fresh idempotencyKey per intended run. Each run here is a new transaction on purpose, so
+/// none of them may reuse another's key, nor a key from an earlier test run.
+fn live_key(step: &str) -> String {
+    format!("e2e-{step}-{}", rand::random::<u64>())
+}
+
 fn grant_entry(actions: &Value, action: &str, wallet: &str) -> Value {
     actions["actions"]
         .as_array()
@@ -969,7 +975,7 @@ async fn run(
     }
     let (ran, failed) = signer.call(
         "rill_run_action",
-        json!({"actionId": action, "walletId": wallet}),
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("run")}),
     );
     if failed {
         return Err(format!("the granted run was refused: {ran}"));
@@ -1010,7 +1016,7 @@ async fn run(
     step("a second run exceeds what is left and is refused");
     let (refused, failed) = signer.call(
         "rill_run_action",
-        json!({"actionId": action, "walletId": wallet}),
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("over-budget")}),
     );
     if !failed || refused.get("digest").is_some() {
         return Err(format!("a run past the budget was not refused: {refused}"));
@@ -1042,7 +1048,7 @@ async fn run(
     }
     let (after, failed) = signer.call(
         "rill_run_action",
-        json!({"actionId": action, "walletId": wallet}),
+        json!({"actionId": action, "walletId": wallet, "idempotencyKey": live_key("after-revoke")}),
     );
     if !failed {
         return Err(format!("a revoked wallet still ran: {after}"));

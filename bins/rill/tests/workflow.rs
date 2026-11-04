@@ -73,6 +73,19 @@ fn interrupted_claim_fails_closed_and_definition_changes_are_refused() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// The window between `create_new` and the first write, which a racing signer process can see.
+/// A claim not yet written is a run in flight: interrupted, and never run again.
+#[test]
+fn an_unwritten_claim_reads_as_interrupted_and_never_executes() {
+    let dir = directory();
+    let workflow = definition();
+    std::fs::write(dir.join(format!("{}.json", workflow.run_id)), "").unwrap();
+    let report = run(&dir, &workflow, |_| panic!("a claim in flight cannot run")).unwrap();
+    assert_eq!(report["status"], "interrupted");
+    assert_eq!(report["replayed"], true);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn a_lost_submit_response_stops_the_workflow_and_is_never_retried() {
     let dir = directory();

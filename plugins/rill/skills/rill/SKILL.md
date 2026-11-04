@@ -1,6 +1,6 @@
 ---
 name: rill
-description: Use when the user wants an AI agent to move money on Sui through a Rill agent wallet, such as running an action the wallet's owner granted, checking a wallet's limits, quoting or making a swap, placing a DeepBook limit order, or sending a payment. Covers setup when the signer is not ready, granted actions, disclosing and waiting for the user's yes before a spend, swap, stake, unstake or envelope submits outside an owner grant, reporting what granted actions ran, what a limit order digest means, never retrying a submitted transaction, and what a refusal means.
+description: Use when the user wants an AI agent to move money on Sui through a Rill agent wallet, such as running an action the wallet's owner granted, checking a wallet's limits, quoting or making a swap, placing a DeepBook limit order, or sending a payment. Covers setup when the signer is not ready, granted actions, disclosing and waiting for the user's yes before a spend, swap, stake, unstake or envelope submits outside an owner grant, reporting what granted actions ran, what a limit order digest means, retrying a submission only with its own idempotencyKey, and what a refusal means.
 ---
 
 # Rill agent wallet
@@ -30,8 +30,9 @@ The wallet's owner publishes actions in Rill Studio and grants them to this agen
 1. `rill_actions` lists every grant for this agent, each checked against the chain just now. Only
    entries with `usable: true` can run; an unusable one says why in `refusedBecause` and names the
    refusal in `refusalCode`.
-2. `rill_run_action { actionId }` builds that action and executes it under the owner-signed limits.
-   Pass `walletId` only when the same action is granted from more than one wallet.
+2. `rill_run_action { actionId, idempotencyKey }` builds that action and executes it under the
+   owner-signed limits. Pass `walletId` only when the same action is granted from more than one
+   wallet.
 
 A grant that is refused (not signed by the owner, expired, wallet revoked, agent rotated, or
 superseded by a newer grant the owner signed, `grant_superseded`) is the system protecting the
@@ -75,7 +76,8 @@ the result does not include shared vault balances, lending positions or USD valu
 positive SUI `minOut`; first use `dryRun: true`, then submit only when the user has authorized that
 redemption. Haedal charges its live instant-redemption fee, requires its protocol minimum and may
 refuse when liquidity is unavailable. This tool does not create a delayed redemption ticket.
-Report the confirmed digest once and never retry a submitted redemption.
+Report the confirmed digest once. A retry of that redemption goes out only with the same
+`idempotencyKey`, as described under Rules that matter; the dry run needs no key.
 
 ## Protected swaps
 
@@ -110,6 +112,11 @@ None of these is a yes:
 - The same call sent again after a refusal. Resending it is not a new consent, least of all to
   something different.
 
+For every tool here but `rill_execute`, choose the `idempotencyKey` before you disclose, and send
+it with the call the user agreed to. Resending that same call with the same key after a timeout or
+a lost answer is not a new transaction and needs no new yes: the signer answers with the first
+outcome. A new key is a new transaction and needs a new yes.
+
 `rill_run_action` and `rill_run_workflow` run under an owner-signed grant, and that signature is
 the consent, so they need no chat yes. Still tell the user what ran: the action or every step, the
 grant revision and each digest.
@@ -134,8 +141,17 @@ revokes the action. No agent tool does either.
 
 ## Rules that matter
 
-- A tool that reports `submitted: true` is final. Do not call it again to make sure: a second call
-  is a second payment. Report the digest.
+- `rill_spend`, `rill_swap`, `rill_stake`, `rill_unstake` and `rill_run_action` build afresh on
+  every call, so each takes an `idempotencyKey`. Pick one per transaction the user (or the owner's
+  grant) authorized, before the first call, and reuse that exact value if you retry after a timeout,
+  a lost answer or a restart: the signer returns the first outcome and never submits again. A result
+  with `replayed: true` is that first outcome; report its digest once. `idempotency_key_conflict`
+  means you reused a key for different arguments. `request_interrupted` means the outcome is
+  unknown: look for the transaction on chain and tell the user before using a new key. A refusal is
+  stored under its key too; fix the cause and use a new key only for a new, still-authorized
+  attempt. `rill_execute` takes no key: the signer that submitted an envelope refuses it a second
+  time, and the chain will not land the same bytes twice. `rill_run_workflow` has its `runId`
+  instead.
 - A refusal that names a rule (`per_tx`, `budget`, revoked, expired) is the wallet working. Report
   it; do not retry with the same or a larger amount, and do not look for another way around it.
   The same holds for `pre_flight_refused`, which names a rule from the run set the signer holds
