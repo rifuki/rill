@@ -12,14 +12,14 @@
 # RILL_WALLET_BIN runs a binary you built or installed yourself instead, and skips the download.
 set -eu
 
-VERSION="0.10.3"
+VERSION="0.11.0"
 # One line per released asset: name and sha256, copied from the release and checked against a
 # local sha256 of each downloaded asset before being written here. A version with no line for a
 # platform refuses rather than running something unverified.
 CHECKSUMS="
-rill-wallet-darwin-arm64 4b45088af4cd1d08287eb6d2af646d9a87e0161d88621dee458552cf737dd540
-rill-wallet-darwin-x64 78b977bfb2828282cb6389b9520a91fd27e0eb0f52144653a8d6b4c30cb8a8b3
-rill-wallet-linux-x64 62d96f0f45a0dfbf0e7a88af5a5e0ed3a6c3446b04ab0c2f368922c471c0fa7d
+rill-wallet-darwin-arm64 c141ae71270613467654532930f19b8634be4d44b57f7d37426e4feee4a15ff8
+rill-wallet-darwin-x64 e905561cef2e9556768cec0bcbde54113e13c07db3fe13e44f08868df2c3396a
+rill-wallet-linux-x64 79a63c53e79d4be25e4e80bee60bffacef49ed0970416494a5151a1493048feb
 "
 
 say() { printf 'rill-mcp: %s\n' "$*" >&2; }
