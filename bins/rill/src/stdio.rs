@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use crate::keystore::Keystore;
 use crate::runset::{RunSet, RUN_SET_VAR};
 use crate::verdict::Failure;
+use rill_core::manifest::SignerTool;
 
 /// Protocol versions this signer speaks.
 // The list and the negotiation live in rill-mcp, so the two transports cannot drift apart on
@@ -67,6 +68,13 @@ pub struct WalletContext {
     /// one root and a test can point it at a scratch directory. `None` means grants are refused:
     /// without it the signer could not remember which grant revisions it has already verified.
     pub state_dir: Option<PathBuf>,
+    /// The node this signer talks to, when it is not the one `SUI_RPC_URL` or the network names.
+    /// A test points it at a closed local port, so a tool that reaches the network before a check
+    /// it should have made fails on this machine instead of reaching a real node.
+    pub rpc_url: Option<String>,
+    /// The Rill API grants are read from, when it is not the one `RILL_API_URL` names. Like
+    /// `rpc_url`, it lets a test pin the API instead of inheriting whatever the shell exports.
+    pub api_url: Option<String>,
 }
 
 /// One envelope this signer has already handed to the chain.
@@ -90,7 +98,15 @@ impl WalletContext {
             owner_tools: false,
             consumed_gas: HashMap::new(),
             state_dir: None,
+            rpc_url: None,
+            api_url: None,
         }
+    }
+
+    /// The Rill API this signer reads grants from and builds actions with: the pinned one, else
+    /// the one `RILL_API_URL` names.
+    pub fn api_url(&self) -> Option<String> {
+        self.api_url.clone().or_else(api_url_from_env)
     }
 
     /// The directory local state lives under; see [`WalletContext::state_dir`].
@@ -305,7 +321,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
         "rill_stake" => stake(context, id, &params),
         "rill_portfolio" => portfolio(context, id, &params),
         "rill_unstake" => unstake(context, id, &params),
-        "rill_execute" => execute(context, id, &params),
+        "rill_execute" => execute(context, id, &params, EnvelopeSource::HandSupplied),
         "rill_actions" => actions(context, id),
         "rill_run_action" => run_action(context, id, &params),
         "rill_run_workflow" => run_workflow(context, id, &params),
@@ -314,7 +330,7 @@ fn call(context: &mut WalletContext, id: Value, message: &Value) -> Value {
 }
 
 fn pair_signer(context: &WalletContext, id: Value, params: &Value) -> Value {
-    let Some(api) = api_url() else {
+    let Some(api) = context.api_url() else {
         return tool_error(id, "not_configured", NO_API);
     };
     let Some(key) = context.keystore.as_ref() else {
@@ -450,6 +466,9 @@ fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, String> {
 }
 
 fn endpoint(context: &WalletContext) -> String {
+    if let Some(url) = &context.rpc_url {
+        return url.clone();
+    }
     std::env::var("SUI_RPC_URL")
         .unwrap_or_else(|_| format!("https://fullnode.{}.sui.io:443", context.network))
 }
@@ -614,8 +633,9 @@ fn status(context: &WalletContext, id: Value) -> Value {
 /// What one wallet permits, and which layer holds each limit.
 ///
 /// The on-chain rules are read from the chain that enforces them. The pre-flight rules come from
-/// the loaded run-set, because they exist only where this signer has something to refuse against;
-/// see [`crate::wallet_read`] for why the two are labelled separately.
+/// the loaded run-set, and only when that run-set is for this wallet: another wallet's scopes are
+/// not this wallet's, and listing them here told an agent this wallet was bound by rules nothing
+/// would check against it. See [`crate::wallet_read`] for why the two are labelled separately.
 ///
 /// Its own tool rather than an argument to `rill_status`: it answers a different question, needs an
 /// argument that one does not, and costs a round trip a caller asking about the signer should not
@@ -626,10 +646,7 @@ fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     };
     let package = package_id();
 
-    let local = context
-        .run_set
-        .as_ref()
-        .map(|run_set| &run_set.capability_manifest);
+    let local = run_set_for(context, wallet).map(|run_set| &run_set.capability_manifest);
     let outcome = block_on(crate::wallet_read::read_limits(
         &endpoint(context),
         &package,
@@ -641,6 +658,259 @@ fn wallet(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         Ok(Err(e)) | Err(e) => {
             context.last_rejection = Some(e.clone());
             tool_error(id, "read_failed", &e)
+        }
+    }
+}
+
+/// The loaded run set, when it is for `wallet`.
+///
+/// Compared as addresses, because `0x1` and its 64-digit spelling are one wallet. A run set for
+/// another wallet says nothing about this one, so it is neither listed nor checked against it.
+fn run_set_for<'a>(context: &'a WalletContext, wallet: &str) -> Option<&'a RunSet> {
+    let wallet = wallet.parse::<sui_sdk_types::Address>().ok()?;
+    context
+        .run_set
+        .as_ref()
+        .filter(|run_set| run_set.wallet_id.parse::<sui_sdk_types::Address>().ok() == Some(wallet))
+}
+
+/// The packages a protocol scope never has to list: the framework, the wallet's own package and
+/// the guard. The same set the Rill builder allows, so an action it compiled under a scope is not
+/// refused here for calling the wallet it spends from.
+fn infrastructure(wallet_package: &str, guard_package: Option<&str>) -> Vec<String> {
+    let mut packages = vec![
+        "0x1".to_string(),
+        "0x2".into(),
+        "0x3".into(),
+        wallet_package.into(),
+    ];
+    packages.extend(guard_package.map(str::to_owned));
+    packages
+}
+
+/// The pre-flight rules of the run set for `wallet`, checked before anything is built.
+///
+/// Pure and first: a local build reads the chain before it can sign, so a refusal that waited for
+/// the build would cost round trips and could only be tested against a node. Which rules apply to
+/// which tool is [`RuleKind::signer_tools`](rill_core::manifest::RuleKind::signer_tools), not a
+/// decision made here.
+fn local_pre_flight(
+    context: &mut WalletContext,
+    id: &Value,
+    wallet: &str,
+    proposal: &rill_policy::preflight::Proposal,
+) -> Option<Value> {
+    let run_set = run_set_for(context, wallet)?;
+    let infrastructure = infrastructure(&run_set.wallet_package_id, None);
+    let refusal =
+        rill_policy::preflight::check(&run_set.capability_manifest, &infrastructure, proposal)
+            .err()?;
+    Some(pre_flight_refused(context, id.clone(), &refusal))
+}
+
+/// A pre-flight refusal, named by its rule so an agent reads which limit held without parsing.
+fn pre_flight_refused(
+    context: &mut WalletContext,
+    id: Value,
+    refusal: &rill_policy::preflight::PreFlightRefusal,
+) -> Value {
+    let reason = format!(
+        "{refusal}. This limit is the owner's, set in the run set this signer holds for the \
+         wallet; report it rather than retrying or looking for another tool to do the same."
+    );
+    context.last_rejection = Some(reason.clone());
+    tool_error_with(
+        id,
+        "pre_flight_refused",
+        &reason,
+        json!({ "rule": refusal.kind.module(), "enforcement": refusal.kind.enforcement().as_str() }),
+    )
+}
+
+/// The coin every agent wallet releases.
+const SUI: &str = "0x2::sui::SUI";
+
+/// What a local build would do, as the pre-flight checker reads it. One per tool, each naming
+/// only the facts that tool knows before it reads the chain. A spend moves SUI to its recipient,
+/// which is the signer itself when the caller names none.
+fn spend_proposal(recipient: &str) -> rill_policy::preflight::Proposal {
+    let mut proposal = rill_policy::preflight::Proposal::new(SignerTool::Spend);
+    proposal.coin_types = Some(vec![SUI.into()]);
+    proposal.recipients = Some(vec![recipient.into()]);
+    proposal
+}
+
+/// `bought` is the coin the swap outputs. `min_out` is the caller's floor as `swap_cmd` reads it:
+/// empty is zero, and zero emits no guard. Text that is not a u64 is a floor nobody can name, so it
+/// is `None`, which a slippage floor refuses rather than guesses.
+fn swap_proposal(
+    coin_type_a: &str,
+    coin_type_b: &str,
+    bought: &str,
+    min_out: &str,
+) -> rill_policy::preflight::Proposal {
+    let floor = if min_out.trim().is_empty() {
+        Some(0)
+    } else {
+        rill_core::amounts::parse_u64_string(min_out).ok()
+    };
+    let mut proposal = rill_policy::preflight::Proposal::new(SignerTool::Swap);
+    proposal.coin_types = Some(vec![coin_type_a.into(), coin_type_b.into()]);
+    proposal.swap_floors = Some(vec![(bought.into(), floor)]);
+    proposal
+}
+
+/// A stake moves SUI in and haSUI out. `hasui` is `None` when the Haedal package was overridden
+/// from the environment, because then this signer cannot name the coin the stake mints.
+fn stake_proposal(hasui: Option<&str>) -> rill_policy::preflight::Proposal {
+    let mut proposal = rill_policy::preflight::Proposal::new(SignerTool::Stake);
+    proposal.coin_types = hasui.map(|hasui| vec![SUI.into(), hasui.into()]);
+    proposal
+}
+
+/// Action ids of the grants this signer could use for `wallet` right now: verified against the
+/// chain, unexpired and not superseded, which is what an `Ok` verdict after the floor means.
+fn usable_grants_for(checked: &[CheckedGrant], wallet: &str) -> Vec<String> {
+    let Ok(wallet) = wallet.parse::<sui_sdk_types::Address>() else {
+        return Vec::new();
+    };
+    checked
+        .iter()
+        .filter_map(|(_, verdict)| verdict.as_ref().ok())
+        .filter(|verified| {
+            verified
+                .grant
+                .wallet_id
+                .parse::<sui_sdk_types::Address>()
+                .ok()
+                == Some(wallet)
+        })
+        .map(|verified| verified.grant.action_id.clone())
+        .collect()
+}
+
+/// What the grants this signer fetched say about a local build on one wallet.
+#[derive(Debug, PartialEq, Eq)]
+enum WalletGate {
+    /// No grant names the wallet, or every one that does is definitely unusable.
+    Open,
+    /// The owner granted these actions on the wallet, so it is spent through them.
+    Granted(Vec<String>),
+    /// Grants for these actions name the wallet and the node could not say whether they are
+    /// usable.
+    Unknown(Vec<String>),
+}
+
+/// Pure, so the decision is tested without a server or a node.
+fn wallet_gate(checked: &[CheckedGrant], wallet: &str) -> WalletGate {
+    let granted = usable_grants_for(checked, wallet);
+    if !granted.is_empty() {
+        return WalletGate::Granted(granted);
+    }
+    let Ok(wallet) = wallet.parse::<sui_sdk_types::Address>() else {
+        return WalletGate::Open;
+    };
+    let unknown: Vec<String> = checked
+        .iter()
+        .filter(|(_, verdict)| verdict.as_ref().is_err_and(|r| r.is_indeterminate()))
+        .filter(|(signed, _)| {
+            signed
+                .grant
+                .wallet_id
+                .parse::<sui_sdk_types::Address>()
+                .ok()
+                == Some(wallet)
+        })
+        .map(|(signed, _)| signed.grant.action_id.clone())
+        .collect();
+    if unknown.is_empty() {
+        WalletGate::Open
+    } else {
+        WalletGate::Unknown(unknown)
+    }
+}
+
+/// The refusal for a local build on a wallet the owner granted actions on.
+fn use_granted_action(
+    context: &mut WalletContext,
+    id: Value,
+    wallet: &str,
+    actions: &[String],
+) -> Value {
+    let reason = format!(
+        "The owner of {wallet} granted this agent actions on it ({}), so this signer does not \
+         build its own transactions for that wallet: they would spend the same wallet and cap \
+         outside the grant's limits. Run the granted action through rill_run_action instead; \
+         rill_actions lists them. Do not look for another route.",
+        actions.join(", ")
+    );
+    context.last_rejection = Some(reason.clone());
+    tool_error_with(
+        id,
+        "use_granted_action",
+        &reason,
+        json!({ "walletId": wallet, "actionIds": actions }),
+    )
+}
+
+/// Refuses a local build on a wallet this signer holds a usable grant for.
+///
+/// A grant's scopes bind only the envelope its action builds. Without this, an agent holding the
+/// grant could spend the same wallet and cap through `rill_spend`, `rill_swap`, `rill_stake` or a
+/// hand-supplied envelope, where only the on-chain rules apply. So a wallet with a grant is spent
+/// through the grant, and a wallet without one keeps working as before.
+///
+/// `api` is the Rill API grants are read from. With none configured the signer runs in pure local
+/// mode, has no grants to read, and the check is skipped. With one configured and unreachable, or
+/// when a grant naming the wallet could not be checked because the node did not answer, it cannot
+/// know whether the wallet is granted, so it refuses with `grants_unavailable` rather than assume
+/// the wallet is not. A grant the node did answer about and that failed (forged, expired,
+/// superseded, a revoked wallet) is not a grant, and leaves the wallet open. The check is as
+/// current as the API's answer: the keyless server can withhold a grant, and then this signer
+/// sees a wallet without one.
+fn granted_wallet_gate(
+    context: &mut WalletContext,
+    id: &Value,
+    wallet: &str,
+    api: Option<&str>,
+) -> Option<Value> {
+    let api = api?;
+    let signer = context.keystore.as_ref()?.address().to_string();
+    let checked = match checked_grants(context, &signer, api) {
+        Ok(checked) => checked,
+        Err(e) => {
+            let reason = format!(
+                "This signer could not read its grants, so it cannot tell whether {wallet} must be \
+                 spent through one, and refuses rather than guess: {e}"
+            );
+            context.last_rejection = Some(reason.clone());
+            return Some(tool_error(id.clone(), "grants_unavailable", &reason));
+        }
+    };
+    gate_refusal(context, id, wallet, wallet_gate(&checked, wallet))
+}
+
+/// The tool error a gate decision calls for, if any.
+fn gate_refusal(
+    context: &mut WalletContext,
+    id: &Value,
+    wallet: &str,
+    gate: WalletGate,
+) -> Option<Value> {
+    match gate {
+        WalletGate::Open => None,
+        WalletGate::Granted(actions) => {
+            Some(use_granted_action(context, id.clone(), wallet, &actions))
+        }
+        WalletGate::Unknown(actions) => {
+            let reason = format!(
+                "The node could not say whether the owner's grants on {wallet} ({}) are usable, so \
+                 this signer cannot tell whether that wallet must be spent through one, and \
+                 refuses rather than guess. Read rill_actions again once the node answers.",
+                actions.join(", ")
+            );
+            context.last_rejection = Some(reason.clone());
+            Some(tool_error(id.clone(), "grants_unavailable", &reason))
         }
     }
 }
@@ -676,6 +946,17 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         );
     };
 
+    // Both before anything is built or read: see `local_pre_flight` and `granted_wallet_gate`.
+    let signer = keystore.address().to_string();
+    let recipient = argument(params, "to").unwrap_or(&signer);
+    if let Some(refused) = local_pre_flight(context, &id, wallet, &spend_proposal(recipient)) {
+        return refused;
+    }
+    let api = context.api_url();
+    if let Some(refused) = granted_wallet_gate(context, &id, wallet, api.as_deref()) {
+        return refused;
+    }
+
     let args = crate::spend_cmd::SpendArgs {
         package_id: package_id(),
         version_id: version_id(),
@@ -687,6 +968,9 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         dry_run: false,
     };
 
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
     // A rule that refused arrives as a refusal naming the rule, not as `"code": "refused"` with
     // `per_tx` somewhere in the prose. That distinction is the whole of R3 on this path.
     match block_on(crate::spend_cmd::spend_json(
@@ -707,11 +991,11 @@ fn spend(context: &mut WalletContext, id: Value, params: &Value) -> Value {
 /// chain, and the refusal names the rule. A swap from this signer's own coins would be an ordinary
 /// swap with extra steps, and would prove nothing the product claims.
 fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
-    let Some(keystore) = context.keystore.as_ref() else {
+    if context.keystore.is_none() {
         let reason = "No signing key is configured, so nothing can be signed.".to_string();
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "no_key", &reason);
-    };
+    }
     if context.network == "mainnet" && !context.mainnet_allowed {
         let reason = rill_core::mainnet::mainnet_refusal();
         context.last_rejection = Some(reason.clone());
@@ -748,6 +1032,28 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     }
     let get = |name: &str| argument(params, name).unwrap_or_default().to_string();
 
+    // The coin the swap buys is the side the wallet's SUI does not fund, as `swap_cmd` reads it.
+    let a2b = a2b.unwrap_or(false);
+    let bought = if a2b {
+        get("coinTypeB")
+    } else {
+        get("coinTypeA")
+    };
+    let proposal = swap_proposal(
+        &get("coinTypeA"),
+        &get("coinTypeB"),
+        &bought,
+        &get("minOut"),
+    );
+    let wallet = get("wallet");
+    if let Some(refused) = local_pre_flight(context, &id, &wallet, &proposal) {
+        return refused;
+    }
+    let api = context.api_url();
+    if let Some(refused) = granted_wallet_gate(context, &id, &wallet, api.as_deref()) {
+        return refused;
+    }
+
     let args = crate::swap_cmd::SwapArgs {
         package_id: package_id(),
         version_id: version_id(),
@@ -764,7 +1070,7 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         pool_id: get("pool"),
         coin_type_a: get("coinTypeA"),
         coin_type_b: get("coinTypeB"),
-        a2b: a2b.unwrap_or(false),
+        a2b,
         spend: get("amount"),
         min_out_base_units: get("minOut"),
         guard_package_id: guard_package_id(),
@@ -778,6 +1084,9 @@ fn swap(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         dry_run: false,
     };
 
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
+    };
     match block_on(crate::swap_cmd::swap_json(
         &endpoint(context),
         keystore,
@@ -900,11 +1209,11 @@ fn unstake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
 
 /// A Haedal liquid stake the wallet pays for, under its own rules.
 fn stake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
-    let Some(keystore) = context.keystore.as_ref() else {
+    if context.keystore.is_none() {
         let reason = "No signing key is configured, so nothing can be signed.".to_string();
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "no_key", &reason);
-    };
+    }
     if context.network == "mainnet" && !context.mainnet_allowed {
         let reason = rill_core::mainnet::mainnet_refusal();
         context.last_rejection = Some(reason.clone());
@@ -926,6 +1235,21 @@ fn stake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         v if v.is_empty() => "0x0".to_string(),
         v => v,
     };
+    // The coin a stake mints is fixed by the Haedal package, so it can be named only for the
+    // package this signer defaults to. An overridden package mints a coin nobody here can name.
+    let hasui = match std::env::var("HAEDAL_PACKAGE_ID") {
+        Ok(_) => None,
+        Err(_) if context.network == "mainnet" => Some(crate::unstake_cmd::MAINNET_HASUI),
+        Err(_) => Some(rill_ptb::deployments::TESTNET_HASUI_TYPE),
+    };
+    let wallet = get("wallet");
+    if let Some(refused) = local_pre_flight(context, &id, &wallet, &stake_proposal(hasui)) {
+        return refused;
+    }
+    let api = context.api_url();
+    if let Some(refused) = granted_wallet_gate(context, &id, &wallet, api.as_deref()) {
+        return refused;
+    }
     let args = crate::stake_cmd::StakeArgs {
         package_id: package_id(),
         version_id: version_id(),
@@ -949,6 +1273,9 @@ fn stake(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         spend: get("amount"),
         gas_budget: TOOL_GAS_BUDGET,
         dry_run: false,
+    };
+    let Some(keystore) = context.keystore.as_ref() else {
+        return tool_error(id, "no_key", "No signing key is configured.");
     };
     match block_on(crate::stake_cmd::stake_json(
         &endpoint(context),
@@ -1174,8 +1501,8 @@ fn bad_mist(id: Value, fields: &[(&str, &str)]) -> Option<Value> {
     })
 }
 
-/// The Rill API this signer reads grants from and builds actions with.
-fn api_url() -> Option<String> {
+/// The Rill API `RILL_API_URL` names. Read through [`WalletContext::api_url`], never directly.
+fn api_url_from_env() -> Option<String> {
     std::env::var(crate::config::API_URL_VAR)
         .ok()
         .map(|url| url.trim().trim_end_matches('/').to_owned())
@@ -1329,7 +1656,7 @@ fn preflight_refusal(
 
 /// `rill_actions`: what this agent may run, and for each grant that cannot be used, why.
 fn actions(context: &mut WalletContext, id: Value) -> Value {
-    let Some(api) = api_url() else {
+    let Some(api) = context.api_url() else {
         return tool_error(id, "not_configured", NO_API);
     };
     let Some(keystore) = context.keystore.as_ref() else {
@@ -1366,7 +1693,7 @@ fn run_action_for_owner(
     params: &Value,
     owner: Option<&str>,
 ) -> Value {
-    let Some(api) = api_url() else {
+    let Some(api) = context.api_url() else {
         return tool_error(id, "not_configured", NO_API);
     };
     let Some(keystore) = context.keystore.as_ref() else {
@@ -1577,6 +1904,7 @@ fn run_action_for_owner(
         context,
         id,
         &json!({ "arguments": { "envelope": envelope } }),
+        EnvelopeSource::Grant,
     );
     context.run_set = saved;
     if let Some(structured) = response
@@ -1633,7 +1961,7 @@ fn run_workflow(context: &mut WalletContext, id: Value, params: &Value) -> Value
     let mut preflight_done = false;
     let report = crate::workflow::run(&directory, &workflow, |step| {
         if !preflight_done {
-            let Some(api) = api_url() else {
+            let Some(api) = context.api_url() else {
                 return json!({"error":"not_configured", "reason":NO_API});
             };
             let checked = match checked_grants(context, &signer, &api) {
@@ -1689,7 +2017,21 @@ const ORDER_PLACED_NOTE: &str = "Order placed on DeepBook and confirmed. This di
     has no tool that reads order status or cancels an order; cancelling and withdrawing are the \
     owner's, in Studio.";
 
-fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
+/// Where an envelope came from, which decides whether a grant has to be its route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeSource {
+    /// Passed to `rill_execute` and checked against the run set loaded from a file.
+    HandSupplied,
+    /// Built for an owner-signed grant by `rill_run_action`, under that grant's run set.
+    Grant,
+}
+
+fn execute(
+    context: &mut WalletContext,
+    id: Value,
+    params: &Value,
+    source: EnvelopeSource,
+) -> Value {
     let Some(run_set) = context.run_set.as_ref() else {
         // Names what is missing and where it goes. "No run-set is loaded" alone tells an agent it
         // cannot proceed without telling whoever launched the signer what to fix.
@@ -1729,7 +2071,11 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
         };
 
     let policy = match run_set.to_policy() {
-        Ok(p) => p,
+        // The guard this signer trusts, which a protocol scope never has to list.
+        Ok(p) => rill_policy::LocalPolicy {
+            guard_package_id: Some(guard_package_id()),
+            ..p
+        },
         Err(e) => return tool_error(id, "bad_run_set", &e.to_string()),
     };
     let validated = match rill_policy::RawEnvelope::new(envelope).validate(&policy, now_ms()) {
@@ -1742,12 +2088,25 @@ fn execute(context: &mut WalletContext, id: Value, params: &Value) -> Value {
     };
     let pinned = match validated.pin_bytes(&policy) {
         Ok(p) => p,
+        Err(rill_policy::Rejection::PreFlight(refusal)) => {
+            return pre_flight_refused(context, id, &refusal)
+        }
         Err(rejection) => {
             let reason = rejection.to_string();
             context.last_rejection = Some(reason.clone());
             return tool_error(id, "policy_rejection", &reason);
         }
     };
+
+    // Last of the local checks, because it is the one that reads the network: a hand-supplied
+    // envelope for a wallet the owner granted actions on must go through the grant instead.
+    if source == EnvelopeSource::HandSupplied {
+        let api = context.api_url();
+        if let Some(refused) = granted_wallet_gate(context, &id, &policy.wallet_id, api.as_deref())
+        {
+            return refused;
+        }
+    }
 
     let digest = pinned.pinned_digest().to_string();
     let targets = pinned.decoded().targets.clone();
@@ -2726,5 +3085,589 @@ mod grant_floor_tests {
         let missing = preflight_refusal(&[usable(3)], &step(2), OWNER).unwrap();
         assert_eq!(missing["error"], "workflow_preflight_refused");
         assert!(missing.get("refusalCode").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pre_flight_tests {
+    //! The pre-flight rules each signing tool claims, refused on that tool and nowhere else.
+    //!
+    //! Every context here talks to a closed local port, so a tool that reached the network before
+    //! the check it should have made fails on this machine rather than reaching a node. That is
+    //! what makes these tests fail offline on code that does not check.
+
+    use super::*;
+    use crate::grants::{Refusal, VerifiedGrant};
+    use rill_core::grant::{Grant, SignedGrant};
+    use rill_core::manifest::{CapabilityRule, Enforcement, RuleKind};
+
+    const PKG: &str = "0x000000000000000000000000000000000000000000000000000000000000cafe";
+    const WALLET: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const ANOTHER_WALLET: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000002";
+    const ALLOWED: &str = "0x000000000000000000000000000000000000000000000000000000000000beef";
+    const STRANGER: &str = "0x000000000000000000000000000000000000000000000000000000000000dead";
+    const OFF_SCOPE: &str = "0x0000000000000000000000000000000000000000000000000000000000000bad";
+    const USDC: &str =
+        "0x00000000000000000000000000000000000000000000000000000000000000c1::usdc::USDC";
+    /// Nothing listens here, so a network call fails at once and stays on this machine.
+    const CLOSED: &str = "http://127.0.0.1:1";
+
+    fn key() -> Keystore {
+        use sui_crypto::ed25519::Ed25519PrivateKey;
+        let encoded = Ed25519PrivateKey::new([11u8; 32]).to_suiprivkey().unwrap();
+        Keystore::from_suiprivkey(&encoded).unwrap()
+    }
+
+    fn signer() -> String {
+        key().address().to_string()
+    }
+
+    /// A run set for WALLET whose manifest carries a budget and `rule`, pinning `targets`.
+    fn run_set(rule: CapabilityRule, targets: &[String]) -> RunSet {
+        serde_json::from_value(json!({
+            "label": "pre-flight",
+            "network": "testnet",
+            "sender": signer(),
+            "actionId": "skill_hero",
+            "walletPackageId": PKG,
+            "walletId": WALLET,
+            "agentCapId": "0xcap",
+            "versionId": "0xversion",
+            "capabilityManifest": {
+                "walletCoinType": "0x2::sui::SUI",
+                "rules": [{ "kind": "budget", "totalMist": "5000000000" }, rule]
+            },
+            "allowedTargets": targets,
+            "allowedObjectIds": [WALLET],
+            "maxAmountBaseUnits": "2000000000",
+            "declaredSpendBaseUnits": "2000000000",
+            "minimumRemainingBaseUnits": "0",
+            "gasCeilingBaseUnits": "50000000"
+        }))
+        .unwrap()
+    }
+
+    fn context(rule: CapabilityRule) -> WalletContext {
+        let mut context = WalletContext::new(Some(key()), "testnet".into(), false)
+            .with_run_set(Some(run_set(rule, &[request_spend()])));
+        context.rpc_url = Some(CLOSED.into());
+        context
+    }
+
+    fn request_spend() -> String {
+        format!("{PKG}::agent_wallet::request_spend")
+    }
+
+    fn call(context: &mut WalletContext, tool: &str, arguments: Value) -> Value {
+        let message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        });
+        handle(context, &message).expect("a request gets a reply")["result"].clone()
+    }
+
+    fn code(result: &Value) -> &str {
+        result["structuredContent"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no code in {result}"))
+    }
+
+    fn assert_refused(result: &Value, kind: RuleKind) {
+        assert_eq!(code(result), "pre_flight_refused", "{result}");
+        assert_eq!(
+            result["structuredContent"]["rule"],
+            kind.module(),
+            "{result}"
+        );
+    }
+
+    fn recipients_allowlist() -> CapabilityRule {
+        CapabilityRule::RecipientAllowlist {
+            addresses: vec![ALLOWED.into()],
+        }
+    }
+
+    fn usdc_only() -> CapabilityRule {
+        CapabilityRule::AssetScope {
+            allowed_coin_types: vec![USDC.into()],
+        }
+    }
+
+    fn spend_to(wallet: &str, to: &str) -> Value {
+        json!({ "wallet": wallet, "cap": "0xcap", "amount": "0.01", "to": to })
+    }
+
+    fn swap_arguments(min_out: &str, accept_any: bool) -> Value {
+        json!({
+            "wallet": WALLET, "cap": "0xcap", "amount": "0.01", "pool": "0xpool",
+            "coinTypeA": "0x2::sui::SUI", "coinTypeB": USDC, "a2b": true,
+            "minOut": min_out, "acceptAnyOutput": accept_any
+        })
+    }
+
+    #[test]
+    fn rill_spend_refuses_a_recipient_off_the_allowlist() {
+        let mut context = context(recipients_allowlist());
+        let result = call(&mut context, "rill_spend", spend_to(WALLET, STRANGER));
+        assert_refused(&result, RuleKind::RecipientAllowlist);
+    }
+
+    #[test]
+    fn rill_spend_refuses_when_sui_is_outside_the_asset_scope() {
+        let mut context = context(usdc_only());
+        let result = call(&mut context, "rill_spend", spend_to(WALLET, ALLOWED));
+        assert_refused(&result, RuleKind::AssetScope);
+    }
+
+    #[test]
+    fn rill_swap_refuses_a_minout_below_the_manifest_floor() {
+        let mut context = context(CapabilityRule::SlippageFloor {
+            min_out_mist: "1000".into(),
+            coin_type: Some(USDC.into()),
+        });
+        let result = call(&mut context, "rill_swap", swap_arguments("999", false));
+        assert_refused(&result, RuleKind::SlippageFloor);
+    }
+
+    #[test]
+    fn rill_swap_refuses_accept_any_output_under_a_floor() {
+        let mut context = context(CapabilityRule::SlippageFloor {
+            min_out_mist: "1000".into(),
+            coin_type: None,
+        });
+        let result = call(&mut context, "rill_swap", swap_arguments("", true));
+        assert_refused(&result, RuleKind::SlippageFloor);
+    }
+
+    #[test]
+    fn rill_swap_refuses_a_coin_outside_the_asset_scope() {
+        let mut context = context(CapabilityRule::AssetScope {
+            allowed_coin_types: vec!["0x2::sui::SUI".into()],
+        });
+        let result = call(&mut context, "rill_swap", swap_arguments("5", false));
+        assert_refused(&result, RuleKind::AssetScope);
+    }
+
+    #[test]
+    fn rill_stake_refuses_when_hasui_is_outside_the_asset_scope() {
+        let mut context = context(CapabilityRule::AssetScope {
+            allowed_coin_types: vec!["0x2::sui::SUI".into()],
+        });
+        let result = call(
+            &mut context,
+            "rill_stake",
+            json!({ "wallet": WALLET, "cap": "0xcap", "amount": "1" }),
+        );
+        assert_refused(&result, RuleKind::AssetScope);
+    }
+
+    /// The guarantee is per wallet: a run set for one wallet says nothing about another, so a
+    /// spend from another wallet is not checked against it. It reaches the (closed) node instead.
+    #[test]
+    fn rill_spend_on_another_wallet_is_not_checked_against_this_run_set() {
+        let mut context = context(recipients_allowlist());
+        let result = call(
+            &mut context,
+            "rill_spend",
+            spend_to(ANOTHER_WALLET, STRANGER),
+        );
+        assert_ne!(code(&result), "pre_flight_refused", "{result}");
+    }
+
+    /// An allowed spend is not refused by the check, and the same wallet spelt short is the same
+    /// wallet.
+    #[test]
+    fn a_spend_inside_every_scope_passes_the_check() {
+        let mut context = context(recipients_allowlist());
+        let result = call(&mut context, "rill_spend", spend_to("0x1", ALLOWED));
+        assert_ne!(code(&result), "pre_flight_refused", "{result}");
+    }
+
+    // ── rill_execute: protocol scope, read from the bytes ──────────────────────────────────────
+
+    /// A transaction that requests a spend and then calls `extra`, built the way the server
+    /// builds one.
+    fn ptb_calling(extra: &str) -> String {
+        use sui_sdk_types::{Address, Digest, Identifier};
+        use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
+
+        let mut tx = TransactionBuilder::new();
+        tx.set_sender(signer().parse::<Address>().unwrap());
+        tx.set_gas_budget(50_000_000);
+        tx.set_gas_price(1_000);
+        tx.add_gas_objects([ObjectInput::owned(
+            "0x000000000000000000000000000000000000000000000000000000000000000a"
+                .parse()
+                .unwrap(),
+            1,
+            Digest::ZERO,
+        )]);
+        let wallet = tx.object(ObjectInput::shared(WALLET.parse().unwrap(), 400_001, true));
+        tx.move_call(
+            Function::new(
+                PKG.parse().unwrap(),
+                Identifier::new("agent_wallet").unwrap(),
+                Identifier::new("request_spend").unwrap(),
+            ),
+            vec![wallet],
+        );
+        tx.move_call(
+            Function::new(
+                extra.parse().unwrap(),
+                Identifier::new("m").unwrap(),
+                Identifier::new("f").unwrap(),
+            ),
+            vec![],
+        );
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(bcs::to_bytes(&tx.try_build().unwrap()).unwrap())
+    }
+
+    fn execute_context(scope: &str, extra: &str) -> (WalletContext, Value) {
+        let targets = vec![request_spend(), format!("{extra}::m::f")];
+        let rule = CapabilityRule::ProtocolScope {
+            allowed_packages: vec![scope.into()],
+        };
+        let mut context = WalletContext::new(Some(key()), "testnet".into(), false)
+            .with_run_set(Some(run_set(rule, &targets)));
+        context.rpc_url = Some(CLOSED.into());
+        let ptb = ptb_calling(extra);
+        let expires = (now_ms() + 60_000) / 1000;
+        let envelope = json!({
+            "version": "1",
+            "actionId": "skill_hero",
+            "actionDigest": rill_core::envelope::digest_unsigned_ptb(&ptb),
+            "network": "testnet",
+            "sender": signer(),
+            "walletPackageId": PKG,
+            "walletId": WALLET,
+            "agentCapId": "0xcap",
+            "balanceManagerId": "0xbm",
+            "tradeCapId": "0xtc",
+            "resolvedParams": {
+                "poolKey": "DEEP_SUI", "poolId": "0xpool", "clientOrderId": "1",
+                "spendAmountMist": "1000000000", "price": "2.5", "quantity": "1",
+                "depositSui": "1", "isBid": true, "payWithDeep": false
+            },
+            "allowedTargets": targets,
+            "requiredObjectIds": [WALLET],
+            "requiredGuards": [],
+            "unsignedPtb": ptb,
+            "preview": "a call outside the scope",
+            "simulation": {
+                "ok": true, "verification": "verified", "gasEstimate": "2000000",
+                "balanceChanges": [], "objectChanges": []
+            },
+            "expiresAt": iso(expires)
+        });
+        (context, envelope)
+    }
+
+    /// Seconds since the epoch as the ISO instant an envelope carries.
+    fn iso(secs: u64) -> String {
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
+            rem / 3600,
+            (rem / 60) % 60,
+            rem % 60
+        )
+    }
+
+    /// The run set pins the off-scope call, so the sequence check passes: only a comparison with
+    /// the manifest's scope refuses it. A hand-written run set is exactly where that can happen.
+    #[test]
+    fn rill_execute_refuses_a_target_package_outside_the_protocol_scope() {
+        let (mut context, envelope) = execute_context(ALLOWED, OFF_SCOPE);
+        let result = call(
+            &mut context,
+            "rill_execute",
+            json!({ "envelope": envelope }),
+        );
+        assert_refused(&result, RuleKind::ProtocolScope);
+    }
+
+    /// The same envelope with the package in scope passes every local check and reaches the node,
+    /// so the scope is the only thing the refusal above answered to.
+    #[test]
+    fn rill_execute_passes_a_target_package_inside_the_protocol_scope() {
+        let (mut context, envelope) = execute_context(OFF_SCOPE, OFF_SCOPE);
+        let result = call(
+            &mut context,
+            "rill_execute",
+            json!({ "envelope": envelope }),
+        );
+        assert_eq!(code(&result), "chain_unavailable", "{result}");
+    }
+
+    // ── the table: every claim refused, every refusal claimed ──────────────────────────────────
+
+    /// A rule of `kind` and a call to `tool` that breaks it, or `None` for a pair with no input.
+    fn violation(kind: RuleKind, tool: SignerTool) -> Option<(WalletContext, &'static str, Value)> {
+        let (rule, name, arguments) = match (kind, tool) {
+            (RuleKind::RecipientAllowlist, SignerTool::Spend) => (
+                recipients_allowlist(),
+                "rill_spend",
+                spend_to(WALLET, STRANGER),
+            ),
+            (RuleKind::AssetScope, SignerTool::Spend) => {
+                (usdc_only(), "rill_spend", spend_to(WALLET, ALLOWED))
+            }
+            (RuleKind::AssetScope, SignerTool::Swap) => (
+                CapabilityRule::AssetScope {
+                    allowed_coin_types: vec!["0x2::sui::SUI".into()],
+                },
+                "rill_swap",
+                swap_arguments("5", false),
+            ),
+            (RuleKind::AssetScope, SignerTool::Stake) => (
+                usdc_only(),
+                "rill_stake",
+                json!({ "wallet": WALLET, "cap": "0xcap", "amount": "1" }),
+            ),
+            (RuleKind::SlippageFloor, SignerTool::Swap) => (
+                CapabilityRule::SlippageFloor {
+                    min_out_mist: "1000".into(),
+                    coin_type: None,
+                },
+                "rill_swap",
+                swap_arguments("999", false),
+            ),
+            (RuleKind::ProtocolScope, SignerTool::Execute) => {
+                let (context, envelope) = execute_context(ALLOWED, OFF_SCOPE);
+                return Some((context, "rill_execute", json!({ "envelope": envelope })));
+            }
+            _ => return None,
+        };
+        Some((context(rule), name, arguments))
+    }
+
+    /// Iterates the table every claim is rendered from. A pair added to `signer_tools` without a
+    /// violating input here fails, so a tool cannot be said to refuse a rule nobody has seen it
+    /// refuse. `rill_run_action` and `rill_run_workflow` need a grant from the network; what they
+    /// share with `rill_execute` is asserted on the source below.
+    #[test]
+    fn every_pre_flight_kind_is_refused_on_every_tool_that_claims_it() {
+        for kind in RuleKind::all() {
+            match kind.enforcement() {
+                Enforcement::OnChain => assert!(
+                    kind.signer_tools().is_empty(),
+                    "{} is the chain's; the signer must not claim it",
+                    kind.module()
+                ),
+                Enforcement::PreFlight => {
+                    assert!(
+                        !kind.signer_tools().is_empty(),
+                        "{} is refused by no signer tool; say so or claim one",
+                        kind.module()
+                    );
+                    for tool in kind.signer_tools() {
+                        let (mut context, name, arguments) =
+                            violation(kind, *tool).unwrap_or_else(|| {
+                                panic!("no violating input for {} on {tool:?}", kind.module())
+                            });
+                        let result = call(&mut context, name, arguments);
+                        assert_refused(&result, kind);
+                    }
+                }
+            }
+        }
+    }
+
+    const SOURCE: &str = include_str!("stdio.rs");
+
+    fn shipped() -> &'static str {
+        SOURCE.split("#[cfg(test)]").next().unwrap()
+    }
+
+    /// One function's body, from its signature to the next item at column zero.
+    fn body(name: &str) -> &'static str {
+        let shipped = shipped();
+        let start = shipped
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("no fn {name}"));
+        let rest = &shipped[start + 1..];
+        &rest[..rest.find("\n}\n").expect("the function closes")]
+    }
+
+    /// The two granted tools run the very execution `rill_execute` runs, under the grant's run
+    /// set, so every rule it refuses they refuse.
+    #[test]
+    fn the_granted_tools_run_the_execute_path_under_the_grants_run_set() {
+        let action = body("run_action_for_owner");
+        assert!(action.contains("context.run_set.replace(verified.run_set.clone())"));
+        assert!(action.contains("execute(") && action.contains("EnvelopeSource::Grant"));
+        assert!(body("run_workflow").contains("run_action_for_owner("));
+        assert!(body("run_action").contains("run_action_for_owner("));
+    }
+
+    /// Both checks come before the first network call in each local build, which is what makes a
+    /// refusal free and testable without a node.
+    #[test]
+    fn every_local_build_checks_before_it_reaches_the_network() {
+        for tool in ["spend", "swap", "stake"] {
+            let body = body(tool);
+            let network = body
+                .find("block_on(")
+                .expect("a local build reaches the chain");
+            for check in ["local_pre_flight(", "granted_wallet_gate("] {
+                let at = body
+                    .find(check)
+                    .unwrap_or_else(|| panic!("{tool} never calls {check}"));
+                assert!(at < network, "{tool} calls {check} after the network");
+            }
+        }
+        let execute = body("execute");
+        let gate = execute
+            .find("granted_wallet_gate(")
+            .expect("rill_execute checks for a grant");
+        assert!(gate < execute.find("block_on(").unwrap());
+    }
+
+    // ── the wallet read lists only this wallet's run set ──────────────────────────────────────
+
+    #[test]
+    fn rill_wallet_omits_the_run_sets_pre_flight_rules_for_another_wallet() {
+        let context = context(recipients_allowlist());
+        assert!(run_set_for(&context, ANOTHER_WALLET).is_none());
+        assert!(run_set_for(&context, "0x1").is_some(), "0x1 is WALLET");
+        assert!(
+            body("wallet").contains("run_set_for(context, wallet)"),
+            "the wallet read must take only the run set for the wallet it was asked about"
+        );
+    }
+
+    // ── a wallet the owner granted actions on goes through the grant ──────────────────────────
+
+    fn grant(wallet: &str, action: &str, verdict: Result<(), Refusal>) -> CheckedGrant {
+        let run_set =
+            serde_json::to_value(run_set(recipients_allowlist(), &[request_spend()])).unwrap();
+        let signed = SignedGrant {
+            grant: Grant {
+                network: "testnet".into(),
+                action_id: action.into(),
+                action_name: action.into(),
+                agent: signer(),
+                wallet_id: wallet.into(),
+                wallet_package_id: PKG.into(),
+                expires_at_ms: "9999999999999".into(),
+                revision: 1,
+                run_set,
+                build_arguments: json!({}),
+            },
+            signature: "sig".into(),
+        };
+        let verdict = verdict.map(|()| VerifiedGrant {
+            grant: signed.grant.clone(),
+            run_set: RunSet::from_value(&signed.grant.run_set).unwrap(),
+            owner: ALLOWED.into(),
+        });
+        (signed, verdict)
+    }
+
+    #[test]
+    fn only_a_usable_grant_for_this_wallet_routes_it_through_the_grant() {
+        let checked = vec![
+            grant(WALLET, "skill_a", Ok(())),
+            grant(WALLET, "skill_b", Err(Refusal::Expired)),
+            grant(
+                WALLET,
+                "skill_c",
+                Err(Refusal::Superseded { floor: 2, given: 1 }),
+            ),
+            grant(ANOTHER_WALLET, "skill_d", Ok(())),
+        ];
+        assert_eq!(usable_grants_for(&checked, "0x1"), vec!["skill_a"]);
+        assert!(usable_grants_for(&checked[1..3], WALLET).is_empty());
+    }
+
+    /// A grant for this wallet the node could not check is not a wallet without a grant. Read as
+    /// one, a node that serves object reads and fails signature checks would let a local build
+    /// spend the wallet outside the grant's scopes.
+    #[test]
+    fn a_grant_the_node_could_not_check_leaves_the_wallet_unknown() {
+        let unchecked = || Err(Refusal::NodeUnavailable("the node could not answer".into()));
+        let checked = vec![
+            grant(WALLET, "skill_a", unchecked()),
+            grant(WALLET, "skill_b", Err(Refusal::Expired)),
+            grant(ANOTHER_WALLET, "skill_c", unchecked()),
+        ];
+        assert_eq!(
+            wallet_gate(&checked, "0x1"),
+            WalletGate::Unknown(vec!["skill_a".into()])
+        );
+        // A usable grant decides it: the wallet is granted whatever else is unknown.
+        let mut with_usable = checked.clone();
+        with_usable.push(grant(WALLET, "skill_d", Ok(())));
+        assert_eq!(
+            wallet_gate(&with_usable, WALLET),
+            WalletGate::Granted(vec!["skill_d".into()])
+        );
+        // Definite refusals, and unknowns for another wallet, leave this wallet open.
+        assert_eq!(wallet_gate(&checked[1..], WALLET), WalletGate::Open);
+    }
+
+    /// Unknown is refused as an unreadable grant list is: this signer cannot tell whether the
+    /// wallet must be spent through a grant, so it does not build for it.
+    #[test]
+    fn an_unknown_grant_refuses_with_grants_unavailable() {
+        let mut context = context(recipients_allowlist());
+        let refused = gate_refusal(
+            &mut context,
+            &json!(1),
+            WALLET,
+            WalletGate::Unknown(vec!["skill_a".into()]),
+        )
+        .expect("a grant nobody could check is a refusal");
+        assert_eq!(code(&refused["result"]), "grants_unavailable", "{refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("skill_a"), "{text}");
+        assert!(gate_refusal(&mut context, &json!(1), WALLET, WalletGate::Open).is_none());
+    }
+
+    #[test]
+    fn a_granted_wallet_is_refused_with_use_granted_action() {
+        let mut context = context(recipients_allowlist());
+        let result = use_granted_action(&mut context, json!(1), WALLET, &["skill_a".into()]);
+        assert_eq!(code(&result["result"]), "use_granted_action", "{result}");
+        let text = result["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("rill_run_action"), "{text}");
+    }
+
+    /// Pure local mode: with no Rill API there are no grants to route through, and the local
+    /// builds keep working exactly as before.
+    #[test]
+    fn without_an_api_the_grant_check_is_skipped() {
+        let mut context = context(recipients_allowlist());
+        assert!(granted_wallet_gate(&mut context, &json!(1), WALLET, None).is_none());
+    }
+
+    /// With an API configured and unreachable, this signer cannot know whether the wallet is
+    /// granted, so it refuses rather than guessing that it is not.
+    #[test]
+    fn an_unreachable_api_refuses_with_grants_unavailable() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rill-stdio-gate-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut context = context(recipients_allowlist()).with_state_dir(Some(state_dir.clone()));
+        let refused = granted_wallet_gate(&mut context, &json!(1), WALLET, Some(CLOSED))
+            .expect("an unreachable API is a refusal");
+        assert_eq!(code(&refused["result"]), "grants_unavailable", "{refused}");
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 }

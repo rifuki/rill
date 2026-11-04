@@ -42,6 +42,7 @@ use rill_core::envelope::{
 
 pub mod decode;
 pub mod inspect;
+pub mod preflight;
 
 /// The longest an envelope may be signable for. An envelope is minted, carried to the signer, and
 /// used within seconds; anything claiming a longer life is either broken or someone's second
@@ -73,6 +74,14 @@ pub struct LocalPolicy {
     /// Balance that must remain in the wallet after this spend. No on-chain rule expresses this.
     pub minimum_remaining_base_units: u64,
     pub gas_ceiling_base_units: u64,
+    /// The owner's manifest, whose pre-flight rules are checked against the bytes for every rule
+    /// that claims the envelope path. `None` checks none, which is a policy with no manifest to
+    /// check against rather than a manifest whose rules were skipped.
+    pub capability_manifest: Option<rill_core::manifest::CapabilityManifest>,
+    /// The `rill_guard` package, which a protocol scope never has to list: every protected swap
+    /// calls it. `None` leaves it out, so a guarded envelope under a protocol scope is refused
+    /// rather than passed on an assumption about which guard is meant.
+    pub guard_package_id: Option<String>,
 }
 
 /// Why an envelope was refused. Every variant is a distinct reason, because "policy violation"
@@ -161,6 +170,8 @@ pub enum Rejection {
     Chain(String),
     /// Mainnet requires an explicit opt-in that was not given.
     MainnetNotOptedIn,
+    /// A pre-flight rule in the run set's manifest that the transaction breaks.
+    PreFlight(preflight::PreFlightRefusal),
 }
 
 impl std::fmt::Display for Rejection {
@@ -252,6 +263,7 @@ impl std::fmt::Display for Rejection {
                 f,
                 "refusing to sign on mainnet without an explicit opt-in"
             ),
+            Self::PreFlight(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -468,6 +480,7 @@ impl Validated {
             }
         }
         crate::inspect::check_object_scope(&policy.required_object_ids, &decoded.object_inputs)?;
+        check_pre_flight(policy, &decoded)?;
 
         Ok(BytePinned {
             pinned_digest: recomputed,
@@ -476,6 +489,33 @@ impl Validated {
             decoded,
         })
     }
+}
+
+/// The manifest's pre-flight rules that claim the envelope path, against what the bytes call.
+///
+/// The pinned target sequence already refuses a call the run set did not list; this refuses one
+/// the run set listed outside the scope the owner set, which a hand-written run set can do. Here
+/// rather than in the signer binary so a [`BytePinned`] cannot exist without it.
+fn check_pre_flight(policy: &LocalPolicy, decoded: &decode::Decoded) -> Result<(), Rejection> {
+    let Some(manifest) = &policy.capability_manifest else {
+        return Ok(());
+    };
+    let mut infrastructure = vec![
+        "0x1".to_string(),
+        "0x2".into(),
+        "0x3".into(),
+        policy.wallet_package_id.clone(),
+    ];
+    infrastructure.extend(policy.guard_package_id.clone());
+    let mut proposal = preflight::Proposal::new(rill_core::manifest::SignerTool::Execute);
+    proposal.packages = Some(
+        decoded
+            .targets
+            .iter()
+            .map(|target| target.split("::").next().unwrap_or_default().to_owned())
+            .collect(),
+    );
+    preflight::check(manifest, &infrastructure, &proposal).map_err(Rejection::PreFlight)
 }
 
 impl BytePinned {

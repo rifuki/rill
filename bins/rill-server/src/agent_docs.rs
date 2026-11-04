@@ -406,17 +406,25 @@ fn layers_step() -> Step {
          breached, and the two answers are not interchangeable:"
             .into(),
         String::new(),
-        "| Rule | Layer | What refuses |".into(),
-        "|---|---|---|".into(),
+        "| Rule | Layer | What refuses | Signer refuses on |".into(),
+        "|---|---|---|---|".into(),
     ];
 
     for kind in RuleKind::all() {
         let enforcement = kind.enforcement();
+        // The per-tool claim comes from the table the refusals are tested against, so a row cannot
+        // promise a refusal on a tool that does not make it.
+        let tools = kind.signer_tool_names();
         lines.push(format!(
-            "| `{}` | {} | {} |",
+            "| `{}` | {} | {} | {} |",
             kind.module(),
             enforcement.as_str(),
-            enforcement.enforced_by()
+            enforcement.enforced_by(),
+            if tools.is_empty() {
+                "none".to_string()
+            } else {
+                tools.join(", ")
+            }
         ));
     }
 
@@ -429,15 +437,27 @@ fn layers_step() -> Step {
         String::new(),
         "Nothing on the chain checks a protocol, an asset, or a recipient. Those limits are \
          pre-flight: the Rill builder refuses to compile an action that breaks one, and the signer \
-         does not compare them with what it signs. On rill_execute, rill_run_action and \
-         rill_run_workflow the signer refuses any Move call or object the run set does not pin, \
-         which holds a protocol scope only as far as those pinned targets were compiled under it. \
-         rill_spend, rill_swap and rill_stake are bounded by the on-chain rules alone."
+         refuses to sign a breach only on the tools the last column names, and only under a run \
+         set for that wallet: rill_run_action and rill_run_workflow check the granted action's \
+         own run set, and the other tools one loaded from a file. On any other tool the signer \
+         does not check the rule. rill_spend, \
+         rill_swap and rill_stake know a wallet's scopes only from a run set loaded for that \
+         wallet; without one they are bounded by the on-chain rules alone."
+            .into(),
+        String::new(),
+        "A wallet the owner granted actions on is spent through the grant. When the signer reads \
+         grants from a Rill API, it refuses rill_spend, rill_swap, rill_stake and a hand-supplied \
+         rill_execute envelope on such a wallet with use_granted_action, so the grant's limits \
+         cannot be stepped around through a local build; run the action with rill_run_action. \
+         When it cannot read the grants, or the node cannot say whether a grant for the wallet is \
+         usable, it refuses them with grants_unavailable rather than build."
             .into(),
         String::new(),
         "The slippage floor is pre-flight too: the Rill builder refuses to compile a swap whose \
-         guard floor is below it, the signer does not read the floor value, and the chain aborts \
-         the transaction when a fill lands below the guard's floor once it runs."
+         guard floor is below it, rill_swap refuses to sign a minOut below it, and the chain \
+         aborts the transaction when a fill lands below the guard's floor once it runs. On \
+         rill_execute, rill_run_action and rill_run_workflow the signer does not read the floor \
+         value; the builder's check is what holds it there."
             .into(),
     ]);
 

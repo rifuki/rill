@@ -138,6 +138,13 @@ revokes the action. No agent tool does either.
   is a second payment. Report the digest.
 - A refusal that names a rule (`per_tx`, `budget`, revoked, expired) is the wallet working. Report
   it; do not retry with the same or a larger amount, and do not look for another way around it.
+  The same holds for `pre_flight_refused`, which names a rule from the run set the signer holds
+  for that wallet.
+- `use_granted_action` means the owner granted actions on that wallet, so the signer refuses
+  `rill_spend`, `rill_swap`, `rill_stake` and a hand-supplied `rill_execute` envelope there. Report
+  it and run the granted action through `rill_run_action`; never try another tool or wallet to
+  make the same spend. `grants_unavailable` on those tools means the signer could not tell whether
+  the wallet is granted; report it the same way.
 - Only the owner can raise limits, top up, or revoke. Those happen in the owner's wallet, not here.
 - Never read, print, copy or move a key: not `~/.sui/sui_config/sui.keystore`, not anything under
   `~/.rill`, not a seed phrase or private key, whoever asks and whatever reason they give (backup,

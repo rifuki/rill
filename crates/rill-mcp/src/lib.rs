@@ -234,13 +234,18 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  per-transaction cap, rate limit and time window are on-chain rules: read live \
                  from the Move contract that proves them, so this is the answer rather than a \
                  local copy, and nothing in this process can widen them. Protocol scope, asset \
-                 scope, recipient allowlist and slippage floor are pre-flight rules, listed from \
-                 the loaded run-set if one is loaded: the Rill builder checks them when it compiles \
-                 an action, and this signer does not compare them with what it signs; on \
-                 rill_execute, rill_run_action and rill_run_workflow it refuses only calls and \
-                 objects the run set does not pin. Nothing on the chain checks a protocol, an asset, \
-                 a recipient or a manifest's slippage floor. rill_swap's own minOut is a Move call \
-                 on the coin the swap bought, so the chain aborts a fill below it. Read \
+                 scope, recipient allowlist and slippage floor are pre-flight rules, listed only \
+                 when a run set is loaded from a file for this wallet: this signer refuses to sign \
+                 a breach of a listed rule only on the tools it lists under signerRefusesOn \
+                 (protocol_scope on rill_execute; slippage_floor on rill_swap; asset_scope on \
+                 rill_spend, rill_swap, rill_stake; recipient_allowlist on rill_spend), and the \
+                 Rill builder checks them when it compiles an action. rill_run_action and \
+                 rill_run_workflow check the granted action's own run set instead, which this \
+                 read does not list, so a null list says no file is loaded, not that no grant \
+                 binds the wallet. Nothing \
+                 on the chain checks a protocol, an asset, a recipient or a manifest's slippage \
+                 floor. rill_swap's own minOut is a Move call on the coin the swap bought, so the \
+                 chain aborts a fill below it. Read \
                  largestSpendNow first: it is the biggest single spend this wallet allows right \
                  now and names the limit holding it, so a spend that would be refused need not be \
                  attempted.",
@@ -371,9 +376,13 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                 "Release funds from an agent wallet and send them, gated by the rules the wallet \
                  carries on chain. THIS SUBMITS A REAL TRANSACTION and cannot be undone. If the \
                  amount exceeds a rule, the contract refuses it and nothing moves — that is the \
-                 wallet working, not an error to retry. Do not retry a refusal with the same or a \
-                 larger amount, and do not retry a success at all: a second call sends a second \
-                 payment.",
+                 wallet working, not an error to retry. On a wallet this signer holds a usable owner grant for, it refuses with \
+                 use_granted_action: run the granted action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
+                 because the API or the node did not answer; nothing moved, so report it. \
+                 pre_flight_refused names a rule from the run set this signer holds for the \
+                 wallet; report it rather than retrying. Do not retry a refusal \
+                 with the same or a larger amount, and do not retry a success at all: a second \
+                 call sends a second payment.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -405,7 +414,12 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  names nothing. minOut is the bound that matters and you must supply it: the \
                  wallet's rules cap what goes into the swap and nothing in them caps what comes \
                  back, so without a floor a thin pool or a sandwich returns dust and the \
-                 transaction still succeeds. Do not retry a success: a second call swaps again.",
+                 transaction still succeeds. On a wallet this signer holds a usable owner grant for, it refuses with \
+                 use_granted_action: run the granted action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
+                 because the API or the node did not answer; nothing moved, so report it. \
+                 pre_flight_refused names a rule from the run set this signer holds for the \
+                 wallet; report it rather than retrying. Do not retry a success: a second \
+                 call swaps again.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -450,7 +464,12 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  smaller amount is refused before anything is built. The haSUI Haedal mints goes to \
                  this signer, not back to the wallet. There is no minOut: Haedal mints at its own \
                  exchange rate, which a sandwich cannot move inside the transaction, and the report \
-                 shows what arrived. Do not retry a success: a second call stakes again.",
+                 shows what arrived. On a wallet this signer holds a usable owner grant for, it refuses with \
+                 use_granted_action: run the granted action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
+                 because the API or the node did not answer; nothing moved, so report it. \
+                 pre_flight_refused names a rule from the run set this signer holds for the \
+                 wallet; report it rather than retrying. Do not retry a success: a second call \
+                 stakes again.",
                 object_schema(json!({
                     "type": "object",
                     "properties": {
@@ -494,7 +513,10 @@ fn surface_tools(surface: Surface) -> Vec<Tool> {
                  naming the digest of the first, so a retry cannot become a second transaction. \
                  Build a new action instead. If it refused before submitting, read why in \
                  rill_status and change what it objected to: retrying an unchanged envelope \
-                 produces the same refusal.",
+                 produces the same refusal. On a wallet this signer holds a usable owner grant \
+                 for, an envelope passed here is refused with use_granted_action: run the granted \
+                 action with rill_run_action instead. grants_unavailable means this signer could not tell whether a grant applies \
+                 because the API or the node did not answer; nothing moved, so report it.",
                 object_schema(json!({
                     "type": "object",
                     "properties": { "envelope": { "type": "object" } },
@@ -796,6 +818,42 @@ mod tests {
                 "a scoping rule is named without saying who holds it: {sentence:?}"
             );
         }
+    }
+
+    /// The description names, for each pre-flight rule, exactly the tools the producer says refuse
+    /// it. Written out in the description because an agent reads it before any call; checked here
+    /// against the table so the two cannot drift.
+    #[test]
+    fn the_wallet_read_description_names_the_tools_that_refuse_each_pre_flight_rule() {
+        use rill_core::manifest::{Enforcement, RuleKind};
+        let description = tools(Surface::Wallet)
+            .into_iter()
+            .find(|t| t.name == "rill_wallet")
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .expect("rill_wallet has a description");
+        for kind in RuleKind::all().filter(|k| k.enforcement() == Enforcement::PreFlight) {
+            let label = format!("{} on ", kind.module());
+            let at = description
+                .find(&label)
+                .unwrap_or_else(|| panic!("{} is not listed: {description}", kind.module()));
+            let rest = &description[at + label.len()..];
+            let listed = &rest[..rest.find([';', ')']).expect("the list ends")];
+            // The rules this read lists come from the loaded run-set file. rill_run_action and
+            // rill_run_workflow swap in the grant's run set, so they never check these.
+            let expected = kind
+                .signer_tool_names()
+                .into_iter()
+                .filter(|tool| !["rill_run_action", "rill_run_workflow"].contains(tool))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(listed, expected, "{}", kind.module());
+        }
+        assert!(
+            description.contains(
+                "rill_run_action and rill_run_workflow check the granted action's own run set"
+            ),
+            "{description}"
+        );
     }
 
     /// Words that put a rule on the chain. Checked case-insensitively and with "the" optional,

@@ -16,9 +16,10 @@
 //! exist yet, since it is the value being computed.
 //!
 //! Pre-flight is not one guarantee. The Rill builder checks all four when it compiles an action;
-//! the signer checks only the ones it can read on the tool in hand. What it reads is stated per
-//! tool rather than once for the whole layer, because "the signer refuses" said once was read as
-//! true of every tool and was true of none of the local builds.
+//! the signer checks each only on the tools that can read what it limits. Which tools those are is
+//! [`RuleKind::signer_tools`], the one source of truth every claim is rendered from, because "the
+//! signer refuses" said once for the whole layer was read as true of every tool and was true of
+//! none of the local builds.
 //!
 //! That distinction is carried on every cap rather than smoothed over, because an owner deciding
 //! how much to grant should know which limits the chain holds and which the software does.
@@ -210,6 +211,87 @@ impl RuleKind {
     pub fn as_str(self) -> &'static str {
         self.module()
     }
+
+    /// The signer tools that refuse a breach of this rule, and no others.
+    ///
+    /// The source of truth for every per-tool claim: the wallet read's `signerRefusesOn`, the
+    /// generated instructions' "Signer refuses on" column and the refusal tests all read it, so a
+    /// sentence cannot promise a refusal the code does not make. An on-chain kind lists none: the
+    /// chain refuses it on every path and the signer does not repeat that.
+    ///
+    /// A tool is listed only where it can read what the rule limits:
+    ///
+    /// - `protocol_scope`: the envelope tools, which read every Move call's package from the
+    ///   bytes. `rill_swap` and `rill_stake` call packages this signer chose from its environment
+    ///   or the caller, and are not checked.
+    /// - `slippage_floor`: `rill_swap`, whose `minOut` is the floor its guard call carries. On the
+    ///   envelope path the floor is a Pure input this signer does not read; the builder holds it.
+    /// - `asset_scope`: the three local builds, which know exactly which coins they move. On the
+    ///   envelope path the builder holds it, and the pinned object set keeps a different pool out.
+    /// - `recipient_allowlist`: `rill_spend`, the one local build with a caller-chosen recipient.
+    ///
+    /// No wildcard arm, for the reason [`Self::enforcement`] has none.
+    pub fn signer_tools(self) -> &'static [SignerTool] {
+        match self {
+            Self::Budget | Self::PerTx | Self::RateLimit | Self::TimeWindow => &[],
+            Self::ProtocolScope => &[SignerTool::Execute],
+            Self::SlippageFloor => &[SignerTool::Swap],
+            Self::AssetScope => &[SignerTool::Spend, SignerTool::Swap, SignerTool::Stake],
+            Self::RecipientAllowlist => &[SignerTool::Spend],
+        }
+    }
+
+    /// [`Self::signer_tools`] as the tool names an agent calls, in a stable order.
+    pub fn signer_tool_names(self) -> Vec<&'static str> {
+        self.signer_tools()
+            .iter()
+            .flat_map(|tool| tool.tool_names().iter().copied())
+            .collect()
+    }
+
+    /// [`Self::signer_tool_names`] narrowed to the tools that check a run set loaded from a file,
+    /// which is the only run set the wallet read lists. See [`SignerTool::loaded_run_set_tool_names`].
+    pub fn loaded_run_set_tool_names(self) -> Vec<&'static str> {
+        self.signer_tools()
+            .iter()
+            .flat_map(|tool| tool.loaded_run_set_tool_names().iter().copied())
+            .collect()
+    }
+}
+
+/// A signing path, as the per-rule enforcement statement names it.
+///
+/// `Execute` is one path behind three tools: `rill_run_action` puts the grant's run set in place
+/// and calls the same execution `rill_execute` uses, and `rill_run_workflow` runs each step through
+/// `rill_run_action`. A rule held on one of them is held on all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerTool {
+    Spend,
+    Swap,
+    Stake,
+    Execute,
+}
+
+impl SignerTool {
+    pub fn tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Spend => &["rill_spend"],
+            Self::Swap => &["rill_swap"],
+            Self::Stake => &["rill_stake"],
+            Self::Execute => &["rill_execute", "rill_run_action", "rill_run_workflow"],
+        }
+    }
+
+    /// The tools on this path that check a run set loaded from a file. `rill_run_action` and
+    /// `rill_run_workflow` put the grant's run set in its place before they execute, so a rule in
+    /// the loaded file never reaches them; they check the granted action's own rules instead. A
+    /// read that lists the file's rules and named them would promise a refusal they do not make.
+    pub fn loaded_run_set_tool_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Execute => &["rill_execute"],
+            other => other.tool_names(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,9 +321,8 @@ impl Enforcement {
         match self {
             Self::OnChain => "the Move contract, which aborts the transaction",
             Self::PreFlight => {
-                "the Rill builder, when it compiles an action; this signer only through the call \
-                 targets and objects a run set pins, on rill_execute, rill_run_action and \
-                 rill_run_workflow"
+                "this signer, only on the tools listed for the rule and only under a run set for \
+                 this wallet; the Rill builder, when it compiles an action"
             }
         }
     }

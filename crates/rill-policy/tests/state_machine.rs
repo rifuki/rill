@@ -144,6 +144,8 @@ fn policy() -> LocalPolicy {
         declared_spend_base_units: 2_000_000_000,
         minimum_remaining_base_units: 0,
         gas_ceiling_base_units: 5_000_000,
+        capability_manifest: None,
+        guard_package_id: None,
     }
 }
 

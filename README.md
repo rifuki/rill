@@ -404,9 +404,10 @@ One tool per question, and reads never share a tool with writes:
              { "module": "per_tx", "enforcement": "on-chain",
                "enforcedBy": "the Move contract, which aborts the transaction" } ],
   "preFlightRules": [ { "module": "recipient_allowlist", "enforcement": "pre-flight",
-                        "enforcedBy": "the Rill builder, when it compiles an action; …" } ],
+                        "enforcedBy": "this signer, only on the tools listed for the rule …",
+                        "signerRefusesOn": ["rill_spend"] } ],
   "note": "Two layers hold this wallet's limits, and each rule above says which. … Nothing on
-           chain checks a protocol, an asset, a recipient or a slippage floor: those rules are
+           chain checks a protocol, an asset, a recipient or a slippage floor. Those rules are
            pre-flight …" }
 
 // rill_spend  0.005 SUI
@@ -429,11 +430,26 @@ cannot widen it, the agent that asked cannot widen it, and the refusal arrives f
 budget, the per-transaction cap, the rate limit and the time window are held by the Move contract
 and proved on chain against the real transaction. Nothing on chain checks a protocol, an asset, a
 recipient or a manifest's slippage floor: those four rules are pre-flight. The Rill builder checks
-them when it compiles an action. The signer does not compare them with what it signs: on
-`rill_execute`, `rill_run_action` and `rill_run_workflow` it refuses any Move call or object the run
-set does not pin, which holds a protocol scope only as far as those targets were compiled under it,
-and `rill_spend`, `rill_swap` and `rill_stake` are bounded by the on-chain rules alone. A swap's own
-`minOut` is enforced by the chain: `rill_swap` emits
+them when it compiles an action, and the signer refuses a breach only on the tools each rule lists
+under `signerRefusesOn`, and only under a run set for that wallet:
+
+| Rule | Signer refuses on |
+|---|---|
+| `protocol_scope` | `rill_execute`, `rill_run_action`, `rill_run_workflow` (every Move call's package, read from the bytes) |
+| `slippage_floor` | `rill_swap` (a `minOut` below the floor, or `acceptAnyOutput`) |
+| `asset_scope` | `rill_spend`, `rill_swap`, `rill_stake` |
+| `recipient_allowlist` | `rill_spend` |
+
+On any other tool the signer does not check the rule; on the envelope path the builder's check is
+what holds it. `rill_run_action` and `rill_run_workflow` check the granted action's own run set,
+never a run set loaded from a file, so `rill_wallet`, which lists only the loaded file's rules, names
+`rill_execute` alone for `protocol_scope`, and its `null` means no file is loaded for that wallet,
+not that no grant binds it. `rill_spend`, `rill_swap` and `rill_stake` know a wallet's scopes only from a run set
+loaded for that wallet. When the signer reads grants from a Rill API, those three and a
+hand-supplied `rill_execute` envelope are refused with `use_granted_action` on a wallet it holds a
+usable grant for, so a grant's limits cannot be stepped around through a local build. When the
+grants cannot be read, or the node cannot say whether a grant for that wallet is usable, they are
+refused with `grants_unavailable` rather than built; with no API configured that check is skipped. A swap's own `minOut` is enforced by the chain: `rill_swap` emits
 `rill_guard::guard::assert_min_value` on the coin the swap bought, before that coin goes anywhere, so
 a fill below `minOut` aborts the whole transaction and the wallet keeps its SUI. The signer's pinned
 sequence carries that call too, so an envelope that dropped it does not match.

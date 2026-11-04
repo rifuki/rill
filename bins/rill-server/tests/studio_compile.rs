@@ -536,6 +536,8 @@ async fn published_stake_builds_a_strict_funded_envelope_with_pinned_bytes() {
         declared_spend_base_units: 1_000_000_000,
         minimum_remaining_base_units: 0,
         gas_ceiling_base_units: 100_000_000,
+        capability_manifest: None,
+        guard_package_id: None,
     };
     let validated = rill_policy::RawEnvelope::new(result.clone())
         .validate(&policy, 1_700_000_000_000)

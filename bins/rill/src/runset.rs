@@ -186,6 +186,10 @@ impl RunSet {
                 "minimumRemainingBaseUnits",
             )?,
             gas_ceiling_base_units: amount(&self.gas_ceiling_base_units, "gasCeilingBaseUnits")?,
+            capability_manifest: Some(self.capability_manifest.clone()),
+            // Not a run-set field: which guard this signer trusts is its own configuration. The
+            // caller that signs sets it; see `LocalPolicy::guard_package_id`.
+            guard_package_id: None,
         })
     }
 }

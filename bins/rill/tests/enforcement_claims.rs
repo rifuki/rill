@@ -93,6 +93,12 @@ fn the_wallet_tool_passes_the_run_sets_manifest_to_the_read() {
         !shipped.contains("let local: Option<&rill_core::manifest::CapabilityManifest> = None"),
         "the manifest was stubbed out; a run-set's pre-flight rules would be invisible"
     );
+    // Only the run set for the wallet asked about: another wallet's scopes listed here would tell
+    // an agent this wallet is bound by rules nothing checks against it.
+    assert!(
+        shipped.contains("let local = run_set_for(context, wallet)"),
+        "the wallet read must take the run set only when it is for this wallet"
+    );
 }
 
 /// The argument list of a call, from its opening parenthesis to the parenthesis that closes it.

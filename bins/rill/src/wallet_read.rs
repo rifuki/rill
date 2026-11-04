@@ -10,7 +10,11 @@
 //! The chain holds four kinds of rule and proves them against the real transaction. The other
 //! four (protocol scope, slippage floor, asset scope, recipient allowlist) exist only pre-flight,
 //! and pre-flight is not one guarantee: the Rill builder checks them when it compiles an action,
-//! and this signer checks only what it can read on the tool in hand. The note below says which.
+//! and this signer checks each only on the tools that can read what it limits. Every pre-flight
+//! rule carries those tools as `signerRefusesOn`, from [`RuleKind::loaded_run_set_tool_names`], so
+//! the read never promises a refusal on a tool that does not make it. The rules listed are the
+//! loaded run-set file's, and `rill_run_action` and `rill_run_workflow` never check that file:
+//! they check the granted action's own run set, which this read does not list.
 //!
 //! # The numbers, not only the names
 //!
@@ -279,6 +283,11 @@ fn labelled(kind: RuleKind) -> Value {
         // The sentence comes from the producer too. The generated instructions print the same one,
         // and a read that worded it here would be the second place the same claim is made.
         "enforcedBy": enforcement.enforced_by(),
+        // Which tools refuse a breach of this rule as listed here, from the table the refusals
+        // themselves are checked against. Only the tools that check the loaded run-set file, which
+        // is where a listed pre-flight rule comes from: the granted tools check the grant's own.
+        // Empty for an on-chain rule: the chain refuses it on every path.
+        "signerRefusesOn": kind.loaded_run_set_tool_names(),
     })
 }
 
@@ -327,15 +336,22 @@ const NOTE: &str = "Start with `largestSpendNow`: it is the biggest single spend
     can widen them, and a spend that exceeds one is aborted by the chain. Their configured values \
     are under each rule's `limits`, in base units, read from the chain rather than from anything \
     this process was told. Nothing on chain checks a protocol, an asset, a recipient or a slippage \
-    floor: those rules are pre-flight and are listed under `preFlightRules` from the loaded run-set \
-    (null means no run-set is loaded, not that there are none). The Rill builder checks them when \
-    it compiles an action. This signer does not compare them with what it signs: on rill_execute, \
-    rill_run_action and rill_run_workflow it refuses any Move call or object the run set does not \
-    pin, which holds a protocol scope only as far as those pinned targets were compiled under it, \
-    and rill_spend, rill_swap and rill_stake are bounded only by the rules under `rules`. \
-    `rill_swap` takes its own minOut and emits an on-chain assertion on the coin it bought, so a \
-    fill below that minOut aborts the whole transaction. Read again after any change: every number \
-    here is a live read, not a cached copy.";
+    floor. Those rules are pre-flight and are listed under `preFlightRules` only from a run set \
+    loaded from a file for this wallet (null means no run set is loaded for this wallet, which \
+    says nothing about grants, and not that there are no such rules). Each names under \
+    `signerRefusesOn` the tools on which this signer refuses to sign a breach of that loaded \
+    rule; on any other tool this signer does not check it. rill_run_action and rill_run_workflow \
+    check the granted action's own run set instead, whose rules this read does not list: \
+    rill_actions names the grants. A granted action's rules are also checked by the Rill builder \
+    when it compiles the action. rill_spend, rill_swap and rill_stake \
+    know a wallet's pre-flight rules only from a run set loaded for that wallet; without one only \
+    the rules under `rules` bound them. When this signer reads grants from a Rill API, they and a \
+    hand-supplied rill_execute envelope are refused with use_granted_action on a wallet it holds a \
+    usable grant for, and with grants_unavailable when the grants cannot be read or a grant for \
+    it cannot be checked, so a grant's rules cannot be stepped around through them. \
+    `rill_swap` also takes its own minOut and emits an on-chain assertion on the coin it bought, \
+    so a fill below that minOut aborts the whole transaction. Read again after any change: every \
+    number here is a live read, not a cached copy.";
 
 #[cfg(test)]
 mod assembly_tests {
@@ -741,11 +757,81 @@ mod tests {
         }
     }
 
+    /// Each pre-flight rule names the tools on which this signer refuses it, from the one table,
+    /// so the read cannot promise a refusal on a tool that does not make it.
+    #[test]
+    fn pre_flight_rules_name_the_tools_that_refuse_them() {
+        let local = manifest(vec![
+            CapabilityRule::ProtocolScope {
+                allowed_packages: vec!["0x1".into()],
+            },
+            CapabilityRule::SlippageFloor {
+                min_out_mist: "1".into(),
+                coin_type: None,
+            },
+            CapabilityRule::AssetScope {
+                allowed_coin_types: vec!["0x2::sui::SUI".into()],
+            },
+            CapabilityRule::RecipientAllowlist {
+                addresses: vec!["0x1".into()],
+            },
+        ]);
+        let out = label_rules(&names(&["budget"]), Some(&local));
+        let pre_flight = out["preFlightRules"].as_array().unwrap();
+        assert_eq!(pre_flight.len(), 4);
+        for rule in pre_flight {
+            let kind = RuleKind::from_module(rule["module"].as_str().unwrap()).unwrap();
+            assert!(
+                !kind.signer_tools().is_empty(),
+                "{} is claimed by no tool",
+                kind.module()
+            );
+            let listed: Vec<&str> = rule["signerRefusesOn"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool.as_str().unwrap())
+                .collect();
+            // The granted tools swap in the grant's own run set, so the rules listed here, which
+            // come from the loaded file, never reach them.
+            let expected: Vec<&str> = kind
+                .signer_tool_names()
+                .into_iter()
+                .filter(|tool| !["rill_run_action", "rill_run_workflow"].contains(tool))
+                .collect();
+            assert_eq!(listed, expected, "{rule}");
+        }
+        let on_chain = &out["rules"][0];
+        assert_eq!(
+            on_chain["signerRefusesOn"],
+            json!([]),
+            "the chain holds {on_chain}"
+        );
+    }
+
     /// Absent would read as "no limits". Null says there is nothing to refuse against yet.
     #[test]
     fn without_a_run_set_the_pre_flight_list_is_null_not_empty() {
         let out = label_rules(&names(&["budget"]), None);
         assert!(out["preFlightRules"].is_null());
         assert!(out.get("preFlightRules").is_some());
+    }
+
+    /// Null is "no run-set file for this wallet", which says nothing about grants: the signer
+    /// can hold a grant's run set and refuse its protocol scope on rill_run_action while this read
+    /// lists nothing. The note must not say otherwise.
+    #[test]
+    fn the_note_says_null_is_no_loaded_run_set_and_names_where_grants_are_checked() {
+        assert!(!NOTE.contains("holds none for this wallet"), "{NOTE}");
+        assert!(
+            NOTE.contains("no run set is loaded for this wallet"),
+            "{NOTE}"
+        );
+        assert!(
+            NOTE.contains(
+                "rill_run_action and rill_run_workflow check the granted action's own run set"
+            ),
+            "{NOTE}"
+        );
     }
 }

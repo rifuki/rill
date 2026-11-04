@@ -274,6 +274,37 @@ fn a_generated_document_states_each_rules_computed_enforcement_label() {
     }
 }
 
+/// The "Signer refuses on" cell of each row is the producer's per-tool table, so the document
+/// cannot say a tool refuses a rule the code does not refuse on it.
+#[test]
+fn each_rules_row_names_the_signer_tools_that_refuse_it() {
+    let doc = document(BASES[0]);
+    assert!(
+        doc.contains("| Rule | Layer | What refuses | Signer refuses on |"),
+        "the layers table has no per-tool column:\n{doc}"
+    );
+    for kind in RuleKind::all() {
+        let prefix = format!("| `{}` |", kind.module());
+        let row = doc
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no row for {} in:\n{doc}", kind.module()));
+        let cell = row
+            .trim_end_matches('|')
+            .rsplit('|')
+            .next()
+            .expect("a last cell")
+            .trim();
+        let names = kind.signer_tool_names();
+        let expected = if names.is_empty() {
+            "none".to_string()
+        } else {
+            names.join(", ")
+        };
+        assert_eq!(cell, expected, "{}'s row: {row}", kind.module());
+    }
+}
+
 /// And the owner's actual grant: every cap carries the label the declaration producer computed for
 /// it, so the document and the wallet read cannot describe the same grant differently.
 #[test]
@@ -407,8 +438,10 @@ fn the_slippage_floor_names_every_point_that_refuses_it() {
         .find(|line| line.contains("slippage floor is pre-flight"))
         .unwrap_or_else(|| panic!("the slippage floor's layer is not stated:\n{doc}"));
     assert!(
-        sentence.contains("refuses to compile") && sentence.contains("aborts"),
-        "the builder's refusal and the chain's abort must both be named: {sentence}"
+        sentence.contains("refuses to compile")
+            && sentence.contains("rill_swap refuses to sign")
+            && sentence.contains("aborts"),
+        "the builder's refusal, rill_swap's and the chain's abort must all be named: {sentence}"
     );
     assert!(
         !doc.contains("whose guard call does not match the floor"),

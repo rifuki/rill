@@ -8,7 +8,11 @@
 //! What a verified grant does and does not do, stated so it is never overstated: it stops this
 //! signer from signing a transaction the owner did not approve, whatever the server sends. It does
 //! not constrain someone who holds the agent's key and builds a transaction themselves; that is
-//! bounded only by the rules the Move contract enforces on the wallet.
+//! bounded only by the rules the Move contract enforces on the wallet. This signer's own local
+//! builds (`rill_spend`, `rill_swap`, `rill_stake`, a hand-supplied `rill_execute`) are refused on
+//! a wallet it holds a usable grant for whenever it reads grants from a Rill API, and on one whose
+//! grant the node could not check ([`Refusal::NodeUnavailable`]), so they are not a route around a
+//! grant; see `stdio::granted_wallet_gate`.
 
 use std::collections::BTreeMap;
 
@@ -56,6 +60,10 @@ pub enum Refusal {
     WalletRevoked,
     WalletExpired,
     BadSignature(String),
+    /// The node could not answer a read the verdict depends on: the wallet, or whether the owner
+    /// signed. Unlike every other refusal this says nothing about the grant itself, so a caller
+    /// deciding whether a wallet is granted must not read it as "not granted".
+    NodeUnavailable(String),
     /// The owner signed this grant, but this signer has already verified a newer revision of it.
     Superseded {
         floor: u64,
@@ -71,6 +79,12 @@ impl Refusal {
             Self::Superseded { .. } => "grant_superseded",
             _ => "grant_refused",
         }
+    }
+
+    /// Whether this refusal leaves open that the grant is the owner's and usable. Only a node that
+    /// could not answer does: every other refusal is a fact about the grant or the wallet.
+    pub fn is_indeterminate(&self) -> bool {
+        matches!(self, Self::NodeUnavailable(_))
     }
 }
 
@@ -104,6 +118,10 @@ impl std::fmt::Display for Refusal {
             Self::BadSignature(why) => {
                 write!(f, "the grant is not signed by the wallet's owner: {why}")
             }
+            Self::NodeUnavailable(why) => write!(
+                f,
+                "this signer could not check the grant, because the node could not answer: {why}"
+            ),
             Self::Superseded { floor, given } => write!(
                 f,
                 "revision {given} of this grant is superseded: this signer has already verified \
@@ -187,7 +205,7 @@ pub async fn verify(
     let wallet = chain
         .get_object(&grant.wallet_id)
         .await
-        .map_err(|e| Refusal::WalletUnreadable(e.to_string()))?;
+        .map_err(|e| Refusal::NodeUnavailable(format!("the wallet could not be read: {e}")))?;
     let fields = wallet
         .fields
         .ok_or_else(|| Refusal::WalletUnreadable("the node returned no fields".into()))?;
@@ -218,8 +236,8 @@ pub async fn verify(
             owner,
         }),
         Ok(SignatureCheck::Invalid(why)) => Err(Refusal::BadSignature(why)),
-        Err(e) => Err(Refusal::BadSignature(format!(
-            "the node could not be asked: {e}"
+        Err(e) => Err(Refusal::NodeUnavailable(format!(
+            "the owner's signature could not be verified: {e}"
         ))),
     }
 }
@@ -521,6 +539,33 @@ mod tests {
             check(&expired, &grant).await.unwrap_err(),
             Refusal::WalletExpired
         );
+    }
+
+    /// A node that cannot be asked has not said the grant is forged or the wallet gone. The
+    /// granted-wallet gate refuses a local build on that answer, which it can do only if the
+    /// verdict says it is unknown rather than wearing a definite refusal's name.
+    #[tokio::test]
+    async fn a_node_that_cannot_answer_leaves_the_grant_undetermined() {
+        let grant = signed();
+        let unasked = chain_for(&grant, wallet(AGENT, false, NOW + 3_600_000))
+            .with_signature_check_unavailable();
+        let refusal = check(&unasked, &grant).await.unwrap_err();
+        assert!(
+            matches!(refusal, Refusal::NodeUnavailable(_)) && refusal.is_indeterminate(),
+            "{refusal:?}"
+        );
+
+        let no_wallet = FakeSui::new().with_valid_signature(
+            grant.grant.message().as_bytes(),
+            &grant.signature,
+            OWNER,
+        );
+        let refusal = check(&no_wallet, &grant).await.unwrap_err();
+        assert!(refusal.is_indeterminate(), "{refusal:?}");
+
+        // A node that answered "not this owner's signature" has decided it.
+        let forged = FakeSui::new().with_object(None, wallet(AGENT, false, NOW + 3_600_000));
+        assert!(!check(&forged, &grant).await.unwrap_err().is_indeterminate());
     }
 
     #[tokio::test]

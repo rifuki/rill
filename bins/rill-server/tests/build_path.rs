@@ -278,6 +278,8 @@ async fn what_the_server_builds_is_what_the_signer_accepts() {
         declared_spend_base_units: 2_000_000_000,
         minimum_remaining_base_units: 0,
         gas_ceiling_base_units: 50_000_000,
+        capability_manifest: None,
+        guard_package_id: None,
     };
 
     let validated = RawEnvelope::new(*envelope)

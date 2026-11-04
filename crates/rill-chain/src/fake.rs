@@ -78,6 +78,8 @@ struct State {
     /// The (message, signature, address) triples the fake accepts as valid. Anything else is
     /// invalid, so a test that forgot to stage a signature fails rather than passes.
     valid_signatures: Vec<(Vec<u8>, String, String)>,
+    /// Whether the node fails when asked to verify a signature, rather than answering.
+    signature_check_unavailable: bool,
 }
 
 impl Default for State {
@@ -100,6 +102,7 @@ impl Default for State {
             // the network's answer, which a caller reads; it is not a price a caller assumed.
             reference_gas_price: Ok(1_000),
             valid_signatures: Vec::new(),
+            signature_check_unavailable: false,
         }
     }
 }
@@ -219,6 +222,13 @@ impl FakeSui {
         self
     }
 
+    /// Make signature verification fail as a node that cannot be asked does, so a caller can be
+    /// shown to tell "not signed" apart from "could not be checked".
+    pub fn with_signature_check_unavailable(self) -> Self {
+        self.state.borrow_mut().signature_check_unavailable = true;
+        self
+    }
+
     /// Stage the objects an execution should report as created.
     ///
     /// A multi-step flow cannot continue without them: `create_wallet` shares a wallet and mints a
@@ -263,6 +273,9 @@ impl SuiRead for FakeSui {
         signature: &str,
         address: &str,
     ) -> ChainResult<SignatureCheck> {
+        if self.state.borrow().signature_check_unavailable {
+            return Err(ChainError::Transport("fake node is unreachable".into()));
+        }
         let accepted = self
             .state
             .borrow()
