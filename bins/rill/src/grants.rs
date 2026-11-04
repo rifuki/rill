@@ -10,11 +10,14 @@
 //! not constrain someone who holds the agent's key and builds a transaction themselves; that is
 //! bounded only by the rules the Move contract enforces on the wallet.
 
+use std::collections::BTreeMap;
+
 use rill_chain::{SignatureCheck, SuiRead};
 use rill_core::grant::{Grant, SignedGrant};
 use serde_json::Value;
 use sui_sdk_types::Address;
 
+use crate::grant_floor::GrantFloors;
 use crate::runset::RunSet;
 
 /// A grant whose every check passed, ready to stand in for a run-set file.
@@ -30,17 +33,44 @@ pub struct VerifiedGrant {
 /// "invalid grant" leaves the owner nothing to fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    WrongNetwork { grant: String, signer: String },
-    NotThisAgent { grant: String, signer: String },
-    WrongDeployment { grant: String, signer: String },
+    WrongNetwork {
+        grant: String,
+        signer: String,
+    },
+    NotThisAgent {
+        grant: String,
+        signer: String,
+    },
+    WrongDeployment {
+        grant: String,
+        signer: String,
+    },
     Expired,
     RunSetDisagrees(String),
     RunSetInvalid(String),
     WalletUnreadable(String),
-    AgentRotated { wallet_agent: String },
+    AgentRotated {
+        wallet_agent: String,
+    },
     WalletRevoked,
     WalletExpired,
     BadSignature(String),
+    /// The owner signed this grant, but this signer has already verified a newer revision of it.
+    Superseded {
+        floor: u64,
+        given: u64,
+    },
+}
+
+impl Refusal {
+    /// The code an agent reads instead of parsing prose. A superseded grant is told apart because
+    /// it is the one refusal that says the server served an approval the owner has since replaced.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Superseded { .. } => "grant_superseded",
+            _ => "grant_refused",
+        }
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -73,6 +103,11 @@ impl std::fmt::Display for Refusal {
             Self::BadSignature(why) => {
                 write!(f, "the grant is not signed by the wallet's owner: {why}")
             }
+            Self::Superseded { floor, given } => write!(
+                f,
+                "revision {given} of this grant is superseded: this signer has already verified \
+                 revision {floor}, signed by the wallet's owner; an older approval is never used"
+            ),
         }
     }
 }
@@ -186,6 +221,47 @@ pub async fn verify(
             "the node could not be asked: {e}"
         ))),
     }
+}
+
+/// Raise each slot's floor to the newest grant verified here, then refuse every verified grant
+/// below its floor.
+///
+/// Only a grant that passed every check raises a floor, so a forged or expired grant with a high
+/// revision cannot lock a slot. An equal revision stays usable, which is what lets a workflow pin
+/// the current revision exactly. A floor that cannot be read or written is an error, never "no
+/// floor".
+pub fn apply_floor(
+    checked: &mut [(SignedGrant, Result<VerifiedGrant, Refusal>)],
+    floors: &GrantFloors,
+) -> Result<(), String> {
+    let mut newest: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+    for (signed, verdict) in checked.iter() {
+        if let Ok(verified) = verdict {
+            let grant = &signed.grant;
+            let slot = (
+                verified.owner.clone(),
+                grant.wallet_id.clone(),
+                grant.action_id.clone(),
+            );
+            let revision = newest.entry(slot).or_insert(0);
+            *revision = (*revision).max(grant.revision);
+        }
+    }
+    for ((owner, wallet, action_id), revision) in &newest {
+        floors.raise(owner, wallet, action_id, *revision)?;
+    }
+    for (signed, verdict) in checked.iter_mut() {
+        let Ok(verified) = verdict else { continue };
+        let grant = &signed.grant;
+        let floor = floors.floor(&verified.owner, &grant.wallet_id, &grant.action_id)?;
+        if grant.revision < floor {
+            *verdict = Err(Refusal::Superseded {
+                floor,
+                given: grant.revision,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

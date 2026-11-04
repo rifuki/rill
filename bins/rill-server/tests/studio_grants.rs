@@ -141,6 +141,45 @@ async fn prepare_reads_the_agent_from_the_wallet_and_asks_for_the_next_revision(
         .is_empty());
 }
 
+/// A lost store (a corrupt file, a fresh deployment) restarts at zero. The next revision is still
+/// numbered from the clock, so it lands above any floor a signer saved from earlier grants and the
+/// owner is never locked out of granting again.
+#[tokio::test]
+async fn prepare_numbers_from_the_clock_after_the_store_is_lost() {
+    let at = |now_ms: u64, current: u64| async move {
+        let context = SetupContext {
+            now_ms,
+            ..context()
+        };
+        let result = prepare_grant(
+            &request(),
+            &skill(),
+            &addr("0x1"),
+            &context,
+            &bounded(),
+            |_, _, _| current,
+        )
+        .await
+        .unwrap();
+        grant_of(&result).revision
+    };
+    assert_eq!(
+        at(900_000, 0).await,
+        900,
+        "an empty store starts at the clock"
+    );
+    assert_eq!(
+        at(900_000, 3).await,
+        900,
+        "the clock is above the stored revision"
+    );
+    assert_eq!(
+        at(900_000, 2_000).await,
+        2_001,
+        "a stored revision above the clock still steps by one"
+    );
+}
+
 #[tokio::test]
 async fn prepare_refuses_a_wallet_that_has_no_rules_yet() {
     let error = prepared(&chain(json!([]), false), 0).await.unwrap_err();

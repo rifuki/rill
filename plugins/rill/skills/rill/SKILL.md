@@ -28,12 +28,16 @@ not edit `~/.rill/config.json`. After setup the user restarts the client so the 
 The wallet's owner publishes actions in Rill Studio and grants them to this agent by signing them.
 
 1. `rill_actions` lists every grant for this agent, each checked against the chain just now. Only
-   entries with `usable: true` can run; an unusable one says why in `refusedBecause`.
+   entries with `usable: true` can run; an unusable one says why in `refusedBecause` and names the
+   refusal in `refusalCode`.
 2. `rill_run_action { actionId }` builds that action and executes it under the owner-signed limits.
    Pass `walletId` only when the same action is granted from more than one wallet.
 
-A grant that is refused (not signed by the owner, expired, wallet revoked, agent rotated) is the
-system protecting the owner. Report it; the owner fixes it by granting again in Studio.
+A grant that is refused (not signed by the owner, expired, wallet revoked, agent rotated, or
+superseded by a newer grant the owner signed, `grant_superseded`) is the system protecting the
+owner. Report it and never route around it; the owner fixes it by granting again in Studio.
+`rill_run_action` answers with the same code, and a workflow pinned to a superseded revision is
+refused before any step runs.
 
 ## Pair the signer
 
@@ -56,11 +60,12 @@ Report the confirmed digest once and never retry a submitted redemption.
 ## Protected swaps
 
 Use `rill_run_action` for a protected swap grant. Its adapter enforces the approved pool, output
-asset, policy revision and minimum output on chain; proceeds go to the vault owner and unspent
-input returns to the vault. Generic `rill_spend` or `rill_swap` cannot release coins from a
-protected vault. Editing a published workflow creates a new immutable version requiring a new
-owner-signed grant. Other action types retain their declared budget rules and signer restrictions;
-do not describe those as using the protected swap adapter.
+asset, protected policy revision (the owner's swap configuration, not the grant revision) and
+minimum output on chain; proceeds go to the vault owner and unspent input returns to the vault.
+Generic `rill_spend` or `rill_swap` cannot release coins from a protected vault. Editing a
+published workflow creates a new immutable version requiring a new owner-signed grant. Other action
+types retain their declared budget rules and signer restrictions; do not describe those as using
+the protected swap adapter.
 
 ## Before anything that submits outside a grant
 

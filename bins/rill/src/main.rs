@@ -1131,10 +1131,23 @@ funded."
                 }
             }
             let owner_tools = std::env::args().any(|a| a == "--owner");
+            // Local state sits beside the config file, the way workflow receipts always have. Said
+            // here, once, where the operator reads stderr; the grant tools then refuse with the
+            // same sentence rather than each failing in its own way.
+            // Resolved to an absolute path once: a relative RILL_CONFIG would otherwise put the
+            // floors under whatever directory the MCP client launched the signer from, and each
+            // project would start with none.
+            let state_dir = config_path
+                .as_deref()
+                .and_then(rill_cli::grant_floor::state_dir_for);
+            if state_dir.is_none() {
+                eprintln!("rill: {}", rill_cli::stdio::NO_STATE_DIR);
+            }
             let mut context =
                 WalletContext::new(loaded.keystore, loaded.network, loaded.mainnet_allowed)
                     .with_run_set(loaded.run_set)
-                    .with_owner_tools(owner_tools);
+                    .with_owner_tools(owner_tools)
+                    .with_state_dir(state_dir);
             if let Err(e) = serve(&mut context, BufReader::new(stdin()), stdout()) {
                 eprintln!("rill: transport stopped: {e}");
                 std::process::exit(1);

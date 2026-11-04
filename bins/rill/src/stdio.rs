@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -61,6 +62,11 @@ pub struct WalletContext {
     pub owner_tools: bool,
     /// Gas references consumed by successful submissions in this process. Builder indexes may lag.
     pub consumed_gas: HashMap<sui_sdk_types::Address, u64>,
+    /// Where this signer keeps what must outlive the process: grant revision floors and workflow
+    /// receipts. Set once at startup from the config directory, so every piece of local state has
+    /// one root and a test can point it at a scratch directory. `None` means grants are refused:
+    /// without it the signer could not remember which grant revisions it has already verified.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// One envelope this signer has already handed to the chain.
@@ -83,7 +89,14 @@ impl WalletContext {
             submitted: HashMap::new(),
             owner_tools: false,
             consumed_gas: HashMap::new(),
+            state_dir: None,
         }
+    }
+
+    /// The directory local state lives under; see [`WalletContext::state_dir`].
+    pub fn with_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
+        self.state_dir = state_dir;
+        self
     }
 
     /// Offer the owner's steps as well: `rill_create_wallet` and `rill_attach_rules`.
@@ -1161,6 +1174,12 @@ fn api_url() -> Option<String> {
 const NO_API: &str = "No Rill API is configured, so there are no granted actions to read. Run \
                       `~/.rill/bin/rill-wallet setup --api <url>` and restart the client.";
 
+/// Said when the signer has no state directory. The fix is the launch environment, which only the
+/// person who configured the signer can change.
+pub const NO_STATE_DIR: &str = "This signer has no state directory (neither RILL_CONFIG nor HOME \
+     is set), so it cannot remember which grant revisions it has already verified and refuses to \
+     use grants. Set HOME or RILL_CONFIG in the launch environment and restart the client.";
+
 /// One fetched grant and what the chain said about it.
 type CheckedGrant = (
     rill_core::grant::SignedGrant,
@@ -1169,11 +1188,18 @@ type CheckedGrant = (
 
 /// Every grant for this signer's address, each checked against the chain. A grant that fails a
 /// check is kept with the reason, so `rill_actions` can say why an action is not available.
+///
+/// Every grant use goes through here, so this is the one place the revision floor is applied: a
+/// grant below a revision this signer has already verified comes back refused as superseded.
 fn checked_grants(
     context: &WalletContext,
     signer: &str,
     api: &str,
 ) -> Result<Vec<CheckedGrant>, String> {
+    // Checked before anything is fetched: a floor that silently did nothing would be no floor.
+    let Some(state_dir) = context.state_dir.clone() else {
+        return Err(NO_STATE_DIR.into());
+    };
     let network = context.network.clone();
     let endpoint = endpoint(context);
     let package = package_id();
@@ -1195,8 +1221,99 @@ fn checked_grants(
                 crate::grants::verify(&chain, &grant, signer, &network, &package, now_ms()).await;
             checked.push((grant, verdict));
         }
-        Ok(checked)
+        floor_checked(&state_dir, &network, signer, checked)
     })?
+}
+
+/// Applies this signer's revision floor to a fetched and verified grant list, raising the floor
+/// to the newest usable revision first. Kept apart from the fetch so the step that carries the
+/// L6 guarantee is exercised by a test without a server or a chain.
+fn floor_checked(
+    state_dir: &std::path::Path,
+    network: &str,
+    signer: &str,
+    mut checked: Vec<CheckedGrant>,
+) -> Result<Vec<CheckedGrant>, String> {
+    let floors = crate::grant_floor::GrantFloors::open(state_dir, network, signer)?;
+    crate::grants::apply_floor(&mut checked, &floors)?;
+    Ok(checked)
+}
+
+/// One `rill_actions` entry. The refusal is given as a code beside the prose, so an agent tells a
+/// superseded grant from any other refusal without matching text.
+fn action_entry((signed, verdict): &CheckedGrant) -> Value {
+    let grant = &signed.grant;
+    let mut entry = json!({
+        "actionId": grant.action_id,
+        "name": grant.action_name,
+        "walletId": grant.wallet_id,
+        "revision": grant.revision,
+        "expiresAtMs": grant.expires_at_ms,
+        "maxPerTransactionBaseUnits": grant.run_set.get("maxAmountBaseUnits"),
+        "usable": verdict.is_ok(),
+    });
+    match verdict {
+        Ok(verified) => entry["owner"] = json!(verified.owner),
+        Err(refusal) => {
+            entry["refusedBecause"] = json!(refusal.to_string());
+            entry["refusalCode"] = json!(refusal.code());
+        }
+    }
+    entry
+}
+
+/// The tool error code when no matching grant is usable. `grant_superseded` only when every
+/// candidate was superseded: then the owner's newer approval exists and the server did not serve
+/// it, which is a different conversation with the owner than an expired or revoked grant.
+fn refusal_code(refusals: &[&crate::grants::Refusal]) -> &'static str {
+    if !refusals.is_empty()
+        && refusals
+            .iter()
+            .all(|r| matches!(r, crate::grants::Refusal::Superseded { .. }))
+    {
+        "grant_superseded"
+    } else {
+        "grant_refused"
+    }
+}
+
+/// Why a workflow step cannot run, or `None` when it has its exact usable grant.
+///
+/// The exact-revision rule is unchanged. When the pinned revision was served but is below this
+/// signer's floor, the refusal says so, because "no exact usable revision" alone sends the owner
+/// looking for a grant that was in fact replaced.
+fn preflight_refusal(
+    checked: &[CheckedGrant],
+    expected: &crate::workflow::Step,
+    owner: &str,
+) -> Option<Value> {
+    let equal_address = |a: &str, b: &str| {
+        a.parse::<sui_sdk_types::Address>().ok() == b.parse::<sui_sdk_types::Address>().ok()
+    };
+    let pinned = |signed: &rill_core::grant::SignedGrant| {
+        signed.grant.action_id == expected.action_id
+            && signed.grant.revision == expected.revision
+            && equal_address(&signed.grant.wallet_id, &expected.wallet_id)
+    };
+    let valid = checked.iter().any(|(signed, verdict)| {
+        pinned(signed)
+            && verdict
+                .as_ref()
+                .is_ok_and(|grant| equal_address(&grant.owner, owner))
+    });
+    if valid {
+        return None;
+    }
+    let mut refused = json!({"error":"workflow_preflight_refused", "actionId":expected.action_id,
+        "reason":"Every step must have the exact usable revision, vault, signer and owner. No workflow transaction submitted."});
+    if let Some(refusal) = checked.iter().find_map(|(signed, verdict)| match verdict {
+        Err(refusal @ crate::grants::Refusal::Superseded { .. }) if pinned(signed) => Some(refusal),
+        _ => None,
+    }) {
+        refused["refusalCode"] = json!(refusal.code());
+        refused["refusedBecause"] = json!(refusal.to_string());
+    }
+    Some(refused)
 }
 
 /// `rill_actions`: what this agent may run, and for each grant that cannot be used, why.
@@ -1212,26 +1329,7 @@ fn actions(context: &mut WalletContext, id: Value) -> Value {
         Ok(checked) => checked,
         Err(e) => return tool_error(id, "grants_unavailable", &e),
     };
-    let actions: Vec<Value> = checked
-        .iter()
-        .map(|(signed, verdict)| {
-            let grant = &signed.grant;
-            let mut entry = json!({
-                "actionId": grant.action_id,
-                "name": grant.action_name,
-                "walletId": grant.wallet_id,
-                "revision": grant.revision,
-                "expiresAtMs": grant.expires_at_ms,
-                "maxPerTransactionBaseUnits": grant.run_set.get("maxAmountBaseUnits"),
-                "usable": verdict.is_ok(),
-            });
-            match verdict {
-                Ok(verified) => entry["owner"] = json!(verified.owner),
-                Err(refusal) => entry["refusedBecause"] = json!(refusal.to_string()),
-            }
-            entry
-        })
-        .collect();
+    let actions: Vec<Value> = checked.iter().map(action_entry).collect();
     tool_ok(
         id,
         json!({
@@ -1314,25 +1412,30 @@ fn run_action_for_owner(
         context.last_rejection = Some(reason.clone());
         return tool_error(id, "not_granted", &reason);
     }
-    let refusals: Vec<String> = matching
+    let refusals: Vec<&crate::grants::Refusal> = matching
         .iter()
-        .filter_map(|(_, verdict)| verdict.as_ref().err().map(ToString::to_string))
+        .filter_map(|(_, verdict)| verdict.as_ref().err())
         .collect();
+    if matching.iter().all(|(_, verdict)| verdict.is_err()) {
+        let reason = format!(
+            "The grant for {action_id} cannot be used: {}. Ask the wallet's owner; do not look \
+             for another route.",
+            refusals
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let code = refusal_code(&refusals);
+        context.last_rejection = Some(reason.clone());
+        return tool_error(id, code, &reason);
+    }
     let mut usable: Vec<crate::grants::VerifiedGrant> = matching
         .into_iter()
         .filter_map(|(_, verdict)| verdict.ok())
         .collect();
     let wallets: std::collections::BTreeSet<String> =
         usable.iter().map(|v| v.grant.wallet_id.clone()).collect();
-    if usable.is_empty() {
-        let reason = format!(
-            "The grant for {action_id} cannot be used: {}. Ask the wallet's owner; do not look \
-             for another route.",
-            refusals.join("; ")
-        );
-        context.last_rejection = Some(reason.clone());
-        return tool_error(id, "grant_refused", &reason);
-    }
     if wallets.len() > 1 {
         return tool_error(
             id,
@@ -1496,21 +1599,10 @@ fn run_workflow(context: &mut WalletContext, id: Value, params: &Value) -> Value
             "The workflow network and signer must match this signer.",
         );
     }
-    let Some(path) = crate::config::path() else {
-        return tool_error(
-            id,
-            "not_configured",
-            "A local configuration path is required for workflow receipts.",
-        );
+    let Some(state_dir) = context.state_dir.clone() else {
+        return tool_error(id, "not_configured", NO_STATE_DIR);
     };
-    let Some(parent) = path.parent() else {
-        return tool_error(
-            id,
-            "not_configured",
-            "The configuration path has no parent directory.",
-        );
-    };
-    let directory = parent
+    let directory = state_dir
         .join("workflow-runs")
         .join(&workflow.network)
         .join(&signer);
@@ -1527,17 +1619,8 @@ fn run_workflow(context: &mut WalletContext, id: Value, params: &Value) -> Value
                 Err(error) => return json!({"error":"grants_unavailable", "reason":error}),
             };
             for expected in &workflow.steps {
-                let valid = checked.iter().any(|(signed, verdict)| {
-                    signed.grant.action_id == expected.action_id
-                        && signed.grant.revision == expected.revision
-                        && equal_address(&signed.grant.wallet_id, &expected.wallet_id)
-                        && verdict
-                            .as_ref()
-                            .is_ok_and(|grant| equal_address(&grant.owner, &workflow.owner))
-                });
-                if !valid {
-                    return json!({"error":"workflow_preflight_refused", "actionId":expected.action_id,
-                        "reason":"Every step must have the exact usable revision, vault, signer and owner. No workflow transaction submitted."});
+                if let Some(refused) = preflight_refusal(&checked, expected, &workflow.owner) {
+                    return refused;
                 }
             }
             preflight_done = true;
@@ -2422,5 +2505,175 @@ mod wallet_read_tests {
             assert_eq!(rule["enforcement"], "on-chain");
         }
         assert_eq!(limits["preFlightRules"][0]["enforcement"], "pre-flight");
+    }
+}
+
+#[cfg(test)]
+mod grant_floor_tests {
+    use super::*;
+    use crate::grants::{Refusal, VerifiedGrant};
+    use rill_core::grant::{Grant, SignedGrant};
+
+    const OWNER: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+    const SIGNER: &str = "0x00000000000000000000000000000000000000000000000000000000000000a2";
+    const WALLET: &str = "0x00000000000000000000000000000000000000000000000000000000000000b1";
+    const PACKAGE: &str = "0x00000000000000000000000000000000000000000000000000000000000000c1";
+
+    fn signed(revision: u64) -> SignedGrant {
+        let run_set = json!({
+            "label": "swap", "network": "mainnet", "sender": SIGNER, "actionId": "skill_x",
+            "walletPackageId": PACKAGE, "walletId": WALLET, "agentCapId": PACKAGE,
+            "versionId": PACKAGE,
+            "capabilityManifest": {"walletCoinType": "0x2::sui::SUI",
+                "rules": [{"kind": "budget", "totalMist": "100"}, {"kind": "per_tx", "maxMist": "50"}]},
+            "allowedTargets": [format!("{PACKAGE}::agent_wallet::request_spend")],
+            "allowedObjectIds": [WALLET], "maxAmountBaseUnits": "50",
+            "declaredSpendBaseUnits": "20", "minimumRemainingBaseUnits": "0",
+            "gasCeilingBaseUnits": "100000000"
+        });
+        SignedGrant {
+            grant: Grant {
+                network: "mainnet".into(),
+                action_id: "skill_x".into(),
+                action_name: "swap".into(),
+                agent: SIGNER.into(),
+                wallet_id: WALLET.into(),
+                wallet_package_id: PACKAGE.into(),
+                expires_at_ms: "9999999999999".into(),
+                revision,
+                run_set,
+                build_arguments: json!({}),
+            },
+            signature: "sig".into(),
+        }
+    }
+
+    fn usable(revision: u64) -> CheckedGrant {
+        let signed = signed(revision);
+        let verified = VerifiedGrant {
+            grant: signed.grant.clone(),
+            run_set: RunSet::from_value(&signed.grant.run_set).unwrap(),
+            owner: OWNER.into(),
+        };
+        (signed, Ok(verified))
+    }
+
+    fn superseded(given: u64, floor: u64) -> CheckedGrant {
+        (signed(given), Err(Refusal::Superseded { floor, given }))
+    }
+
+    /// Without a state root there is nowhere to keep the floor, so grants are refused outright,
+    /// before anything is fetched: a floor that silently did nothing would be no floor.
+    #[test]
+    fn a_signer_without_a_state_directory_refuses_grants_before_fetching() {
+        let context = WalletContext::new(None, "mainnet".into(), true);
+        let error = checked_grants(&context, SIGNER, "http://127.0.0.1:1").unwrap_err();
+        assert!(error.contains("state directory"), "{error}");
+    }
+
+    /// The floor must be applied on the path every grant use takes, not only in `apply_floor`:
+    /// once revision 3 was usable, a later fetch that serves only revision 2 is a rollback and
+    /// comes back superseded through every surface that reports it.
+    #[test]
+    fn a_rolled_back_grant_is_superseded_on_the_path_every_use_takes() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "rill-stdio-floor-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&state_dir);
+
+        let first = floor_checked(&state_dir, "mainnet", SIGNER, vec![usable(3)]).unwrap();
+        assert!(
+            first[0].1.is_ok(),
+            "revision 3 is the newest, so it is usable"
+        );
+
+        let rolled_back = floor_checked(&state_dir, "mainnet", SIGNER, vec![usable(2)]).unwrap();
+        assert!(
+            matches!(
+                rolled_back[0].1,
+                Err(Refusal::Superseded { floor: 3, given: 2 })
+            ),
+            "{:?}",
+            rolled_back[0].1.as_ref().err()
+        );
+        assert_eq!(
+            action_entry(&rolled_back[0])["refusalCode"],
+            "grant_superseded"
+        );
+        let refusals: Vec<&Refusal> = rolled_back
+            .iter()
+            .filter_map(|(_, verdict)| verdict.as_ref().err())
+            .collect();
+        assert_eq!(refusal_code(&refusals), "grant_superseded");
+        let refused = preflight_refusal(&rolled_back, &step(2), OWNER).unwrap();
+        assert_eq!(refused["refusalCode"], "grant_superseded");
+
+        // The floor is per network: the same signer on testnet has no history yet.
+        let testnet = floor_checked(&state_dir, "testnet", SIGNER, vec![usable(2)]).unwrap();
+        assert!(testnet[0].1.is_ok());
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn rill_actions_names_the_refusal_in_a_field() {
+        let entry = action_entry(&superseded(2, 3));
+        assert_eq!(entry["usable"], false);
+        assert_eq!(entry["refusalCode"], "grant_superseded");
+        assert!(entry["refusedBecause"]
+            .as_str()
+            .unwrap()
+            .contains("revision 3"));
+
+        let other = action_entry(&(signed(1), Err(Refusal::Expired)));
+        assert_eq!(other["refusalCode"], "grant_refused");
+
+        let ok = action_entry(&usable(4));
+        assert_eq!(ok["usable"], true);
+        assert!(ok.get("refusalCode").is_none());
+    }
+
+    #[test]
+    fn only_a_wholly_superseded_action_answers_grant_superseded() {
+        let superseded = Refusal::Superseded { floor: 3, given: 2 };
+        let expired = Refusal::Expired;
+        assert_eq!(refusal_code(&[&superseded]), "grant_superseded");
+        assert_eq!(
+            refusal_code(&[&superseded, &superseded]),
+            "grant_superseded"
+        );
+        assert_eq!(refusal_code(&[&superseded, &expired]), "grant_refused");
+        assert_eq!(refusal_code(&[&expired]), "grant_refused");
+        assert_eq!(refusal_code(&[]), "grant_refused");
+    }
+
+    fn step(revision: u64) -> crate::workflow::Step {
+        crate::workflow::Step {
+            action_id: "skill_x".into(),
+            wallet_id: WALLET.into(),
+            revision,
+            params: None,
+        }
+    }
+
+    #[test]
+    fn a_workflow_pinned_to_a_superseded_revision_says_why() {
+        let refused = preflight_refusal(&[superseded(2, 3)], &step(2), OWNER).unwrap();
+        assert_eq!(refused["error"], "workflow_preflight_refused");
+        assert_eq!(refused["refusalCode"], "grant_superseded");
+        assert!(refused["refusedBecause"]
+            .as_str()
+            .unwrap()
+            .contains("revision 3"));
+
+        // The floor revision itself is still exact-pinnable.
+        assert!(preflight_refusal(&[usable(3)], &step(3), OWNER).is_none());
+
+        // A revision the server does not hold is refused as before, with no superseded code.
+        let missing = preflight_refusal(&[usable(3)], &step(2), OWNER).unwrap();
+        assert_eq!(missing["error"], "workflow_preflight_refused");
+        assert!(missing.get("refusalCode").is_none());
     }
 }

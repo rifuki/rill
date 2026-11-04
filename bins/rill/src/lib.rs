@@ -19,6 +19,7 @@ pub const BINARY_NAME: &str = rill_core::release::WALLET_BINARY;
 
 pub mod config;
 pub mod grant_cmd;
+pub mod grant_floor;
 pub mod grants;
 pub mod http;
 pub mod init;

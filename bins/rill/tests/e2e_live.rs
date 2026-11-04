@@ -937,7 +937,10 @@ async fn run(
         .and_then(|g| g.iter().find(|g| g["grant"]["walletId"] == wallet.as_str()))
         .cloned()
         .ok_or("the stored grant is not listed")?;
-    forged["grant"]["revision"] = json!(2);
+    // One above the stored revision, so the server's newer-revision check passes and the refusal
+    // can only come from the signature. Revisions are numbered from the clock, not from 1.
+    let stored = forged["grant"]["revision"].as_u64().unwrap_or(0);
+    forged["grant"]["revision"] = json!(stored + 1);
     match http::post_json_as(&format!("{api}/api/grants"), &forged, &token).await {
         Ok(v) => return Err(format!("a grant the owner never signed was stored: {v}")),
         Err(e) if e.contains("signature") => eprintln!("refused: {e}"),

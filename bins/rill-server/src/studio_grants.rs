@@ -90,9 +90,25 @@ pub async fn prepare_grant(
         }
     }
     let mut grant = grant_plan(&bind, skill, owner, context, chain).await?;
-    grant.revision = current_revision(&grant.agent, &grant.wallet_id, &grant.action_id) + 1;
+    grant.revision = next_revision(
+        current_revision(&grant.agent, &grant.wallet_id, &grant.action_id),
+        context.now_ms,
+    );
     let message = grant.message();
     Ok(json!({ "grant": grant, "message": message }))
+}
+
+/// The revision a newly prepared grant carries: one above the stored revision, and never below the
+/// current unix time in seconds.
+///
+/// Each signer refuses a revision lower than one it has already verified, and the store can lose its
+/// history (a corrupt file loads empty, a fresh deployment starts empty). Counting from 1 again would
+/// then lock every owner out of granting to a signer that saw an earlier grant. Numbering from the
+/// clock puts the next revision above any it could have seen, with no recovery step for the owner,
+/// while `current + 1` keeps revisions strictly increasing per slot when grants come faster than one
+/// a second. Unix seconds stay far inside the integer range a JavaScript client reads exactly.
+pub fn next_revision(current: u64, now_ms: u64) -> u64 {
+    current.saturating_add(1).max(now_ms / 1000)
 }
 
 /// The non-empty manager, capability and price fields of a published DeepBook node, by request key.
@@ -344,6 +360,20 @@ mod tests {
                 ("price", "3.5".to_owned()),
             ]
         );
+    }
+
+    /// The prepared revision stays strictly above what the store holds, and never falls below the
+    /// clock, so a signer's saved floor is passed even after the store is lost.
+    #[test]
+    fn a_new_revision_is_above_the_stored_one_and_never_below_the_clock() {
+        let now_ms = 1_800_000_000_123;
+        assert_eq!(next_revision(0, now_ms), 1_800_000_000);
+        assert_eq!(next_revision(3, now_ms), 1_800_000_000);
+        assert_eq!(next_revision(1_800_000_005, now_ms), 1_800_000_006);
+        assert_eq!(next_revision(u64::MAX - 1, now_ms), u64::MAX);
+
+        let now_seconds = studio_api::now_ms() / 1000;
+        assert!(next_revision(0, studio_api::now_ms()) >= now_seconds);
     }
 
     /// Studio publishes these fields empty; an empty one is no default, so the request must name it.
